@@ -3259,6 +3259,22 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+// ggml_factored_linear
+// y = basis @ (coeffs @ x)
+// Expresses factored-linear intent as a pair of ggml_mul_mat nodes; the
+// two-matmul form is strictly cheaper than materializing W = basis @ coeffs
+// first (rank << min(d_out,d_in)), and it reuses every backend's existing
+// MUL_MAT path (cuBLAS, quantized kernels, etc.). Phase 3.4 can pattern-match
+// these paired nodes to insert streaming hooks for per-layer coefficients.
+struct ggml_tensor * ggml_factored_linear(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * basis,
+        struct ggml_tensor  * coeffs,
+        struct ggml_tensor  * x) {
+    struct ggml_tensor * Ax = ggml_mul_mat(ctx, coeffs, x);
+    return ggml_mul_mat(ctx, basis, Ax);
+}
+
 // ggml_mul_mat_id
 
 /*

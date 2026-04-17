@@ -1419,6 +1419,20 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // Factored linear: y = basis @ coeffs @ x
+    //   basis:  [rank, d_out]           (shared across a window in Basis Sharing)
+    //   coeffs: [d_in, rank]            (per-layer; the "streamable" factor)
+    //   x:      [d_in, n_tokens, ...]
+    //   result: [d_out, n_tokens, ...]
+    // Implemented as two ggml_mul_mat nodes; this helper exists to express
+    // factored-linear intent at the graph-builder level. Later work can
+    // pattern-match these pairs for streaming scheduling.
+    GGML_API struct ggml_tensor * ggml_factored_linear(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * basis,
+            struct ggml_tensor  * coeffs,
+            struct ggml_tensor  * x);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
