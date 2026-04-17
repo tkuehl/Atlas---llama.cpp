@@ -48,7 +48,32 @@ W^(i) ≈ B_shared · C^(i)
 
 For `o_proj` and `down_proj` (per-matrix, no cross-layer sharing), use the balanced-truncation weighting from our whole-model experiments: SVD of `S_out · W · S_in` where `S_in = (X^T X)^(1/2)` and `S_out = (G^T G)^(1/2)` from a backward calibration pass. Our 0.5B results showed 5-20% PPL improvement over pure ASVD at matched rank. (See `balanced_test.py`.)
 
-### 2.3 SparseGPT-style OBS repair (our extension)
+### 2.3 SparseGPT-style OBS repair — role reassessed after empirical test
+
+**Updated 2026-04-17 after validation on gate_proj layer 12.**
+
+Result table (bal_wgt, the metric that predicts downstream PPL):
+
+| rank | plain SVD | SVD+OBS | ASVD  | balanced |
+|------|-----------|---------|-------|----------|
+|  128 |   0.493   |  0.351  | 0.309 |  0.268   |
+|  256 |   0.413   |  0.272  | 0.231 |  0.181   |
+|  384 |   0.353   |  0.215  | 0.175 |  0.126   |
+|  512 |   0.299   |  0.168  | 0.130 |  0.086   |
+|  640 |   0.245   |  0.125  | 0.090 |  0.056   |
+|  768 |   0.183   |  0.084  | 0.052 |  0.031   |
+
+Ordering: plain SVD ≫ SVD+OBS ≈ ASVD > balanced truncation.
+
+**Finding:** on per-matrix SVD, OBS repair approximates ASVD but does not beat it. Applying it on top of plain SVD roughly replicates what ASVD computes from the start. So OBS-as-standalone-repair is not a useful step for per-matrix decompositions.
+
+**But OBS does have a role in Basis Sharing.** When the basis is cross-layer-constrained (not layer-locally optimal), refitting per-layer coefficients via the closed-form weighted LS solution is a meaningful improvement that the Basis Sharing paper does NOT do (they use SVD slices directly). Per-layer weighted LS given fixed basis `B`:
+
+```
+A_i* = (B^T · S_out_i^T · S_out_i · B)^-1 · B^T · S_out_i^T · S_out_i · W_i
+```
+
+This is our one unambiguous novel-math contribution on top of published techniques — it's the "coefficient refit" that combines Basis Sharing's cross-layer basis with balanced truncation's output-aware weighting.
 
 SparseGPT (arxiv:2301.00774) gives a closed-form weight update that, after pruning entry `W[i,j]`, analytically redistributes the error into the remaining weights to minimize `||W·X - W'·X||`. The math extends cleanly to SVD truncation:
 

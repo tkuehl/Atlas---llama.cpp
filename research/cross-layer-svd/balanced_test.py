@@ -83,6 +83,48 @@ def balanced(W, XTX, GGT, rank):
     return W_r.to(W.dtype)
 
 
+def obs_repair_svd(W, XTX, rank, eps_ratio=1e-5):
+    """Plain-SVD rank-r truncation with OBS-style input-side repair.
+
+    Adapted from SparseGPT/OBS math (our derivation; paper doesn't directly
+    address SVD truncation): let V_k be the d_in - r bottom right singular
+    vectors of W (the dropped input directions). With H = XTX + eps*I:
+
+        W' = W - (W V_k) (V_k^T H^-1 V_k)^-1 (H^-1 V_k)^T
+
+    Intuition: instead of orthogonally projecting out V_k (which plain SVD
+    does), this projection is in the H^-1 inner product — accounting for
+    which input directions the calibration data actually activates.
+    """
+    W64 = W.to(torch.float64)
+    d_out, d_in = W64.shape
+
+    # Plain SVD, same as plain_svd() — kept here so we can reuse V.
+    U, sigma, Vt = torch.linalg.svd(W64, full_matrices=False)
+    r = min(rank, sigma.numel())
+    if r >= Vt.shape[0]:
+        return W.clone()
+
+    V_k = Vt[r:, :].T                   # [d_in, d_in - r] (dropped directions)
+
+    # H = XTX + eps*I
+    xtx64 = XTX.to(torch.float64)
+    eps = eps_ratio * xtx64.diag().mean().item() + 1e-8
+    H = xtx64 + eps * torch.eye(d_in, dtype=torch.float64)
+
+    # Stable H^-1 @ V_k via Cholesky solve (don't materialize H^-1).
+    L = torch.linalg.cholesky(H)                     # H = L L^T
+    Hinv_V = torch.cholesky_solve(V_k, L)            # [d_in, d_in - r]
+
+    # Gram: V_k^T H^-1 V_k
+    Gram = V_k.T @ Hinv_V                            # [d_in - r, d_in - r]
+    Gram_inv_HinvV_T = torch.linalg.solve(Gram, Hinv_V.T)  # [d_in - r, d_in]
+
+    correction = (W64 @ V_k) @ Gram_inv_HinvV_T      # [d_out, d_in]
+    W_repaired = W64 - correction
+    return W_repaired.to(W.dtype)
+
+
 # ---------- error metrics ----------
 
 def err_plain(W, W_hat):
@@ -197,9 +239,10 @@ def sweep(snapshot_path, ranks):
     print("-" * 72)
 
     for r in ranks:
-        for name, fn in [("plain-SVD", lambda: plain_svd(W, r)),
-                         ("ASVD",      lambda: asvd(W, XTX, r)),
-                         ("balanced",  lambda: balanced(W, XTX, GGT, r))]:
+        for name, fn in [("plain-SVD",    lambda r=r: plain_svd(W, r)),
+                         ("SVD + OBS",    lambda r=r: obs_repair_svd(W, XTX, r)),
+                         ("ASVD",         lambda r=r: asvd(W, XTX, r)),
+                         ("balanced",     lambda r=r: balanced(W, XTX, GGT, r))]:
             t0 = time.time()
             W_hat = fn()
             dt = time.time() - t0
