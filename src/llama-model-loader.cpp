@@ -1055,6 +1055,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                 // duplicated output tensor
             max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+            // Phase 3.2: factored GGUFs redistribute dense weights across basis+coeffs
+            // pairs; each per-layer call may duplicate a shared basis tensor, adding
+            // up to (window_size-1) extra allocations per shared role per window.
+            // Budget 2x the base count so we don't clip on factored loads.
+            if (factored_enabled) {
+                max_n_tensors *= 2;
+            }
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
             }
@@ -1350,6 +1357,15 @@ llama_model_loader::create_tensor_factored(
     };
 
     auto build_one = [&](const std::string & gguf_name) -> ggml_tensor * {
+        // NOTE: we intentionally do NOT cache/share the basis ggml_tensor across
+        // layers, even though shared basis means multiple layers could logically
+        // reuse it. The factored_coeffs map in llama_model is keyed by basis
+        // pointer — if two layers shared a basis pointer, we couldn't
+        // disambiguate their coeffs at graph-build time. Phase 3.4's streaming
+        // runtime changes the data plane so that basis is stored once and
+        // coeffs stream from pinned host; until then we pay ~(window_size-1)
+        // extra basis copies per window. For Qwen 3B window=2 this is ~400 MB
+        // above the factored ideal — tolerable for correctness validation.
         ggml_tensor * t_meta = get_tensor_meta(gguf_name.c_str());
         if (!t_meta) {
             throw std::runtime_error(format(
@@ -1402,7 +1418,13 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
+    // Factored loads legitimately allocate more ggml_tensors than there are
+    // entries in weights_map: each shared basis is duplicated per referencing
+    // layer (see create_tensor_factored). Allow n_created to exceed n_tensors
+    // when loading a factored GGUF.
+    const bool ok = factored_enabled ? (n_created >= n_tensors)
+                                     : (n_created == n_tensors);
+    if (!ok) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
     }
     if (n_tensors_moved > 0) {
