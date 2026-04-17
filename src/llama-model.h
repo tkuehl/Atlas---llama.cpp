@@ -286,6 +286,26 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
+    // Factored-weight coefficients (Phase 3.2).
+    //
+    // When these are non-null, the corresponding weight pointer (wq, wk, etc.)
+    // holds the BASIS matrix of a rank-r factorization rather than the dense
+    // weight. Graph builders use llm_linear_factored() to pick between
+    // ggml_mul_mat (normal) and ggml_factored_linear (factored).
+    //
+    // Shape contract:
+    //   wX:        [rank, d_out]     (ggml ne convention)
+    //   wX_coeffs: [d_in, rank]
+    // This matches what ggml_factored_linear expects and reconstructs the
+    // dense weight W = basis @ coeffs of shape [d_in, d_out] (ggml ne).
+    struct ggml_tensor * wq_coeffs       = nullptr;
+    struct ggml_tensor * wk_coeffs       = nullptr;
+    struct ggml_tensor * wv_coeffs       = nullptr;
+    struct ggml_tensor * wo_coeffs       = nullptr;
+    struct ggml_tensor * ffn_gate_coeffs = nullptr;
+    struct ggml_tensor * ffn_up_coeffs   = nullptr;
+    struct ggml_tensor * ffn_down_coeffs = nullptr;
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
@@ -520,6 +540,13 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // Factored-weight sidecar (Phase 3.2): w -> coeffs for weights that are
+    // stored in factored form. When a tensor appears in this map, the
+    // build_lora_mm path calls ggml_factored_linear(w, coeffs, x) instead of
+    // ggml_mul_mat(w, x). Populated by the loader for GGUFs with
+    // factored.enabled=True; empty otherwise.
+    std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> factored_coeffs;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
