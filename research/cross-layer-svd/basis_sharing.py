@@ -267,7 +267,8 @@ class XtxStore:
     code unchanged. Call cleanup() when done to delete temp files.
     """
 
-    def __init__(self, mode: str, temp_dir: Path | None, min_free_gb: float):
+    def __init__(self, mode: str, temp_dir: Path | None, min_free_gb: float,
+                 gpu_workspace_cap_gb: float = 4.0):
         assert mode in ("ram", "disk", "auto")
         self.mode = mode
         self.min_free_gb = min_free_gb
@@ -278,6 +279,15 @@ class XtxStore:
             self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._memmaps: dict[str, np.memmap] = {}
         self._paths: list[Path] = []
+        # Per-d_in GPU scratch buffers for the `flat.T @ flat` matmul that
+        # produces each hook's gramian delta. We pre-allocate one workspace
+        # per unique d value (typically just 2 for decoder-only LLMs:
+        # hidden_size and intermediate_size) so the hot path is alloc-free.
+        # Cap is a soft budget; individual workspaces larger than this fall
+        # back to the CPU addmm path in collect_stats.
+        self._gpu_workspaces: dict[int, torch.Tensor] = {}
+        self._gpu_enabled = torch.cuda.is_available()
+        self._gpu_workspace_cap_bytes = int(gpu_workspace_cap_gb * 1e9)
 
     def _use_disk(self, bytes_needed: int) -> bool:
         if self.mode == "ram":
@@ -314,8 +324,46 @@ class XtxStore:
         _require_ram_headroom(bytes_needed, self.min_free_gb, name)
         return torch.zeros(d, d, dtype=torch.float32)
 
+    def get_gpu_workspace(self, d: int) -> torch.Tensor | None:
+        """Return (lazily-allocated) CUDA fp32 d×d buffer for delta matmul.
+
+        Returns None when CUDA is unavailable, the tensor would exceed the
+        configured cap, or allocation fails (e.g. VRAM exhausted). Callers
+        in the hook path fall back to CPU-side addmm in that case.
+        """
+        if not self._gpu_enabled:
+            return None
+        if d in self._gpu_workspaces:
+            return self._gpu_workspaces[d]
+        bytes_needed = d * d * 4
+        if bytes_needed > self._gpu_workspace_cap_bytes:
+            return None
+        try:
+            ws = torch.empty(d, d, dtype=torch.float32, device="cuda")
+        except torch.cuda.OutOfMemoryError:
+            return None
+        self._gpu_workspaces[d] = ws
+        return ws
+
+    def free_gpu_workspaces(self):
+        """Release all pre-allocated GPU buffers. Call at the end of
+        calibration so downstream compute_factors has the full VRAM to
+        work with during SVD."""
+        self._gpu_workspaces.clear()
+        if self._gpu_enabled:
+            torch.cuda.empty_cache()
+
+    def has_disk_backed(self) -> bool:
+        """True if any of the accumulators allocated via this store live on
+        an np.memmap. checkpoint_save pickles the whole xtx dict, which
+        materializes memmaps into RAM — so we disable the checkpoint when
+        this is True (the resulting .pt would be tens of GB and the reload
+        would OOM)."""
+        return bool(self._memmaps)
+
     def cleanup(self):
         # Drop strong refs so the OS can unlink the files on Windows.
+        self.free_gpu_workspaces()
         self._memmaps.clear()
         for p in self._paths:
             try:
@@ -332,73 +380,120 @@ class XtxStore:
 
 # ---------- calibration (forward + optional backward) ----------
 
-def collect_stats(model, tokenizer, texts, device, seq_len, all_roles, need_grad,
+def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_grad,
                   xtx_store: XtxStore, ggt_store: XtxStore | None = None):
     """Run calibration and accumulate X^T X (input cov) and optionally G^T G
-    (output-gradient cov) for every linear we care about."""
-    groups = find_layers(model, all_roles)
+    (output-gradient cov) for every linear we care about.
+
+    `role_groups` is a list-of-lists: each inner list is one calibration pass
+    whose hooks fire only for those roles. A single-pass calibration is
+    expressed as `[all_roles]` and is the cheapest when gramians fit in RAM.
+    Splitting into multiple passes (e.g. [shared_roles, [o_proj], [down_proj]])
+    caps peak RAM per pass, which is how we make 14B+ fit on a 64 GB box.
+
+    When the XtxStore has GPU workspaces available, hooks push the tall
+    (batch*seq × d) activation to the GPU and run the d×d delta matmul
+    there — then copy the small(-ish) delta back to the CPU accumulator.
+    For d=18944 on RTX 5070 this is ~3× faster than the pure-CPU addmm
+    path, and the per-hook PCIe traffic (~1.4 GB for down_proj) stays
+    bounded by the already-resident gramian size. On machines without
+    CUDA or when a workspace would exceed the cap, hooks fall back to the
+    original CPU addmm path.
+    """
     xtx = {}
     ggt = {} if need_grad else None
-    hooks = []
-
+    # Every module we'll touch across every pass — we grad-enable the whole
+    # set upfront so the backward hooks installed later don't hit frozen
+    # params.
+    all_groups: dict = {}
+    for pass_roles in role_groups:
+        for role, entries in find_layers(model, pass_roles).items():
+            all_groups.setdefault(role, entries)
     if need_grad:
         for p in model.parameters():
             p.requires_grad_(False)
-        for role, entries in groups.items():
+        for role, entries in all_groups.items():
             for _, _, mod in entries:
                 mod.weight.requires_grad_(True)
 
-    # Memory-efficient hook: move the thin (batch*seq × d) tensor to CPU FIRST,
-    # then compute the d×d gramian on CPU. Otherwise we'd allocate a d×d GPU
-    # tensor per call and D2H-copy it — for d=11008 that's 484 MB/call, and
-    # with 108 such matrices per sample (gate/up/down on 36 layers of a 3B),
-    # a single sample spends 52+ GB of PCIe bandwidth on gramian traffic alone.
     def fwd_hook_factory(name, d_in):
         xtx[name] = xtx_store.alloc(name, d_in)
+        ws = xtx_store.get_gpu_workspace(d_in)
 
+        if ws is not None:
+            def hook(mod, inputs):
+                x = inputs[0].detach()
+                flat = x.reshape(-1, x.shape[-1])
+                flat_gpu = flat.to(device="cuda", dtype=torch.float32, non_blocking=True)
+                # In-place matmul into the pre-allocated workspace, then D2H
+                # into a fresh CPU tensor. .cpu() is synchronous in torch's
+                # default stream, so the next hook's overwrite of `ws` is
+                # safely ordered after this copy completes.
+                torch.mm(flat_gpu.T, flat_gpu, out=ws)
+                xtx[name].add_(ws.cpu())
+            return hook
+
+        # CPU fallback — identical semantics, just slower for big d.
         def hook(mod, inputs):
             x = inputs[0].detach()
             flat_cpu = x.reshape(-1, x.shape[-1]).to(device="cpu", dtype=torch.float32)
             xtx[name].addmm_(flat_cpu.T, flat_cpu)
-
         return hook
 
     def bwd_hook_factory(name, d_out):
         ggt[name] = ggt_store.alloc(name, d_out)
+        ws = ggt_store.get_gpu_workspace(d_out)
+
+        if ws is not None:
+            def hook(mod, grad_input, grad_output):
+                g = grad_output[0].detach()
+                flat = g.reshape(-1, g.shape[-1])
+                flat_gpu = flat.to(device="cuda", dtype=torch.float32, non_blocking=True)
+                torch.mm(flat_gpu.T, flat_gpu, out=ws)
+                ggt[name].add_(ws.cpu())
+            return hook
 
         def hook(mod, grad_input, grad_output):
             g = grad_output[0].detach()
             flat_cpu = g.reshape(-1, g.shape[-1]).to(device="cpu", dtype=torch.float32)
             ggt[name].addmm_(flat_cpu.T, flat_cpu)
-
         return hook
 
-    for role, entries in groups.items():
-        for _, name, mod in entries:
-            hooks.append(mod.register_forward_pre_hook(fwd_hook_factory(name, mod.in_features)))
-            if need_grad:
-                hooks.append(mod.register_full_backward_hook(bwd_hook_factory(name, mod.out_features)))
-
     model.eval()
-    for text in tqdm(texts, desc="calibration"):
-        enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
-        input_ids = enc.input_ids.to(device)
-        if input_ids.shape[1] < 8:
-            continue
-        if need_grad:
-            out = model(input_ids, labels=input_ids)
-            out.loss.backward()
-            model.zero_grad(set_to_none=True)
-        else:
-            with torch.no_grad():
-                model(input_ids)
+    n_passes = len(role_groups)
+    for pass_idx, pass_roles in enumerate(role_groups):
+        pass_groups = find_layers(model, pass_roles)
+        hooks = []
+        for role, entries in pass_groups.items():
+            for _, name, mod in entries:
+                hooks.append(mod.register_forward_pre_hook(
+                    fwd_hook_factory(name, mod.in_features)))
+                if need_grad:
+                    hooks.append(mod.register_full_backward_hook(
+                        bwd_hook_factory(name, mod.out_features)))
 
-    for h in hooks:
-        h.remove()
+        desc = (f"calib pass {pass_idx+1}/{n_passes} "
+                f"({sum(len(e) for e in pass_groups.values())} modules)")
+        for text in tqdm(texts, desc=desc):
+            enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
+            input_ids = enc.input_ids.to(device)
+            if input_ids.shape[1] < 8:
+                continue
+            if need_grad:
+                out = model(input_ids, labels=input_ids)
+                out.loss.backward()
+                model.zero_grad(set_to_none=True)
+            else:
+                with torch.no_grad():
+                    model(input_ids)
+
+        for h in hooks:
+            h.remove()
+
     if need_grad:
         for p in model.parameters():
             p.requires_grad_(False)
-    return xtx, ggt, groups
+    return xtx, ggt, all_groups
 
 
 # ---------- rank computation ----------
@@ -1014,6 +1109,16 @@ def main():
     p.add_argument("--xtx-temp-dir", default=None,
                    help="Directory for disk-backed gramians (default: "
                         "{checkpoint-dir}/xtx or {save-dir}/xtx).")
+    p.add_argument("--xtx-gpu-workspace-gb", type=float, default=4.0,
+                   help="Max VRAM budget for the d*d delta-matmul workspace "
+                        "used during gramian accumulation. Set to 0 to force "
+                        "the CPU addmm path.")
+    p.add_argument("--calib-passes", default="single",
+                   choices=["single", "by-role"],
+                   help="single: accumulate all gramians in one forward sweep "
+                        "(fastest when RAM fits). by-role: run separate sweeps "
+                        "for shared roles, o_proj, and down_proj so only one "
+                        "role's gramians co-exist in RAM — enables 14B+ models.")
     args = p.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -1083,23 +1188,54 @@ def main():
         else:
             xtx_temp_dir = Path(".") / "xtx_tmp"
         avail_gb = psutil.virtual_memory().available / 1e9
+        # Per-role pass selection. `single` keeps all hooks live for one sweep
+        # through the calibration texts (fastest when RAM fits). `by-role`
+        # splits into three sweeps so only one role's gramians are resident
+        # at a time — the trade is 3× forward-pass cost for ~1/3 the peak
+        # RAM. Down_proj gets its own pass because d_in=18944 dominates the
+        # per-gramian cost on 7B+.
+        if args.calib_passes == "by-role":
+            role_groups = [
+                list(SHARED_ROLES),
+                ["self_attn.o_proj"],
+                ["mlp.down_proj"],
+            ]
+        else:
+            role_groups = [SHARED_ROLES + PERMATRIX_ROLES]
         print(f"calibration ({len(calib)} samples, need_grad={need_grad}); "
+              f"passes={args.calib_passes} ({len(role_groups)} sweep(s)), "
               f"xtx backend={args.xtx_backend}, min-free-ram={args.min_free_ram_gb:.1f} GB, "
+              f"gpu-workspace={args.xtx_gpu_workspace_gb:.1f} GB, "
               f"free now={avail_gb:.1f} GB, temp_dir={xtx_temp_dir}")
         xtx_store = XtxStore(args.xtx_backend, xtx_temp_dir,
-                             args.min_free_ram_gb)
+                             args.min_free_ram_gb,
+                             gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb)
         ggt_store = (XtxStore(args.xtx_backend, xtx_temp_dir,
-                              args.min_free_ram_gb)
+                              args.min_free_ram_gb,
+                              gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb)
                      if need_grad else None)
         t0 = time.time()
         try:
             xtx, ggt, _ = collect_stats(model, tokenizer, calib, input_device,
-                                        args.calib_seq_len, all_roles, need_grad,
+                                        args.calib_seq_len, role_groups, need_grad,
                                         xtx_store=xtx_store,
                                         ggt_store=ggt_store)
             print(f"  done in {time.time()-t0:.1f}s")
-            if ckpt_dir:
+            # Free GPU scratch buffers now so compute_factors gets full VRAM.
+            xtx_store.free_gpu_workspaces()
+            if ggt_store is not None:
+                ggt_store.free_gpu_workspaces()
+            # Checkpoint only when gramians are fully in RAM. Memmap-backed
+            # tensors pickle by materializing into host memory (torch.save
+            # reads the entire file), producing multi-GB .pt files that
+            # can't be reloaded without OOM — worse than skipping the
+            # checkpoint outright.
+            if ckpt_dir and not (xtx_store.has_disk_backed() or
+                                 (ggt_store is not None and ggt_store.has_disk_backed())):
                 checkpoint_save(ckpt_dir, "calibration", {"xtx": xtx, "ggt": ggt})
+            elif ckpt_dir:
+                print("  skipping calibration checkpoint "
+                      "(disk-backed gramians aren't safely picklable)")
         except BaseException:
             # Best-effort cleanup of disk-backed accumulators on failure so a
             # crashed run doesn't leave 40 GB of temp files behind.

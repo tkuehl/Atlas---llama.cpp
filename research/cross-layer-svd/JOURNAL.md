@@ -298,3 +298,73 @@ Two tracks:
 Priority ordering in §3 of that doc. Key callouts: cuBLAS Grouped GEMM is
 probably the single cheapest fix for the 27% decode regression; GPU-resident
 gramians are the single cheapest fix for calibration wall-time at 7B+ scale.
+
+---
+
+## Background reading — Phase 3.4 design inputs
+
+Two external references that reshape how Phase 3.4 should be scoped. Captured here so the design conversation doesn't start from zero when we pick this up.
+
+### GPUDirect Storage (NVIDIA cuFile)
+
+**What it is.** Direct NVMe→VRAM DMA via the `nvidia-fs` kernel module + `cuFile` API. Bypasses the CPU bounce buffer. Effective streaming bandwidth goes from ~6-8 GB/s (CPU-mediated) to ~25-45 GB/s on decent Gen5 NVMe.
+
+**Platform reality.** Linux only. No Windows driver. WSL2 lacks `cuFile` today. Our Windows 11 dev box can't use it.
+
+**Bandwidth math for a pure streaming Phase 3.4 design (Qwen 2.5 7B factored at r=0.5):**
+
+| quantity | value |
+|---|---|
+| down_proj coefficient per layer | ~380 MB (rank × hidden × bf16) |
+| shared-role coefficient per layer | ~15-30 MB |
+| layers traversed per decoded token | 28 |
+| total coefficient payload per token | ~11 GB |
+| target tok/s | 20-40 |
+| **required streaming bandwidth** | **220-440 GB/s** |
+| PCIe Gen5 x16 sustained | ~55 GB/s |
+
+Naïve "stream every layer every token" is **4-8× over what a single PCIe link can deliver**, with or without GDS. This means Phase 3.4 cannot be pure per-token streaming — we must either (a) keep a working set of coefficients resident across many tokens, (b) batch decode so coefficient loads amortize across tokens, or (c) reduce the per-token payload via FlashSVD-style tile fusion (see below).
+
+**Principles to apply on Windows (since we can't use GDS itself):**
+- Pinned host staging buffers, allocated once and reused
+- Two CUDA streams (compute + copy), double-buffered prefetch
+- Transfer granularity tuned to SSD queue depth (2-16 MB chunks, not 32-64 KB)
+- Hides CPU-staging cost, captures ~70% of GDS's benefit
+
+**When GDS becomes worth it.** Dual-boot or provision a Linux dev box if Phase 3.4 hits a PCIe-bound wall in practice. Not before — the gap between pinned+async and true GDS is ~2-3× for our workload, which isn't the current bottleneck.
+
+### FlashSVD (arxiv 2508.01506)
+
+**What it is.** Custom GPU kernels that fuse the two matmuls of a factored linear (`basis @ (coeffs @ x)`) so the intermediate activation never lands in HBM. Tile-by-tile streaming through on-chip SRAM. Paper claims 70% peak activation memory reduction with zero accuracy loss on BERT/RoBERTa at ranks 16-768.
+
+**Two FFN variants in the paper:**
+- **V1 (practical)**: first projection uses cuBLAS GEMM; second projection + activation fused into a streaming kernel. This is the one that actually wins on latency.
+- **V2 (extreme memory)**: fully fused GEMM-Activation-GEMM, zero HBM I/O, but **60% latency penalty** (reconstruction loop serializes). Flagged by the authors as a memory-vs-speed tradeoff.
+
+**Direct relevance to us.** Our `ggml_factored_linear(basis, coeffs, x)` *is* the V2 compute shape. The current ggml implementation launches two separate `ggml_mul_mat` kernels — intermediate writes to HBM, second kernel reads it back. This is the exact inefficiency FlashSVD attacks.
+
+**Gaps blocking a naïve port:**
+
+| factor | FlashSVD | us |
+|---|---|---|
+| model type | encoders (BERT), no KV cache | decoder-only, causal, KV cache |
+| sequence regime | long (M ≥ 512) | prefill long, **decode M=1** |
+| code release | none | would need custom CUDA kernel as new ggml op |
+| benchmark at M=128 | **0.62× slower than dense** | decode lives here — naïve port would *regress* tok/s |
+
+FlashSVD only wins at long sequences. A straight port hurts decode throughput, which is what chat users feel. Any integration must gate on seq length and use the dense path for decode.
+
+**The synergy with GDS that actually matters.** FlashSVD's tile-streaming design means coefficients never need to live fully in VRAM — only the current tile. Combining that with pinned-host (or GDS) async prefetch:
+
+> Coefficients sit on NVMe → `cp.async` loads tile-sized chunks (~KB) directly into shared memory → fused matmul computes its tile → evict → next tile.
+
+Working set in VRAM shrinks from 100s of MB per layer to O(MB). This reframes the Phase 3.4 bandwidth problem from "impossible on one GPU" to "tractable with careful pipelining." Without this fusion, Phase 3.4 hits the PCIe wall.
+
+### Phase 3.4 design recommendation
+
+When we pick up Phase 3.4:
+
+1. **Don't port FlashSVD naïvely.** Its benchmarks don't match decode. A straight kernel port regresses decode throughput.
+2. **Prototype a fused factored-linear kernel for prefill only.** Long-context gain, no decode regression. Gate on a batch/seq threshold. ~2-3 weeks of work.
+3. **Design the streaming data plane around tile-fused kernels**, not full coefficient residency. This is the combination that makes the "larger model than fits" thesis actually achievable.
+4. **Revisit GDS if we productionize.** The Linux port becomes worth it once Phase 3.4 is PCIe-bound in practice.
