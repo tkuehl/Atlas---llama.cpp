@@ -3,7 +3,10 @@ __pycache__/
 *.pyc
 results*.json
 smoke_*.json
+bs_*.json
 *.pkl
+*.gguf
 caldera_text.txt
 .env
 runs/
+factored_out*/

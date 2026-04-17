@@ -205,9 +205,40 @@ blk.12.attn_q.weight.group     → scalar int   window group ID (layers with sam
 - Old loaders without factored-weight support will load the basis as a normal tensor and ignore `.coeffs` → no crash, just won't use compression
 - No GGUF_VERSION bump needed
 
-### 4.2 Python converter
+### 4.2 Python converter (two-stage)
 
-New script: `gguf-py/scripts/convert_factored.py`. Reads a standard GGUF, applies our decomposition pipeline (Basis Sharing with window=2 on Q/K/V/Gate/Up, balanced-truncation per-matrix on O/Down, OBS repair as final pass), writes a factored GGUF.
+**Stage A — decomposition (HF → intermediate format).** `basis_sharing.py` reads a HuggingFace model, computes factors, emits our intermediate format (Phase 2a):
+
+```
+out_dir/
+  manifest.json           — model_id, window, target_ratio, role maps
+  untouched.safetensors   — unfactored weights (embeddings, norms, lm_head, etc.)
+  factored.safetensors    — all factor tensors with structured names:
+                            shared.{role_tag}.w{WINDOW}.basis
+                            shared.{role_tag}.w{WINDOW}.coeffs.{LAYER}
+                            permatrix.{role_tag}.{LAYER}.U
+                            permatrix.{role_tag}.{LAYER}.V
+```
+
+Role tags match llama.cpp's standard names: `attn_q`, `attn_k`, `attn_v`, `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down`.
+
+**Stage B — GGUF emission (intermediate → factored GGUF).** Separate script `convert_factored.py` (Phase 2b, TBD). Given:
+1. A standard GGUF produced by `convert_hf_to_gguf.py` (provides metadata, tokenizer, architecture)
+2. Our intermediate format from Stage A
+
+...emit a new GGUF where each factored weight is replaced by sibling tensors per the naming convention in §4.1 + KV metadata:
+
+```
+factored.enabled = true
+factored.window_size = 2
+factored.target_ratio = 0.5
+factored.shared_roles = ["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up"]
+factored.permatrix_roles = ["attn_output", "ffn_down"]
+blk.12.ffn_gate.factored_window = 6     (per-layer KV: which window)
+blk.12.ffn_gate.factored_rank = 655     (per-layer KV: rank used)
+```
+
+Splitting computation (slow, Python-heavy, needs GPU + transformers) from GGUF emission (fast, metadata-juggling) keeps the pipeline modular and lets us iterate on the decomposition math without re-engineering GGUF plumbing.
 
 ### 4.3 Model loader changes
 
