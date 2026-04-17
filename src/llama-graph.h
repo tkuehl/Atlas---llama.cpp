@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -545,6 +546,12 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // Phase 3.2: sidecar map from basis tensor -> coeffs tensor for factored
+    // weights (see llama_model::factored_coeffs). When non-null and a tensor
+    // is found here, build_lora_mm routes to ggml_factored_linear instead of
+    // ggml_mul_mat. Null for standard (unfactored) models.
+    const std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> * factored_coeffs = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -758,6 +765,11 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // Phase 3.2: see llm_graph_params::factored_coeffs. Null for unfactored
+    // models; when set, build_lora_mm consults it to decide between
+    // ggml_mul_mat and ggml_factored_linear.
+    const std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> * factored_coeffs = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
