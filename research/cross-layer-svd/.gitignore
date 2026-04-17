@@ -2,5 +2,8 @@
 __pycache__/
 *.pyc
 results*.json
+smoke_*.json
+*.pkl
+caldera_text.txt
 .env
 runs/

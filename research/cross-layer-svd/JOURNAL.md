@@ -108,3 +108,96 @@ This hypothesis is untested. The immediate next experiment is whether HODLR on a
 2. **Per-matrix high-rank sweep** — r ∈ {512, 768, 1024, 2048} on MLP only. Establishes the quality ceiling we're measuring everything else against.
 3. **Balanced-truncation weighting** — add gradient covariance from a calibration backward pass; compare to ASVD at matched rank.
 4. **Tensor train across layers** (if HODLR+balanced-trunc validates).
+
+---
+
+## 2026-04-17 (evening) — Experimental results + strategic pivot
+
+### Experiment 3: HODLR single-matrix (gate_proj layer 12)
+Compared depth-1 and depth-2 HODLR against flat ASVD at matched byte budget.
+
+**Result:** Flat ASVD wins on weighted error at every byte budget (e.g. 5.8 MB budget → HODLR wgt_err 0.18, flat SVD wgt_err 0.12). Raw Frobenius error is closer (HODLR sometimes slightly better) but *weighted* error — the metric that predicts PPL — favors flat.
+
+**Why:** HODLR was designed for CFD integral-equation matrices where spatial locality is real. LLM weight rows/cols have no spatial structure; the quadtree prior is wrong. Our block-local ASVD also ignores cross-block activation covariance, stripping the signal that ASVD exploits.
+
+### Experiment 4: balanced truncation single-matrix
+Compared plain SVD, ASVD, and balanced (input + output gradient weighted) on one gate_proj matrix across ranks 64-768.
+
+**Result:** Balanced beats ASVD on weighted error at every rank, margin widens with rank (7% at r=64 → 40% at r=768). Balanced *loses* to ASVD on plain Frobenius and on input-only weighted error — it's intentionally sacrificing those to win on the balanced metric.
+
+### Experiment 5: whole-model balanced truncation (Qwen 2.5 0.5B)
+Extended prototype.py with a `--weighting balanced` flag. Requires a backward-pass calibration (forward + `loss.backward()`) to accumulate the output-gradient gramian GGT per module. Reconstruction is `W_r = S_out^{-1} U_r Σ_r V_r^T S_in^{-1}` with GPU eigendecomps for stability.
+
+**Result on 0.5B:**
+```
+rank | ASVD PPL | balanced PPL | delta
+ 512 |    86.5  |    46.8      | 46% better
+ 640 |    24.1  |    19.3      | 20% better
+ 768 |    13.1  |    12.4      |  5% better
+```
+Balanced wins everywhere but improvement shrinks as rank grows. The gap on whole-model PPL is smaller than the single-matrix weighted-error gap would suggest — some of the single-matrix improvement is wasted on layers that don't matter as much for final loss.
+
+### Research landscape (second agent survey, ML-specific)
+
+Key findings that changed our thinking:
+
+- **Basis Sharing (Saha et al. 2024, [arxiv 2410.07383](https://arxiv.org/abs/2410.07383))** — explicitly validates shared-basis cross-layer IF applied to **windows of 2-4 adjacent layers** (not all L). Global sharing breaks on LLaMA-7B just like it broke on our Qwen 0.5B. Our architecture was right; our granularity was wrong.
+- **SparseGPT-style OBS repair** ([arxiv 2301.00774](https://arxiv.org/abs/2301.00774)) — after truncation, use Hessian-inverse closed-form to *analytically redistribute* error into remaining columns. "Project and repair" instead of "project and pray." ~200 lines on top of our pipeline.
+- **CALDERA** ([arxiv 2405.18886](https://arxiv.org/abs/2405.18886)) — inverts the streaming economics: keep a 3-4 bit quantized W *resident*, stream a small (rank 64-128) correction. Per-layer PCIe transfer drops to 2-8 MB, well under 1 ms on Gen4 x16.
+- **Scale effects:** small models (<3B) fundamentally resist compression — intrinsic rank ≈ nominal rank. ~60-70% of our 0.5B fragility is model size, not algorithm. Papers: [arxiv 2411.04330](https://arxiv.org/abs/2411.04330), [arxiv 2404.09937](https://arxiv.org/abs/2404.09937), [arxiv 2012.13255](https://arxiv.org/abs/2012.13255).
+- **Nothing in production uses factored streaming.** FlexGen, PowerInfer, DeepSpeed-ZeRO-Inference, llama.cpp `-ngl` — none execute `y = B(A·x)` with PCIe-overlapped coefficient transfer. Either they reconstruct dense weights in VRAM or they stream whole layers naively.
+
+## Strategic pivot — 2026-04-17
+
+**From** "novel factoring scheme + streaming runtime"
+**To** "adopt proven factoring math + ship the streaming runtime that nobody has built yet"
+
+The decomposition math has been extensively studied in 2023-2024. Windowed Basis Sharing, non-uniform rank, balanced-truncation-adjacent methods, Q+LR hybrids — they're all published. **What's missing across every paper is the actual inference runtime**: kernel-level `y = B(A·x)` GEMM with double-buffered PCIe `cudaMemcpyAsync` streaming the next layer's coefficients, overlapped with current layer compute.
+
+That runtime work is where the llama.cpp fork gives us superpower. We can:
+1. Adopt windowed Basis Sharing + balanced truncation (or CALDERA) as the *decomposition*
+2. Build the *serving path* in `ggml-cuda` that keeps the resident basis warm and streams coefficients on a second CUDA stream
+3. Benchmark end-to-end tok/s vs naive offloading schemes (AirLLM, FlexGen)
+
+This is a cleaner, higher-value framing. The innovation budget moves from "prove a new math" to "prove a new runtime that makes existing math practical."
+
+### Revised roadmap
+
+1. **Gate 1 (now, in flight):** run current pipeline on Qwen 2.5 3B. If PPL at r=1024 is in the usable range (< ~20), the 0.5B-ceiling hypothesis is confirmed and the scheme works.
+2. **Next decomposition:** windowed Basis Sharing (window ∈ {2, 3, 4}) + balanced truncation on Qwen 3B. This is our original scheme at correct granularity.
+3. **Parallel kernel track:** prototype the `y = B(Ax)` kernel + double-buffered `cudaMemcpyAsync` in `ggml-cuda/`. Start against a toy decomposition; integrate winning factorization later.
+4. **CALDERA as alternate track:** Q+LR decomposition if Basis Sharing's memory split doesn't fit the 70B-on-12GB goal (Basis Sharing's shared basis is small but per-layer coeffs scale with L; CALDERA's quantized resident scales with param count).
+5. **Integration:** end-to-end benchmark on 70B — tok/s, TTFT, peak VRAM, PCIe utilization.
+
+---
+
+## 2026-04-17 (late) — Phase 0 complete: DESIGN.md
+
+Aggregated 5 parallel research agents + ggml internals recon into a full design doc: see **[DESIGN.md](DESIGN.md)** in this directory.
+
+Key corrections and pins from the aggregation:
+
+- **Paper ID correction:** Basis Sharing is arxiv **2410.03765**, not 2410.07383 (which is SparseGrad, unrelated). This repo's earlier notes had the wrong ID.
+- **Window=2 is the only safe Basis Sharing window size.** Paper's ablation: window=8 already worse than no sharing at 50% compression on LLaMA-7B.
+- **`o_proj` and `down_proj` do NOT share across layers** (Basis Sharing paper's Fig. 4b). Only q/k/v/gate/up. Those non-shared roles stay per-matrix with balanced truncation.
+- **FP64 Cholesky is mandatory** for the activation-covariance whitening; FP32 is unstable at 7B+ scale.
+- **CALDERA can't fit 70B in 12GB** even at its lowest published bit budget (~1.9 avg bits, ~16.6 GB). Streaming is still required. CALDERA is deferred to Phase 6.
+- **SparseGPT OBS repair** extends to SVD truncation with a clean derivation; this is our one "original math" contribution. Empirical validation is the last gate before Phase 1.
+- **Gen5 PCIe on RTX 5070 sustains 55-60 GB/s** — PCIe is not our bottleneck. Kernel launch overhead on small rank-k GEMMs is the real concern.
+- **Fork stays private.** Every streaming/offload proposal upstream has been rejected or closed-stale since 2023. Known scheduler bugs ([#18310](https://github.com/ggml-org/llama.cpp/issues/18310), [#18313](https://github.com/ggml-org/llama.cpp/issues/18313)) are closed "not planned" — we work around, not through.
+
+### Strategic pivot confirmed by aggregation
+
+From "novel factoring scheme + streaming runtime" → **"adopt proven factoring math (Basis Sharing + balanced truncation + OBS repair) and ship the streaming runtime that nobody has built"**. The decomposition papers stop at "here's the math, run it in Python with reconstructed weights." The PCIe-overlapped inference runtime is where our fork differentiates.
+
+### Phase 0 deliverables
+
+- [x] ggml internals recon (scheduler, tensor types, mul_mat dispatch, GGUF extensibility)
+- [x] 5 parallel research agents synthesized (Basis Sharing, CALDERA, SparseGPT OBS, CUDA streaming practices, llama.cpp upstream archaeology)
+- [x] DESIGN.md written with phase plan, file map, open questions
+- [ ] OBS-on-SVD empirical check on a single `gate_proj` (last gate before Phase 1)
+
+### Phase 1 triggers
+
+Proceed to Phase 1 when:
+1. OBS-on-SVD empirical check shows meaningful `bal_wgt` reduction vs plain balanced truncation at matched rank, OR is demonstrated harmless if the repair provides no lift — either outcome is fine, we just need the decision data.

@@ -65,12 +65,9 @@ def find_target_linears(model):
 
 @torch.no_grad()
 def collect_activation_stats(model, tokenizer, texts, device, seq_len):
-    """Run calibration texts and accumulate X^T X for each target linear.
-
-    Accumulators live on CPU fp32 to avoid VRAM blowup on down_proj (d_in=hidden*mlp_ratio).
-    """
+    """Run calibration texts and accumulate X^T X for each target linear."""
     groups = find_target_linears(model)
-    stats = {}  # {module_name: X^T X tensor on CPU}
+    stats = {}
     hooks = []
 
     def make_hook(name, d_in):
@@ -89,8 +86,7 @@ def collect_activation_stats(model, tokenizer, texts, device, seq_len):
             hooks.append(mod.register_forward_pre_hook(make_hook(name, d_in)))
 
     model.eval()
-    pbar = tqdm(texts, desc="calibration")
-    for text in pbar:
+    for text in tqdm(texts, desc="calibration"):
         enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
         input_ids = enc.input_ids.to(device)
         if input_ids.shape[1] < 8:
@@ -102,29 +98,130 @@ def collect_activation_stats(model, tokenizer, texts, device, seq_len):
     return stats, groups
 
 
-def whiten_matrices(xtx, eps_ratio=1e-4):
-    """Return (S, S_inv) where S @ S ≈ XTX + eps*I, both symmetric PSD."""
-    xtx = xtx.to(torch.float64)
+def collect_activation_and_grad_stats(model, tokenizer, texts, device, seq_len):
+    """Run forward+backward on calibration texts and accumulate:
+       - X^T X (input covariance) per target linear
+       - G^T G (output gradient covariance) per target linear
+    Needed for balanced truncation weighting.
+    """
+    groups = find_target_linears(model)
+    xtx = {}
+    ggt = {}
+    hooks = []
+
+    # Freeze everything, then re-enable grads only on target weights.
+    # The backward hook needs the target's output to be in the grad graph,
+    # which requires at least one parameter in or upstream of the module to have grad.
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for role, entries in groups.items():
+        for _, _, mod in entries:
+            mod.weight.requires_grad_(True)
+
+    def make_fwd_hook(name, d_in):
+        xtx[name] = torch.zeros(d_in, d_in, dtype=torch.float32)
+
+        def hook(mod, inputs):
+            x = inputs[0].detach()
+            flat = x.reshape(-1, x.shape[-1]).to(torch.float32)
+            xtx[name].add_((flat.T @ flat).cpu())
+
+        return hook
+
+    def make_bwd_hook(name, d_out):
+        ggt[name] = torch.zeros(d_out, d_out, dtype=torch.float32)
+
+        def hook(mod, grad_input, grad_output):
+            g = grad_output[0].detach()
+            flat = g.reshape(-1, g.shape[-1]).to(torch.float32)
+            ggt[name].add_((flat.T @ flat).cpu())
+
+        return hook
+
+    for role, entries in groups.items():
+        for _, name, mod in entries:
+            hooks.append(mod.register_forward_pre_hook(make_fwd_hook(name, mod.in_features)))
+            hooks.append(mod.register_full_backward_hook(make_bwd_hook(name, mod.out_features)))
+
+    model.eval()
+    for text in tqdm(texts, desc="calibration+bwd"):
+        enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
+        input_ids = enc.input_ids.to(device)
+        if input_ids.shape[1] < 8:
+            continue
+        out = model(input_ids, labels=input_ids)
+        out.loss.backward()
+        model.zero_grad(set_to_none=True)
+
+    for h in hooks:
+        h.remove()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return xtx, ggt, groups
+
+
+def _stable_svd_left(W, device):
+    """Return left singular vectors of W. Uses GPU only for smaller matrices;
+    falls back to CPU for big MLP matrices where cuSolver hits workspace issues
+    or runs out of VRAM. Threshold is empirical."""
+    rows, cols = W.shape
+    if device == "cuda" and rows * cols <= 5_000_000:
+        try:
+            w_gpu = W.to(device)
+            U, _, _ = torch.linalg.svd(w_gpu, full_matrices=False, driver="gesvd")
+            return U
+        except RuntimeError as e:
+            if "cusolver" not in str(e).lower() and "cuda" not in str(e).lower() \
+               and "memory" not in str(e).lower():
+                raise
+            # fall through to CPU
+    U, _, _ = torch.linalg.svd(W, full_matrices=False)
+    return U
+
+
+def whiten_matrices(xtx, eps_ratio=1e-4, device=None):
+    """Return (S, S_inv) where S @ S ≈ XTX + eps*I, both symmetric PSD.
+
+    Tries GPU eigh for speed; falls back to CPU on cuSolver failures that we've
+    seen intermittently on Blackwell + CUDA 12.8 nightly.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     n = xtx.shape[0]
-    mean_diag = xtx.diag().mean().item()
+    mean_diag = xtx.to(torch.float64).diag().mean().item()
     eps = eps_ratio * mean_diag + 1e-8
-    reg = xtx + eps * torch.eye(n, dtype=torch.float64)
-    # Symmetric eigendecomposition (PSD by construction)
-    evals, evecs = torch.linalg.eigh(reg)
-    evals = evals.clamp(min=eps)
-    sqrt_evals = evals.sqrt()
-    inv_sqrt_evals = 1.0 / sqrt_evals
-    S = (evecs * sqrt_evals.unsqueeze(0)) @ evecs.T
-    S_inv = (evecs * inv_sqrt_evals.unsqueeze(0)) @ evecs.T
+
+    def _compute(dev):
+        xtx64 = xtx.to(device=dev, dtype=torch.float64)
+        reg = xtx64 + eps * torch.eye(n, device=dev, dtype=torch.float64)
+        evals, evecs = torch.linalg.eigh(reg)
+        evals = evals.clamp(min=eps)
+        S = (evecs * evals.sqrt().unsqueeze(0)) @ evecs.T
+        S_inv = (evecs * (1.0 / evals.sqrt()).unsqueeze(0)) @ evecs.T
+        return S, S_inv
+
+    if device == "cuda":
+        try:
+            S, S_inv = _compute("cuda")
+            return S.cpu().to(torch.float32), S_inv.cpu().to(torch.float32)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "cusolver" not in msg and "cuda" not in msg and "memory" not in msg:
+                raise
+            # fall through
+    S, S_inv = _compute("cpu")
     return S.to(torch.float32), S_inv.to(torch.float32)
 
 
-def precompute_factors(weights, xtx_list, mode, activation_aware=True):
+def precompute_factors(weights, xtx_list, mode, weighting="asvd", ggt_list=None):
     """One-shot factorization. `mode` selects the decomposition geometry:
-      - 'cross-layer-h': stack W_i horizontally; shared output basis U [d_out, r].
-      - 'cross-layer-v': stack W_i vertically;   shared input  basis V [d_in, r].
+      - 'cross-layer-h': stack W_i horizontally; shared output basis.
+      - 'cross-layer-v': stack W_i vertically;   shared input  basis.
       - 'per-matrix':    per-matrix SVD, no sharing.
-    Reconstruction uses the numerically stable projection form in all cases.
+    `weighting` selects the inner-product the SVD is taken in:
+      - 'none':     plain Frobenius (no weighting)
+      - 'asvd':     input-activation weighted
+      - 'balanced': input AND output-gradient weighted (per-matrix only)
     """
     L = len(weights)
     d_out, d_in = weights[0].shape
@@ -132,35 +229,83 @@ def precompute_factors(weights, xtx_list, mode, activation_aware=True):
 
     weights_fp32 = [w.to(torch.float32).contiguous() for w in weights]
 
-    if activation_aware:
-        S_list = [whiten_matrices(x)[0] for x in xtx_list]
-        weighted = [w @ S for w, S in zip(weights_fp32, S_list)]
-    else:
-        weighted = weights_fp32
-
     f = {
         "mode": mode,
+        "weighting": weighting,
         "weights_fp32": weights_fp32,
         "d_out": d_out, "d_in": d_in, "L": L,
-        "activation_aware": activation_aware,
         "dtype": weights[0].dtype,
     }
 
+    if mode == "per-matrix" and weighting == "balanced":
+        assert ggt_list is not None, "balanced weighting requires ggt_list"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        per_layer = []
+
+        def _gpu_whiten(M, eps_ratio=1e-5):
+            M64 = M.to(device=device, dtype=torch.float64)
+            n = M64.shape[0]
+            eps = eps_ratio * M64.diag().mean().item() + 1e-8
+            reg = M64 + eps * torch.eye(n, device=device, dtype=torch.float64)
+            evals, evecs = torch.linalg.eigh(reg)
+            evals = evals.clamp(min=eps)
+            S = (evecs * evals.sqrt().unsqueeze(0)) @ evecs.T
+            S_inv = (evecs * (1.0 / evals.sqrt()).unsqueeze(0)) @ evecs.T
+            return S, S_inv
+
+        for W, XTX, GGT in zip(weights_fp32, xtx_list, ggt_list):
+            S_in, S_in_inv = _gpu_whiten(XTX)
+            S_out, S_out_inv = _gpu_whiten(GGT)
+            W_g = W.to(device=device, dtype=torch.float64)
+            M = S_out @ W_g @ S_in
+            U, sigma, Vt = torch.linalg.svd(M, full_matrices=False)
+            # Move everything back to CPU fp64 for storage; GPU VRAM stays bounded.
+            per_layer.append({
+                "U": U.cpu(), "sigma": sigma.cpu(), "Vt": Vt.cpu(),
+                "S_in_inv": S_in_inv.cpu(),
+                "S_out_inv": S_out_inv.cpu(),
+            })
+            del S_in, S_in_inv, S_out, S_out_inv, W_g, M, U, sigma, Vt
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        f["per_layer"] = per_layer
+        return f
+
+    # Non-balanced paths: optionally apply activation weighting, then SVD.
+    # SVD on GPU fp32 for the big MLP matrices on larger models.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if weighting == "asvd":
+        S_list = [whiten_matrices(x)[0] for x in xtx_list]
+        weighted = [w @ S for w, S in zip(weights_fp32, S_list)]
+    elif weighting == "none":
+        weighted = weights_fp32
+    else:
+        raise ValueError(f"weighting={weighting} not supported for mode={mode}")
+
     if mode == "cross-layer-h":
-        W_cat = torch.cat(weighted, dim=1)  # [d_out, L * d_in]
+        W_cat = torch.cat(weighted, dim=1).to(device)
         U, _, _ = torch.linalg.svd(W_cat, full_matrices=False)
-        f["U"] = U  # [d_out, min(d_out, L*d_in)]
+        f["U"] = U.cpu()
+        del W_cat, U
+        if device == "cuda":
+            torch.cuda.empty_cache()
     elif mode == "cross-layer-v":
-        W_cat = torch.cat(weighted, dim=0)  # [L * d_out, d_in]
+        W_cat = torch.cat(weighted, dim=0).to(device)
         _, _, Vt = torch.linalg.svd(W_cat, full_matrices=False)
-        f["V"] = Vt.T  # [d_in, min(d_in, L*d_out)]
+        f["V"] = Vt.T.cpu()
+        del W_cat, Vt
+        if device == "cuda":
+            torch.cuda.empty_cache()
     elif mode == "per-matrix":
         Us = []
-        Vts = []
-        for w_weighted, w_orig in zip(weighted, weights_fp32):
-            U, _, _ = torch.linalg.svd(w_weighted, full_matrices=False)
-            Us.append(U)
-        f["U_per_layer"] = Us  # each [d_out, min(d_out, d_in)]
+        for w_weighted in weighted:
+            U = _stable_svd_left(w_weighted, device)
+            Us.append(U.cpu())
+            del U
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        f["U_per_layer"] = Us
     else:
         raise ValueError(f"unknown mode: {mode}")
 
@@ -168,10 +313,23 @@ def precompute_factors(weights, xtx_list, mode, activation_aware=True):
 
 
 def reconstruct_at_rank(factors, rank):
-    """Slice cached factors to `rank` and rebuild per-layer weights via projection."""
+    """Slice cached factors to `rank` and rebuild per-layer weights."""
     mode = factors["mode"]
+    weighting = factors.get("weighting", "asvd")
     dtype = factors["dtype"]
     recons = []
+
+    if mode == "per-matrix" and weighting == "balanced":
+        r_effective = None
+        for layer_f in factors["per_layer"]:
+            U = layer_f["U"]; sigma = layer_f["sigma"]; Vt = layer_f["Vt"]
+            S_in_inv = layer_f["S_in_inv"]; S_out_inv = layer_f["S_out_inv"]
+            r = min(rank, sigma.numel())
+            r_effective = r
+            M_r = (U[:, :r] * sigma[:r].unsqueeze(0)) @ Vt[:r, :]
+            W_r = S_out_inv @ M_r @ S_in_inv
+            recons.append(W_r.to(dtype))
+        return r_effective, recons
 
     if mode == "cross-layer-h":
         r = min(rank, factors["U"].shape[1])
@@ -183,7 +341,6 @@ def reconstruct_at_rank(factors, rank):
         r = min(rank, factors["V"].shape[1])
         V_r = factors["V"][:, :r]
         for W_i in factors["weights_fp32"]:
-            # Project onto top-r input directions: W_i @ V_r @ V_r^T
             recons.append(((W_i @ V_r) @ V_r.T).to(dtype))
     elif mode == "per-matrix":
         r_effective = None
@@ -270,8 +427,12 @@ def main():
                    default=[32, 64, 128, 192, 256, 384, 512, 768])
     p.add_argument("--mode", default="cross-layer-h",
                    choices=["cross-layer-h", "cross-layer-v", "per-matrix"])
+    p.add_argument("--weighting", default="asvd",
+                   choices=["none", "asvd", "balanced"],
+                   help="SVD inner-product weighting. 'balanced' is per-matrix only "
+                        "and requires a backward-pass calibration (slower).")
     p.add_argument("--no-asvd", action="store_true",
-                   help="disable activation-aware weighting (naive SVD baseline)")
+                   help="deprecated alias for --weighting none")
     p.add_argument("--roles", nargs="+", default=None,
                    help="subset of ROLES to decompose (default: all)")
     p.add_argument("--out", default="results.json")
@@ -283,15 +444,31 @@ def main():
     dtype = getattr(torch, args.dtype)
     roles_to_factor = args.roles or ROLES
 
-    print(f"loading {args.model} in {args.dtype} on {device}")
+    # Legacy flag compatibility
+    if args.no_asvd:
+        args.weighting = "none"
+
+    if args.weighting == "balanced" and args.mode != "per-matrix":
+        p.error("--weighting balanced is only supported with --mode per-matrix")
+
+    # Backward pass needs fp32 weights for stable gradients on small calibration sets.
+    load_dtype = torch.float32 if args.weighting == "balanced" else dtype
+    print(f"loading {args.model} in {load_dtype} on {device} "
+          f"(mode={args.mode}, weighting={args.weighting})")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=load_dtype).to(device)
     model.eval()
 
     calib = load_calibration_texts(tokenizer, args.calib_samples)
     print(f"calibration corpus: {len(calib)} samples")
     t0 = time.time()
-    xtx_by_name, groups = collect_activation_stats(model, tokenizer, calib, device, args.calib_seq_len)
+    ggt_by_name = None
+    if args.weighting == "balanced":
+        xtx_by_name, ggt_by_name, groups = collect_activation_and_grad_stats(
+            model, tokenizer, calib, device, args.calib_seq_len)
+    else:
+        xtx_by_name, groups = collect_activation_stats(
+            model, tokenizer, calib, device, args.calib_seq_len)
     print(f"calibration pass done in {time.time()-t0:.1f}s")
 
     eval_text = load_eval_text()
@@ -305,16 +482,21 @@ def main():
     results = {
         "model": args.model,
         "mode": args.mode,
+        "weighting": args.weighting,
         "calib_samples": args.calib_samples,
         "eval_tokens": args.eval_tokens,
         "roles_factored": roles_to_factor,
-        "activation_aware": not args.no_asvd,
         "baseline_ppl": baseline_ppl,
         "sweeps": [],
     }
 
     # One-shot factorization per role, cache, then slice cheaply per rank.
-    print(f"\nprecomputing factors per role (mode={args.mode})")
+    # Move the model to CPU during SVD so GPU VRAM is free for cuSolver workspace
+    # (matters on larger models where model + SVD workspace > VRAM).
+    print(f"\nprecomputing factors per role (mode={args.mode} weighting={args.weighting})")
+    if device == "cuda":
+        model.cpu()
+        torch.cuda.empty_cache()
     role_cache = {}
     for role in roles_to_factor:
         entries = groups.get(role, [])
@@ -323,9 +505,11 @@ def main():
         _, names, modules = zip(*entries)
         weights = [m.weight.data.cpu() for m in modules]
         xtx_list = [xtx_by_name[n] for n in names]
+        ggt_list = [ggt_by_name[n] for n in names] if ggt_by_name else None
         t0 = time.time()
         factors = precompute_factors(weights, xtx_list, args.mode,
-                                     activation_aware=not args.no_asvd)
+                                     weighting=args.weighting,
+                                     ggt_list=ggt_list)
         dt = time.time() - t0
         role_cache[role] = {"factors": factors, "modules": modules, "names": names}
         d_out, d_in = factors["d_out"], factors["d_in"]
@@ -333,9 +517,15 @@ def main():
             max_r = factors["U"].shape[1]
         elif args.mode == "cross-layer-v":
             max_r = factors["V"].shape[1]
+        elif args.mode == "per-matrix" and args.weighting == "balanced":
+            max_r = factors["per_layer"][0]["sigma"].numel()
         else:
             max_r = factors["U_per_layer"][0].shape[1]
         print(f"  {role}: {d_out}x{d_in} x{len(modules)}  max_rank={max_r}  ({dt:.1f}s)")
+
+    # Move the model back to GPU for the PPL eval loop.
+    if device == "cuda":
+        model.to(device)
 
     for r in args.ranks:
         print(f"\n--- rank = {r} ---")
