@@ -704,6 +704,9 @@ llama_model_loader::llama_model_loader(
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
             __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 
+    // Phase 3.2: detect factored-weight GGUFs and build the source map.
+    scan_factored_sources();
+
     // determine file type based on the number of tensors for each quantization and print meta data
     // TODO: make optional
     {
@@ -1682,6 +1685,132 @@ bool llama_model_loader::load_all_data(
 
 std::string llama_model_loader::ftype_name() const {
     return llama_model_ftype_name(ftype);
+}
+
+// ---------------------------------------------------------------------------
+// Factored-weight detection (Phase 3.2)
+// ---------------------------------------------------------------------------
+//
+// A factored GGUF replaces each dense weight `blk.{L}.{role}.weight` with
+// either a shared-basis pair:
+//     shared.{role}.w{W:03d}.basis           (d_out × rank; shared across window)
+//     shared.{role}.w{W:03d}.coeffs.{L:03d}  (rank × d_in;   per-layer)
+// or a per-matrix pair:
+//     permatrix.{role}.{L:03d}.U             (d_out × rank)
+//     permatrix.{role}.{L:03d}.V             (rank × d_in)
+//
+// scan_factored_sources walks weights_map and records, for each logical
+// dense-weight name that should be loaded, the GGUF tensor names of its
+// basis and coefficients replacements. No tensors are allocated here —
+// that happens in the model-specific load_tensors path.
+
+void llama_model_loader::scan_factored_sources() {
+    // KV lookup: only run the scan if factored.enabled is true and set.
+    factored_enabled = false;
+    const int kid = gguf_find_key(metadata, "factored.enabled");
+    if (kid < 0 || gguf_get_kv_type(metadata, kid) != GGUF_TYPE_BOOL) {
+        return;
+    }
+    factored_enabled = gguf_get_val_bool(metadata, kid);
+    if (!factored_enabled) {
+        return;
+    }
+
+    // Two passes over weights_map:
+    //   1) index all shared bases by (role, window)
+    //   2) resolve each shared coeffs.{L} and each permatrix pair into a
+    //      factored_source entry keyed by "blk.{L}.{role}.weight".
+
+    // Pass 1: basis map
+    std::unordered_map<std::string, std::string> basis_by_role_window;
+    for (const auto & kv : weights_map) {
+        const std::string & name = kv.first;
+        // expecting "shared.{role}.w{W}.basis"
+        if (name.rfind("shared.", 0) != 0) continue;
+        const size_t dot2 = name.find('.', 7);  // position after "shared."
+        if (dot2 == std::string::npos) continue;
+        const std::string role = name.substr(7, dot2 - 7);
+        if (name.substr(dot2 + 1, 1) != "w") continue;
+        const size_t suffix_start = name.find('.', dot2 + 1);
+        if (suffix_start == std::string::npos) continue;
+        const std::string window = name.substr(dot2 + 2, suffix_start - dot2 - 2);
+        const std::string suffix = name.substr(suffix_start + 1);
+        if (suffix == "basis") {
+            basis_by_role_window[role + "|" + window] = name;
+        }
+    }
+
+    // Pass 2: resolve shared coeffs and permatrix pairs
+    std::unordered_map<std::string, std::pair<std::string,std::string>> pm_pairs;  // "role|L" -> (U,V)
+
+    for (const auto & kv : weights_map) {
+        const std::string & name = kv.first;
+
+        if (name.rfind("shared.", 0) == 0) {
+            // shared.{role}.w{W}.coeffs.{L}
+            const size_t dot2 = name.find('.', 7);
+            if (dot2 == std::string::npos) continue;
+            const std::string role = name.substr(7, dot2 - 7);
+            const size_t suffix_start = name.find('.', dot2 + 1);
+            if (suffix_start == std::string::npos) continue;
+            const std::string window = name.substr(dot2 + 2, suffix_start - dot2 - 2);
+            const std::string suffix = name.substr(suffix_start + 1);
+            if (suffix.rfind("coeffs.", 0) != 0) continue;
+            const std::string layer_str = suffix.substr(7);
+            int layer = -1;
+            try { layer = std::stoi(layer_str); } catch (...) { continue; }
+            auto it = basis_by_role_window.find(role + "|" + window);
+            if (it == basis_by_role_window.end()) {
+                throw std::runtime_error(format(
+                    "factored GGUF: coeffs tensor '%s' has no matching basis (role=%s window=%s)",
+                    name.c_str(), role.c_str(), window.c_str()));
+            }
+            const std::string canonical = format("blk.%d.%s.weight", layer, role.c_str());
+            factored_sources[canonical] = {it->second, name};
+        } else if (name.rfind("permatrix.", 0) == 0) {
+            // permatrix.{role}.{L}.{U|V}
+            const size_t dot2 = name.find('.', 10);
+            if (dot2 == std::string::npos) continue;
+            const std::string role = name.substr(10, dot2 - 10);
+            const size_t dot3 = name.find('.', dot2 + 1);
+            if (dot3 == std::string::npos) continue;
+            const std::string layer_str = name.substr(dot2 + 1, dot3 - dot2 - 1);
+            const std::string kind = name.substr(dot3 + 1);
+            int layer = -1;
+            try { layer = std::stoi(layer_str); } catch (...) { continue; }
+            const std::string key = role + "|" + std::to_string(layer);
+            if (kind == "U") {
+                pm_pairs[key].first = name;
+            } else if (kind == "V") {
+                pm_pairs[key].second = name;
+            }
+        }
+    }
+
+    for (const auto & kv : pm_pairs) {
+        const std::string & key = kv.first;
+        const auto & pair = kv.second;
+        const size_t bar = key.find('|');
+        const std::string role = key.substr(0, bar);
+        const int layer = std::stoi(key.substr(bar + 1));
+        if (pair.first.empty() || pair.second.empty()) {
+            throw std::runtime_error(format(
+                "factored GGUF: permatrix role=%s layer=%d missing %s",
+                role.c_str(), layer, pair.first.empty() ? "U" : "V"));
+        }
+        const std::string canonical = format("blk.%d.%s.weight", layer, role.c_str());
+        factored_sources[canonical] = {pair.first, pair.second};
+    }
+
+    LLAMA_LOG_INFO("%s: factored GGUF — %zu factored weights detected\n",
+            __func__, factored_sources.size());
+}
+
+const llama_model_loader::factored_source *
+llama_model_loader::get_factored_source(const std::string & name) const {
+    if (!factored_enabled) return nullptr;
+    auto it = factored_sources.find(name);
+    return (it == factored_sources.end()) ? nullptr : &it->second;
 }
 
 void llama_model_loader::print_info() const {

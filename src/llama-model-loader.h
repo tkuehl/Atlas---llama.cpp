@@ -90,6 +90,22 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
+    // Factored-weight metadata (Phase 3.2). Populated by scan_factored_sources()
+    // at construction if the GGUF has factored.enabled=True. Each entry maps a
+    // logical dense-weight name ("blk.{L}.{role}.weight") to the GGUF names of
+    // its basis and coefficients tensors.
+    //
+    // For shared-basis roles (q/k/v/gate/up): multiple layers in a window share
+    // the SAME basis_name, but each layer has its own coeffs_name.
+    // For per-matrix roles (o_proj / down_proj): basis is the "U" factor,
+    // coeffs is the "V" factor, both unique per layer.
+    struct factored_source {
+        std::string basis_name;
+        std::string coeffs_name;
+    };
+    bool factored_enabled = false;
+    std::unordered_map<std::string, factored_source> factored_sources;
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
@@ -204,4 +220,19 @@ struct llama_model_loader {
     std::string ftype_name() const;
 
     void print_info() const;
+
+    // Phase 3.2: call after weights_map is populated. Checks the KV field
+    // "factored.enabled". If true, walks weights_map looking for
+    // "shared.{role}.w{W}.basis" / ".coeffs.{L}" and
+    // "permatrix.{role}.{L}.{U|V}" names, and builds factored_sources
+    // mapping each canonical dense-weight name to the factor pair that
+    // replaces it.
+    //
+    // Idempotent; safe to call exactly once after construction.
+    void scan_factored_sources();
+
+    // Returns a pointer to the factored source descriptor for a canonical
+    // dense-weight name like "blk.12.ffn_gate.weight", or nullptr if the
+    // tensor isn't factored (or if this isn't a factored GGUF).
+    const factored_source * get_factored_source(const std::string & name) const;
 };
