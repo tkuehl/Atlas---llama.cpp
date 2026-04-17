@@ -3066,35 +3066,32 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
+        // Factored-aware tensor creation (Phase 3.2).
+        //
+        // For any role the GGUF has factored (declared in ml.factored_sources),
+        // allocate the basis + coeffs pair, register the pair in
+        // model.factored_coeffs so build_lora_mm routes through
+        // ggml_factored_linear, and return the basis so the caller can still
+        // assign it to layer.wq / layer.ffn_down / etc.
+        //
+        // For unfactored roles (and for non-MUL_MAT tensors like norms and
+        // biases) ml.create_tensor_factored returns {nullptr, nullptr} and we
+        // fall through to the ordinary path. This means every architecture
+        // gets factored support transparently — no per-arch plumbing.
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+            if (ml.factored_enabled) {
+                auto pair = ml.create_tensor_factored(
+                    hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+                    tn, flags);
+                if (pair.first != nullptr) {
+                    factored_coeffs.emplace(pair.first, pair.second);
+                    return pair.first;
+                }
+            }
             return ml.create_tensor(
                 hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
                 tn, ne, flags);
-        };
-
-        // Phase 3.2 step 3c: factored-aware tensor creation.
-        // For roles that may be factored (Q/K/V/O/gate/up/down), tries the
-        // factored path first. If the role is in factored_sources, allocates
-        // both basis and coeffs tensors, stores the coeffs pointer in
-        // *coeffs_out, and registers the pair in model.factored_coeffs so the
-        // graph builder routes through ggml_factored_linear. Falls back to
-        // ordinary create_tensor for unfactored GGUFs.
-        auto create_tensor_or_factored = [&](const LLM_TN_IMPL & tn,
-                                              const std::initializer_list<int64_t> & ne,
-                                              int flags,
-                                              ggml_tensor ** coeffs_out) -> ggml_tensor * {
-            const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-            auto pair = ml.create_tensor_factored(
-                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-                tn, flags);
-            if (pair.first != nullptr) {
-                if (coeffs_out) *coeffs_out = pair.second;
-                factored_coeffs.emplace(pair.first, pair.second);
-                return pair.first;
-            }
-            if (coeffs_out) *coeffs_out = nullptr;
-            return create_tensor(tn, ne, flags);
         };
 
         layers.resize(n_layer);
@@ -3120,9 +3117,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (layer.wqkv) {
                 layer.bqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
             } else {
-                layer.wq = create_tensor_or_factored(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags, &layer.wq_coeffs);
-                layer.wk = create_tensor_or_factored(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags, &layer.wk_coeffs);
-                layer.wv = create_tensor_or_factored(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags, &layer.wv_coeffs);
+                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
+                layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
+                layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags);
                 layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
                 layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
                 layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
@@ -3940,13 +3937,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
                         create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
-                        layer.wo = create_tensor_or_factored(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0, &layer.wo_coeffs);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
-                        layer.ffn_gate = create_tensor_or_factored(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0, &layer.ffn_gate_coeffs);
-                        layer.ffn_down = create_tensor_or_factored(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0, &layer.ffn_down_coeffs);
-                        layer.ffn_up   = create_tensor_or_factored(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0, &layer.ffn_up_coeffs);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                     }
                 } break;
             case LLM_ARCH_QWEN2MOE:

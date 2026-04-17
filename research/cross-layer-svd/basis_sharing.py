@@ -18,10 +18,13 @@ Usage:
 
 import argparse
 import json
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+import psutil
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -226,9 +229,111 @@ def make_windows(L, window_size):
     return out
 
 
+# ---------- memory safety + gramian storage ----------
+#
+# Calibration accumulates d×d fp32 gramians (xtx, optionally ggt) for every
+# linear module we're about to factor. For tall intermediate-dim matrices like
+# down_proj on 7B+ (d_in=18944), a single gramian is 1.4 GB and the full model
+# needs ~40 GB — more than fits in RAM alongside the model. XtxStore solves
+# that by optionally memmap-backing the accumulators onto NVMe, so page cache
+# absorbs the hot set and RAM pressure stays bounded.
+
+def _require_ram_headroom(bytes_needed: int, min_free_gb: float, label: str):
+    """Safety check (Option A): refuse the allocation if it would put free RAM
+    below the configured OS headroom. Raises with a message that names the
+    offending role and suggests --xtx-backend disk as the mitigation."""
+    avail = psutil.virtual_memory().available
+    reserve = int(min_free_gb * 1e9)
+    if avail - bytes_needed < reserve:
+        raise MemoryError(
+            f"refusing to allocate {bytes_needed/1e9:.2f} GB for {label}: "
+            f"only {avail/1e9:.2f} GB free, would leave less than the "
+            f"{min_free_gb:.1f} GB reserved for the OS. "
+            f"Pass --xtx-backend disk (or auto) to spill gramians to NVMe."
+        )
+
+
+class XtxStore:
+    """Allocates and owns d×d fp32 accumulators for calibration.
+
+    Modes:
+      - "ram":  torch.zeros on CPU (current behavior)
+      - "disk": np.memmap → torch.from_numpy; addmm_ writes through to NVMe.
+                The OS page cache handles residency; this just caps RAM.
+      - "auto": per-tensor choice. If the allocation would trip the
+                --min-free-ram-gb threshold, fall back to disk; else RAM.
+
+    All tensors are CPU fp32 and safe to hand to downstream addmm_ and SVD
+    code unchanged. Call cleanup() when done to delete temp files.
+    """
+
+    def __init__(self, mode: str, temp_dir: Path | None, min_free_gb: float):
+        assert mode in ("ram", "disk", "auto")
+        self.mode = mode
+        self.min_free_gb = min_free_gb
+        self.temp_dir = Path(temp_dir) if temp_dir is not None else None
+        if mode != "ram":
+            if self.temp_dir is None:
+                raise ValueError("disk-backed XtxStore requires a temp_dir")
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self._memmaps: dict[str, np.memmap] = {}
+        self._paths: list[Path] = []
+
+    def _use_disk(self, bytes_needed: int) -> bool:
+        if self.mode == "ram":
+            return False
+        if self.mode == "disk":
+            return True
+        # auto: go to disk if this allocation would cross the safety line OR
+        # if free RAM is already within one allocation of the reserve. The
+        # double-reserve margin biases us toward disk earlier, before RAM
+        # pressure cascades: better to spill a few extra gramians to NVMe
+        # than to fill RAM and stall the next allocation.
+        avail = psutil.virtual_memory().available
+        reserve = int(self.min_free_gb * 1e9)
+        return bytes_needed > avail - 2 * reserve
+
+    def alloc(self, name: str, d: int) -> torch.Tensor:
+        bytes_needed = d * d * 4  # fp32
+        use_disk = self._use_disk(bytes_needed)
+        if use_disk:
+            # No RAM safety check on the disk path. Memmap writes go to the
+            # OS page cache, which Windows auto-reclaims under pressure — so
+            # even when free RAM looks low, we are not actually allocating
+            # new process memory. Guarding this on virtual_memory().available
+            # produces false positives once the page cache fills up.
+            safe = name.replace("/", "_").replace(".", "_")
+            path = self.temp_dir / f"xtx_{safe}.f32"
+            # mode='w+' truncates; freshly-extended pages are zero-initialized
+            # by the OS, so we don't need (and shouldn't pay for) an explicit
+            # arr[:] = 0 that dirties every page up front.
+            arr = np.memmap(str(path), dtype="float32", mode="w+", shape=(d, d))
+            self._memmaps[name] = arr
+            self._paths.append(path)
+            return torch.from_numpy(arr)
+        _require_ram_headroom(bytes_needed, self.min_free_gb, name)
+        return torch.zeros(d, d, dtype=torch.float32)
+
+    def cleanup(self):
+        # Drop strong refs so the OS can unlink the files on Windows.
+        self._memmaps.clear()
+        for p in self._paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        self._paths.clear()
+        if self.temp_dir is not None and self.temp_dir.exists():
+            try:
+                self.temp_dir.rmdir()
+            except OSError:
+                pass  # dir not empty (leftover files or other artifacts)
+
+
 # ---------- calibration (forward + optional backward) ----------
 
-def collect_stats(model, tokenizer, texts, device, seq_len, all_roles, need_grad):
+def collect_stats(model, tokenizer, texts, device, seq_len, all_roles, need_grad,
+                  xtx_store: XtxStore, ggt_store: XtxStore | None = None):
     """Run calibration and accumulate X^T X (input cov) and optionally G^T G
     (output-gradient cov) for every linear we care about."""
     groups = find_layers(model, all_roles)
@@ -249,7 +354,7 @@ def collect_stats(model, tokenizer, texts, device, seq_len, all_roles, need_grad
     # with 108 such matrices per sample (gate/up/down on 36 layers of a 3B),
     # a single sample spends 52+ GB of PCIe bandwidth on gramian traffic alone.
     def fwd_hook_factory(name, d_in):
-        xtx[name] = torch.zeros(d_in, d_in, dtype=torch.float32)
+        xtx[name] = xtx_store.alloc(name, d_in)
 
         def hook(mod, inputs):
             x = inputs[0].detach()
@@ -259,7 +364,7 @@ def collect_stats(model, tokenizer, texts, device, seq_len, all_roles, need_grad
         return hook
 
     def bwd_hook_factory(name, d_out):
-        ggt[name] = torch.zeros(d_out, d_out, dtype=torch.float32)
+        ggt[name] = ggt_store.alloc(name, d_out)
 
         def hook(mod, grad_input, grad_output):
             g = grad_output[0].detach()
@@ -462,6 +567,35 @@ def _gpu_mem_str():
     return f"[gpu {used:.1f}/{total/1024**3:.1f}GB]"
 
 
+def _weight_to_cpu(mod):
+    """Safely fetch a module's weight as a CPU tensor.
+
+    With accelerate's device_map offloading, a module's parameters can live
+    on the `meta` device (pure metadata, no data). `mod.weight.data.cpu()`
+    raises NotImplementedError on those. `mod.state_dict()` triggers the
+    accelerate hooks that materialize the weights, so we fall back to it.
+    """
+    w = mod.weight
+    if w.device.type == "meta":
+        return mod.state_dict()["weight"].cpu()
+    return w.data.cpu()
+
+
+def _install_weight(mod, new_weight):
+    """Write `new_weight` into `mod.weight`, coping with meta-device params.
+
+    In-place `mod.weight.data.copy_(...)` fails when the parameter is a
+    meta placeholder (no storage). In that case we swap in a fresh
+    Parameter so the module has a real weight backing the forward pass.
+    Non-meta params use the normal in-place copy so we don't perturb
+    accelerate's offload hooks.
+    """
+    if mod.weight.device.type == "meta":
+        mod.weight = torch.nn.Parameter(new_weight.detach(), requires_grad=False)
+    else:
+        mod.weight.data.copy_(new_weight.to(mod.weight.device))
+
+
 def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
                     window_size, target_ratio, device, refit=True):
     """Compute all decomposition factors WITHOUT modifying the model.
@@ -492,7 +626,7 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
     for role, entries in groups_shared.items():
         _, names, mods = zip(*entries)
         L = len(mods)
-        W_list_all = [m.weight.data.cpu() for m in mods]
+        W_list_all = [_weight_to_cpu(m) for m in mods]
         xtx_list_all = [xtx[n] for n in names]
         ggt_list_all = [ggt[n] for n in names] if ggt else None
         d_out, d_in = W_list_all[0].shape
@@ -578,7 +712,7 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
             have_ggt = ggt is not None
             S_in, S_in_inv = sqrt_and_inv(xtx[name], device=device,
                                           need_inv=have_ggt)
-            W_t = mod.weight.data.to(device=S_in.device, dtype=S_in.dtype)
+            W_t = _weight_to_cpu(mod).to(device=S_in.device, dtype=S_in.dtype)
             if have_ggt:
                 S_out, S_out_inv = sqrt_and_inv(ggt[name], device=device,
                                                 need_inv=True)
@@ -627,8 +761,8 @@ def materialize_factors_in_place(model, factors, groups_shared, groups_permatrix
         for win in factors["shared"][role]["windows"]:
             B = win["basis"]
             for i_local, layer_i in enumerate(win["layers"]):
-                W_recon = (B @ win["coeffs"][i_local]).to(mods[layer_i].weight.device, dtype)
-                mods[layer_i].weight.data.copy_(W_recon)
+                W_recon = (B @ win["coeffs"][i_local]).to(dtype)
+                _install_weight(mods[layer_i], W_recon)
             role_report.append({"window": win["window_id"], "layers": win["layers"],
                                 "mode": win["mode"], "rank": win["rank"]})
         report[role] = role_report
@@ -639,8 +773,8 @@ def materialize_factors_in_place(model, factors, groups_shared, groups_permatrix
         pm_info = factors["permatrix"][role]
         for lf in pm_info["layers"]:
             i = lf["layer"]
-            W_r = (lf["U"] @ lf["V"]).to(mods[i].weight.device, dtype)
-            mods[i].weight.data.copy_(W_r)
+            W_r = (lf["U"] @ lf["V"]).to(dtype)
+            _install_weight(mods[i], W_r)
             role_report.append({"layer": i, "rank": pm_info["rank"]})
         report[role] = role_report
 
@@ -865,6 +999,21 @@ def main():
                    help="device for gramian eigendecompositions + SVDs "
                         "(cuda preferred; falls back to CPU on cuSolver failures)")
     p.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
+    p.add_argument("--device-map", default=None,
+                   help="HuggingFace device_map, e.g. 'auto' for transformers-managed "
+                        "GPU+CPU dispatch on models that don't fit entirely in VRAM. "
+                        "When set, skips the manual .to(device)/.cpu() moves.")
+    p.add_argument("--min-free-ram-gb", type=float, default=4.0,
+                   help="OS headroom: refuse gramian allocations that would leave "
+                        "less than this much free RAM. Safety net against OOM "
+                        "locking up the machine.")
+    p.add_argument("--xtx-backend", default="auto", choices=["auto", "ram", "disk"],
+                   help="Where to store d*d calibration gramians. 'ram' matches "
+                        "legacy behavior; 'disk' memmaps them to NVMe; 'auto' "
+                        "picks per-tensor based on --min-free-ram-gb.")
+    p.add_argument("--xtx-temp-dir", default=None,
+                   help="Directory for disk-backed gramians (default: "
+                        "{checkpoint-dir}/xtx or {save-dir}/xtx).")
     args = p.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -886,34 +1035,78 @@ def main():
     # once we add backward. Gramian accumulators are fp32 regardless (we cast
     # inside the hooks), so calibration statistics stay precise.
     load_dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(args.model,
-                                                 torch_dtype=load_dtype).to(device)
+    use_device_map = args.device_map is not None
+    if use_device_map:
+        print(f"  using device_map='{args.device_map}' (transformers-managed dispatch)")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=load_dtype, device_map=args.device_map)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=load_dtype).to(device)
     model.eval()
+    # When device_map is in use, the script's `device` variable (derived from
+    # torch.cuda.is_available) may not match where the model's inputs should
+    # land — e.g. device_map="cpu" wants inputs on CPU even though CUDA is
+    # available. Use the model's own device for forward passes in that case.
+    input_device = str(model.device) if use_device_map else device
 
     # Baseline PPL first (untouched weights)
     eval_text = load_eval_text()
     print("baseline PPL")
     t0 = time.time()
-    baseline_ppl = evaluate_ppl(model, tokenizer, eval_text, device, n_tokens=args.eval_tokens)
+    baseline_ppl = evaluate_ppl(model, tokenizer, eval_text, input_device, n_tokens=args.eval_tokens)
     print(f"  = {baseline_ppl:.3f} ({time.time()-t0:.1f}s)")
 
     # Calibration
     calib = load_calib_texts(tokenizer, args.calib_samples)
     all_roles = SHARED_ROLES + PERMATRIX_ROLES
 
-    # Calibration — checkpoint-resumable
+    # Calibration — checkpoint-resumable. xtx_store/ggt_store are created
+    # only on a fresh calibration pass; reused-checkpoint paths use in-memory
+    # tensors loaded from the pickle and have nothing to clean up.
+    xtx_store: XtxStore | None = None
+    ggt_store: XtxStore | None = None
     cached_calib = checkpoint_load(ckpt_dir, "calibration") if ckpt_dir else None
     if cached_calib is not None:
         xtx, ggt = cached_calib["xtx"], cached_calib["ggt"]
         print(f"  reused cached calibration ({len(xtx)} modules)")
     else:
-        print(f"calibration ({len(calib)} samples, need_grad={need_grad})")
+        # Resolve the temp dir for disk-backed gramians. Falls through a
+        # preference chain so single-shot runs without a checkpoint dir still
+        # have somewhere reasonable to spill to.
+        if args.xtx_temp_dir is not None:
+            xtx_temp_dir = Path(args.xtx_temp_dir)
+        elif ckpt_dir is not None:
+            xtx_temp_dir = Path(ckpt_dir) / "xtx"
+        elif args.save_dir is not None:
+            xtx_temp_dir = Path(args.save_dir) / "xtx"
+        else:
+            xtx_temp_dir = Path(".") / "xtx_tmp"
+        avail_gb = psutil.virtual_memory().available / 1e9
+        print(f"calibration ({len(calib)} samples, need_grad={need_grad}); "
+              f"xtx backend={args.xtx_backend}, min-free-ram={args.min_free_ram_gb:.1f} GB, "
+              f"free now={avail_gb:.1f} GB, temp_dir={xtx_temp_dir}")
+        xtx_store = XtxStore(args.xtx_backend, xtx_temp_dir,
+                             args.min_free_ram_gb)
+        ggt_store = (XtxStore(args.xtx_backend, xtx_temp_dir,
+                              args.min_free_ram_gb)
+                     if need_grad else None)
         t0 = time.time()
-        xtx, ggt, _ = collect_stats(model, tokenizer, calib, device,
-                                    args.calib_seq_len, all_roles, need_grad)
-        print(f"  done in {time.time()-t0:.1f}s")
-        if ckpt_dir:
-            checkpoint_save(ckpt_dir, "calibration", {"xtx": xtx, "ggt": ggt})
+        try:
+            xtx, ggt, _ = collect_stats(model, tokenizer, calib, input_device,
+                                        args.calib_seq_len, all_roles, need_grad,
+                                        xtx_store=xtx_store,
+                                        ggt_store=ggt_store)
+            print(f"  done in {time.time()-t0:.1f}s")
+            if ckpt_dir:
+                checkpoint_save(ckpt_dir, "calibration", {"xtx": xtx, "ggt": ggt})
+        except BaseException:
+            # Best-effort cleanup of disk-backed accumulators on failure so a
+            # crashed run doesn't leave 40 GB of temp files behind.
+            xtx_store.cleanup()
+            if ggt_store is not None:
+                ggt_store.cleanup()
+            raise
 
     # Compute factors (no model mutation yet)
     shared_roles_use = [] if args.permatrix_only else SHARED_ROLES
@@ -930,7 +1123,9 @@ def main():
     else:
         # Move model to CPU during decomposition — frees ~6 GB of VRAM for the
         # SVD/Cholesky workspace (big win on 12 GB GPUs with 3B+ models).
-        if device == "cuda":
+        # Skip when device_map is in use: accelerate-dispatched models can't be
+        # naively .to()-ed, and parts are already on CPU anyway.
+        if device == "cuda" and not use_device_map:
             model.cpu()
             torch.cuda.empty_cache()
             print(f"  model moved to CPU for compute_factors {_gpu_mem_str()}", flush=True)
@@ -941,8 +1136,17 @@ def main():
         print(f"  done in {time.time()-t0:.1f}s")
         if ckpt_dir:
             checkpoint_save(ckpt_dir, "factors", factors)
+        # Gramians are no longer needed — factors are cached. Drop strong refs
+        # and delete any disk-backed memmaps before PPL eval and save_factored
+        # load the model back into RAM.
+        xtx = {}
+        ggt = {} if ggt is not None else None
+        if xtx_store is not None:
+            xtx_store.cleanup()
+        if ggt_store is not None:
+            ggt_store.cleanup()
         # Move model back for PPL eval
-        if device == "cuda":
+        if device == "cuda" and not use_device_map:
             model.to(device)
 
     # Persist factors BEFORE mutating model (so we save the clean decomposition)
@@ -957,11 +1161,15 @@ def main():
     # Materialize factors back into model for PPL eval
     report = materialize_factors_in_place(model, factors, groups_shared,
                                           groups_permatrix, dtype=dtype)
-    model = model.to(dtype)
+    # Skip global .to(dtype) for device_map models — accelerate dispatch hooks
+    # don't survive the move. materialize_factors_in_place already casts the
+    # rewritten linear weights to `dtype`; other params stay at load_dtype.
+    if not use_device_map:
+        model = model.to(dtype)
 
     print("factored PPL")
     t0 = time.time()
-    factored_ppl = evaluate_ppl(model, tokenizer, eval_text, device, n_tokens=args.eval_tokens)
+    factored_ppl = evaluate_ppl(model, tokenizer, eval_text, input_device, n_tokens=args.eval_tokens)
     print(f"  = {factored_ppl:.3f} ({time.time()-t0:.1f}s)  "
           f"delta {(factored_ppl-baseline_ppl)/baseline_ppl*100:+.1f}% vs baseline")
 

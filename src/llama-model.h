@@ -286,25 +286,15 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
-    // Factored-weight coefficients (Phase 3.2).
+    // Factored-weight coefficients (Phase 3.2) live on the model, not the layer:
+    // `llama_model::factored_coeffs` maps each factored weight pointer (wq, wk,
+    // ffn_down, ...) to its coefficients tensor. build_lora_mm checks that map
+    // to pick between ggml_mul_mat (dense) and ggml_factored_linear (factored).
     //
-    // When these are non-null, the corresponding weight pointer (wq, wk, etc.)
-    // holds the BASIS matrix of a rank-r factorization rather than the dense
-    // weight. Graph builders use llm_linear_factored() to pick between
-    // ggml_mul_mat (normal) and ggml_factored_linear (factored).
-    //
-    // Shape contract:
-    //   wX:        [rank, d_out]     (ggml ne convention)
-    //   wX_coeffs: [d_in, rank]
-    // This matches what ggml_factored_linear expects and reconstructs the
-    // dense weight W = basis @ coeffs of shape [d_in, d_out] (ggml ne).
-    struct ggml_tensor * wq_coeffs       = nullptr;
-    struct ggml_tensor * wk_coeffs       = nullptr;
-    struct ggml_tensor * wv_coeffs       = nullptr;
-    struct ggml_tensor * wo_coeffs       = nullptr;
-    struct ggml_tensor * ffn_gate_coeffs = nullptr;
-    struct ggml_tensor * ffn_up_coeffs   = nullptr;
-    struct ggml_tensor * ffn_down_coeffs = nullptr;
+    // Shape contract when a weight is factored:
+    //   basis (stored as wX):  [rank, d_out]   (ggml ne convention)
+    //   coeffs (in the map):   [d_in, rank]
+    // Reconstructs the dense weight W = basis @ coeffs of shape [d_in, d_out].
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;

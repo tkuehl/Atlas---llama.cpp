@@ -1,0 +1,762 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "window": 2,
+  "target_ratio": 0.5,
+  "refit": false,
+  "permatrix_only": false,
+  "calib_samples": 32,
+  "eval_tokens": 2048,
+  "baseline_ppl": 12.219437599182129,
+  "factored_ppl": 1393.9859619140625,
+  "delta_pct": 11307.938790958471,
+  "save_dir": null,
+  "roundtrip_verified": null,
+  "report": {
+    "self_attn.q_proj": [
+      {
+        "window": 0,
+        "layers": [
+          0,
+          1
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 1,
+        "layers": [
+          2,
+          3
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 2,
+        "layers": [
+          4,
+          5
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 3,
+        "layers": [
+          6,
+          7
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 4,
+        "layers": [
+          8,
+          9
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 5,
+        "layers": [
+          10,
+          11
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 6,
+        "layers": [
+          12,
+          13
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 7,
+        "layers": [
+          14,
+          15
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 8,
+        "layers": [
+          16,
+          17
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 9,
+        "layers": [
+          18,
+          19
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 10,
+        "layers": [
+          20,
+          21
+        ],
+        "mode": "shared",
+        "rank": 298
+      },
+      {
+        "window": 11,
+        "layers": [
+          22,
+          23
+        ],
+        "mode": "shared",
+        "rank": 298
+      }
+    ],
+    "self_attn.k_proj": [
+      {
+        "window": 0,
+        "layers": [
+          0,
+          1
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 1,
+        "layers": [
+          2,
+          3
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 2,
+        "layers": [
+          4,
+          5
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 3,
+        "layers": [
+          6,
+          7
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 4,
+        "layers": [
+          8,
+          9
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 5,
+        "layers": [
+          10,
+          11
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 6,
+        "layers": [
+          12,
+          13
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 7,
+        "layers": [
+          14,
+          15
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 8,
+        "layers": [
+          16,
+          17
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 9,
+        "layers": [
+          18,
+          19
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 10,
+        "layers": [
+          20,
+          21
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 11,
+        "layers": [
+          22,
+          23
+        ],
+        "mode": "shared",
+        "rank": 59
+      }
+    ],
+    "self_attn.v_proj": [
+      {
+        "window": 0,
+        "layers": [
+          0,
+          1
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 1,
+        "layers": [
+          2,
+          3
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 2,
+        "layers": [
+          4,
+          5
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 3,
+        "layers": [
+          6,
+          7
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 4,
+        "layers": [
+          8,
+          9
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 5,
+        "layers": [
+          10,
+          11
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 6,
+        "layers": [
+          12,
+          13
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 7,
+        "layers": [
+          14,
+          15
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 8,
+        "layers": [
+          16,
+          17
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 9,
+        "layers": [
+          18,
+          19
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 10,
+        "layers": [
+          20,
+          21
+        ],
+        "mode": "shared",
+        "rank": 59
+      },
+      {
+        "window": 11,
+        "layers": [
+          22,
+          23
+        ],
+        "mode": "shared",
+        "rank": 59
+      }
+    ],
+    "mlp.gate_proj": [
+      {
+        "window": 0,
+        "layers": [
+          0,
+          1
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 1,
+        "layers": [
+          2,
+          3
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 2,
+        "layers": [
+          4,
+          5
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 3,
+        "layers": [
+          6,
+          7
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 4,
+        "layers": [
+          8,
+          9
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 5,
+        "layers": [
+          10,
+          11
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 6,
+        "layers": [
+          12,
+          13
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 7,
+        "layers": [
+          14,
+          15
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 8,
+        "layers": [
+          16,
+          17
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 9,
+        "layers": [
+          18,
+          19
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 10,
+        "layers": [
+          20,
+          21
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 11,
+        "layers": [
+          22,
+          23
+        ],
+        "mode": "shared",
+        "rank": 654
+      }
+    ],
+    "mlp.up_proj": [
+      {
+        "window": 0,
+        "layers": [
+          0,
+          1
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 1,
+        "layers": [
+          2,
+          3
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 2,
+        "layers": [
+          4,
+          5
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 3,
+        "layers": [
+          6,
+          7
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 4,
+        "layers": [
+          8,
+          9
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 5,
+        "layers": [
+          10,
+          11
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 6,
+        "layers": [
+          12,
+          13
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 7,
+        "layers": [
+          14,
+          15
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 8,
+        "layers": [
+          16,
+          17
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 9,
+        "layers": [
+          18,
+          19
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 10,
+        "layers": [
+          20,
+          21
+        ],
+        "mode": "shared",
+        "rank": 654
+      },
+      {
+        "window": 11,
+        "layers": [
+          22,
+          23
+        ],
+        "mode": "shared",
+        "rank": 654
+      }
+    ],
+    "self_attn.o_proj": [
+      {
+        "layer": 0,
+        "rank": 224
+      },
+      {
+        "layer": 1,
+        "rank": 224
+      },
+      {
+        "layer": 2,
+        "rank": 224
+      },
+      {
+        "layer": 3,
+        "rank": 224
+      },
+      {
+        "layer": 4,
+        "rank": 224
+      },
+      {
+        "layer": 5,
+        "rank": 224
+      },
+      {
+        "layer": 6,
+        "rank": 224
+      },
+      {
+        "layer": 7,
+        "rank": 224
+      },
+      {
+        "layer": 8,
+        "rank": 224
+      },
+      {
+        "layer": 9,
+        "rank": 224
+      },
+      {
+        "layer": 10,
+        "rank": 224
+      },
+      {
+        "layer": 11,
+        "rank": 224
+      },
+      {
+        "layer": 12,
+        "rank": 224
+      },
+      {
+        "layer": 13,
+        "rank": 224
+      },
+      {
+        "layer": 14,
+        "rank": 224
+      },
+      {
+        "layer": 15,
+        "rank": 224
+      },
+      {
+        "layer": 16,
+        "rank": 224
+      },
+      {
+        "layer": 17,
+        "rank": 224
+      },
+      {
+        "layer": 18,
+        "rank": 224
+      },
+      {
+        "layer": 19,
+        "rank": 224
+      },
+      {
+        "layer": 20,
+        "rank": 224
+      },
+      {
+        "layer": 21,
+        "rank": 224
+      },
+      {
+        "layer": 22,
+        "rank": 224
+      },
+      {
+        "layer": 23,
+        "rank": 224
+      }
+    ],
+    "mlp.down_proj": [
+      {
+        "layer": 0,
+        "rank": 378
+      },
+      {
+        "layer": 1,
+        "rank": 378
+      },
+      {
+        "layer": 2,
+        "rank": 378
+      },
+      {
+        "layer": 3,
+        "rank": 378
+      },
+      {
+        "layer": 4,
+        "rank": 378
+      },
+      {
+        "layer": 5,
+        "rank": 378
+      },
+      {
+        "layer": 6,
+        "rank": 378
+      },
+      {
+        "layer": 7,
+        "rank": 378
+      },
+      {
+        "layer": 8,
+        "rank": 378
+      },
+      {
+        "layer": 9,
+        "rank": 378
+      },
+      {
+        "layer": 10,
+        "rank": 378
+      },
+      {
+        "layer": 11,
+        "rank": 378
+      },
+      {
+        "layer": 12,
+        "rank": 378
+      },
+      {
+        "layer": 13,
+        "rank": 378
+      },
+      {
+        "layer": 14,
+        "rank": 378
+      },
+      {
+        "layer": 15,
+        "rank": 378
+      },
+      {
+        "layer": 16,
+        "rank": 378
+      },
+      {
+        "layer": 17,
+        "rank": 378
+      },
+      {
+        "layer": 18,
+        "rank": 378
+      },
+      {
+        "layer": 19,
+        "rank": 378
+      },
+      {
+        "layer": 20,
+        "rank": 378
+      },
+      {
+        "layer": 21,
+        "rank": 378
+      },
+      {
+        "layer": 22,
+        "rank": 378
+      },
+      {
+        "layer": 23,
+        "rank": 378
+      }
+    ]
+  }
+}
