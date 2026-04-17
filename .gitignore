@@ -145,3 +145,8 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Research fork: Windows build helpers (un-ignore specific .bat / .ps1 scripts
+# that would otherwise be caught by the /build* rule)
+!/build-cuda-configure.bat
+!/build-cuda-compile.bat

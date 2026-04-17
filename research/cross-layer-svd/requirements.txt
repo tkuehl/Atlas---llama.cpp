@@ -1,0 +1,7 @@
+torch>=2.2
+transformers>=4.44
+datasets>=2.19
+numpy
+tqdm
+python-dotenv
+httpx
