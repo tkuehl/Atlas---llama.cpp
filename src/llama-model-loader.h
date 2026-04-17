@@ -198,6 +198,22 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    // Phase 3.2 step 3b: factored-aware tensor creation.
+    //
+    // Given a canonical dense-weight role described by `tn`, if this GGUF is
+    // factored AND the canonical name is in factored_sources, allocate TWO
+    // tensors in the backend (basis + coeffs) using the actual GGUF tensor
+    // names from the factored_sources entry, and return them as {basis, coeffs}.
+    // If the role is not factored (or this isn't a factored GGUF), returns
+    // {nullptr, nullptr} — caller should fall back to normal create_tensor.
+    //
+    // The routing (buft_list selection) uses `tn` for op-kind classification,
+    // so factored weights get the same backend placement as their dense
+    // counterparts.
+    std::pair<struct ggml_tensor *, struct ggml_tensor *> create_tensor_factored(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, int flags);
+
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
     void done_getting_tensors() const;

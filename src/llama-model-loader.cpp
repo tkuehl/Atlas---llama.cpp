@@ -1287,6 +1287,92 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+std::pair<struct ggml_tensor *, struct ggml_tensor *>
+llama_model_loader::create_tensor_factored(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, int flags) {
+    const std::string canonical = tn.str();
+    const auto * fs = get_factored_source(canonical);
+    if (fs == nullptr) {
+        return {nullptr, nullptr};
+    }
+
+    // Lightweight ctx selector (same contract as the one in create_tensor).
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            int max_n_tensors = n_tensors + 1 + hparams.n_layer*2;
+            if (files.empty()) {
+                max_n_tensors += hparams.n_layer*256;
+            }
+            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+            ggml_init_params params = { ctx_size, NULL, /*no_alloc*/ true };
+            ggml_context * c = ggml_init(params);
+            if (!c) {
+                throw std::runtime_error(format("failed to create ggml context"));
+            }
+            ctx_map.emplace(buft, c);
+            return c;
+        }
+        return it->second.get();
+    };
+
+    // For factored weights the op is always MUL_MAT (they replace a dense linear),
+    // so classification via `tn` is correct; what varies is the physical meta.
+    auto buft_for_meta = [&](ggml_tensor * t_meta, const char * role_name) -> ggml_backend_buffer_type_t {
+        if (!t_meta) {
+            throw std::runtime_error(format("missing factored tensor '%s'", role_name));
+        }
+        llm_tensor_info info;
+        try {
+            info = llm_tensor_info_for(tn.tensor);
+        } catch (const std::out_of_range & e) {
+            throw std::runtime_error(format("missing tensor info mapping for %s", canonical.c_str()));
+        }
+        // Factored weights always drive a MUL_MAT op — never bias — so we
+        // don't need the bias-suffix remapping from create_tensor here.
+        const ggml_op op = info.op;
+
+        const buft_list_t * buft_list;
+        switch (info.layer) {
+            case LLM_TENSOR_LAYER_INPUT:     buft_list = buft_list_input;  break;
+            case LLM_TENSOR_LAYER_OUTPUT:    buft_list = buft_list_output; break;
+            case LLM_TENSOR_LAYER_REPEATING: buft_list = buft_list_layer;  break;
+            default:
+                throw std::runtime_error(format("invalid layer for factored tensor '%s'", canonical.c_str()));
+        }
+
+        ggml_backend_buffer_type_t buft = select_weight_buft(hparams, t_meta, op, buft_list);
+        if (!buft) {
+            throw std::runtime_error(format("failed to find buffer type for factored tensor '%s'", role_name));
+        }
+        return buft;
+    };
+
+    auto build_one = [&](const std::string & gguf_name) -> ggml_tensor * {
+        ggml_tensor * t_meta = get_tensor_meta(gguf_name.c_str());
+        if (!t_meta) {
+            throw std::runtime_error(format(
+                "factored GGUF references '%s' but tensor is missing", gguf_name.c_str()));
+        }
+        ggml_backend_buffer_type_t buft = buft_for_meta(t_meta, gguf_name.c_str());
+        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_tensor * t = ggml_dup_tensor(ctx, t_meta);
+        ggml_set_name(t, gguf_name.c_str());
+        n_created++;
+        return t;
+    };
+
+    ggml_tensor * basis  = build_one(fs->basis_name);
+    ggml_tensor * coeffs = build_one(fs->coeffs_name);
+
+    // flags is accepted for API symmetry with create_tensor; TENSOR_NOT_REQUIRED
+    // doesn't apply to factored weights (factoring is all-or-nothing per role).
+    (void) flags;
+
+    return {basis, coeffs};
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required) {
     const struct ggml_tensor * cur = check_tensor_dims(name, ne, required);
 
