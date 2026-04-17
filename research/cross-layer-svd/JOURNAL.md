@@ -273,3 +273,28 @@ Running log of commits (run `git log --oneline` for canonical ordering):
 2. **Scale validation on 7B+** — the 3B quality curve is bounded by the small-model ceiling. Running Qwen 2.5 7B or Qwen 3 8B at target_ratio=0.5 should land in paper territory (PPL ~19-25). That's the real validation of the decomposition math.
 3. **Phase 3.4 — streaming runtime** — true shared-basis on GPU (no per-layer duplication), coefficients in pinned host RAM streamed over PCIe during inference. The novel technical contribution beyond what papers have published.
 4. **Deferred** — re-enable LS coefficient refit with deferred-hook pattern (forward-only calibration plus per-sample post-hoc gradient processing to avoid the sync-per-hook death we hit earlier).
+
+---
+
+## 2026-04-17 (late) — Optimization path aggregated: see [optimization_path.md](optimization_path.md)
+
+Literature survey + pipeline-code walk-through produced a consolidated
+optimization catalog in **[optimization_path.md](optimization_path.md)**.
+Two tracks:
+
+- **Runtime (C++/CUDA)** — kernel fusion to fix the two-`mul_mat` anti-pattern
+  (FlashSVD, SVDQuant/Nunchaku, arxiv:2512.20861's Triton reference);
+  kernel-launch reduction via cuBLAS Grouped GEMM, CUDA Graph capture, and
+  megakernels (Mirage MPK, Hazy "No Bubbles"); transport upgrades
+  (GPUDirect Storage, HMM, PIPO's tensor-merging); coefficient quantization
+  (IntLoRA, FireQ); orthogonal multipliers (activation sparsity, speculative
+  decoding).
+- **Decomposition pipeline (Python)** — GPU-resident role-sequential gramian
+  (fixes the CPU hotspot at `basis_sharing.py:356-374`), randomized SVD via
+  `torch.svd_lowrank` to replace Golub-Reinsch, gramian caching across
+  `target_ratio` sweeps, Cholesky-ladder audit, and batched calibration
+  samples.
+
+Priority ordering in §3 of that doc. Key callouts: cuBLAS Grouped GEMM is
+probably the single cheapest fix for the 27% decode regression; GPU-resident
+gramians are the single cheapest fix for calibration wall-time at 7B+ scale.
