@@ -971,7 +971,29 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    // Phase 3.2: if `w` is registered as a factored basis, perform the
+    // linear as y = basis @ (coeffs @ x) via ggml_factored_linear. The two
+    // ggml_mul_mat nodes it emits are strictly cheaper than materializing
+    // W = basis @ coeffs whenever rank < min(d_out, d_in)/2, which is
+    // always true for factored models. LoRA adapters keyed by `w` (basis)
+    // won't match the dense-keyed adapter table, so LoRA simply skips for
+    // factored weights — the expected behavior since LoRAs trained against
+    // dense weights wouldn't be meaningful against a basis.
+    ggml_tensor * res;
+    if (factored_coeffs) {
+        auto it = factored_coeffs->find(w);
+        if (it != factored_coeffs->end()) {
+            // const_cast: ggml_factored_linear takes non-const by ggml
+            // convention; it doesn't mutate inputs, just records pointers
+            // in the computation graph.
+            res = ggml_factored_linear(ctx0, w,
+                    const_cast<ggml_tensor *>(it->second), cur);
+        } else {
+            res = ggml_mul_mat(ctx0, w, cur);
+        }
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
