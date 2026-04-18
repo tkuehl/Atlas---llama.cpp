@@ -25,20 +25,32 @@ Two separate optimization tracks:
 ### 1.1 Kernel fusion — fix the two-matmul anti-pattern
 
 `ggml_factored_linear` (`ggml/src/ggml.c:3269`) emits two sequential
-`ggml_mul_mat` nodes. This is 504 extra launches/token on Qwen 3B (7 roles
-× 36 layers × 2 launches), which matches the measured 2.5 ms decode regression.
+`ggml_mul_mat` nodes. Qwen 3B has 7 factored linears × 36 layers = 252
+factored-linear sites per token; at 2 launches each that's **504 total
+launches, 252 extra over the dense baseline**. This matches the measured
+2.5 ms decode regression.
 
 - **FlashSVD** ([arxiv:2508.01506](https://www.arxiv.org/pdf/2508.01506)) —
   end-to-end rank-aware streaming inference for SVD-compressed models. Fuses
   low-rank projection kernels *into* attention/FFN pipelines with SRAM tiling.
-  −70% peak activation, −75% transient memory, zero added latency. Their
-  fused kernel is the design to adopt for `ggml-cuda/factored-linear.cu`.
+  **Applicability caveat (see JOURNAL Background reading):** FlashSVD has two
+  variants. V1 (cuBLAS GEMM + fused second projection + activation) wins on
+  latency at long sequence; V2 (fully fused GEMM-Activation-GEMM, zero HBM
+  I/O) pays a **60% latency penalty** and benchmarks **0.62× slower than
+  dense at M=128**. Decode sits at M=1 where a naïve port would *regress*
+  tok/s. Memory wins (−70% peak activation, −75% transient) apply
+  unconditionally. Treat as the **prefill-only** target, gated on a batch/seq
+  threshold that falls back to the dense path for decode. Also a prerequisite
+  for making Phase 3.4 streaming tractable (per-tile working set instead of
+  full coefficient residency).
 - **SVDQuant / Nunchaku**
   ([arxiv:2411.05007](https://arxiv.org/abs/2411.05007),
    [deepwiki](https://deepwiki.com/mit-han-lab/nunchaku/2-svdquant-quantization))
   — identical "two-branch" structure to ours; their fix is to fuse the
   low-rank branch kernels into the low-bit branch to eliminate redundant
-  activation memory traffic. 3× decode speedup on RTX 4090.
+  activation memory traffic. 3× decode speedup on RTX 4090. Unlike FlashSVD
+  this one does claim wins at batch-1 decode — the more relevant reference
+  for our regime.
 - **BLR on Resource-Constrained GPUs**
   ([arxiv:2512.20861](https://arxiv.org/abs/2512.20861), Dec 2025) —
   same problem, roofline analysis showing multi-token inference stays
@@ -58,8 +70,12 @@ Three attacks, weakest → strongest:
 2. **cuBLAS Grouped GEMM (12.5+)** — one kernel for N different-shaped
    matmuls
    ([NVIDIA blog](https://developer.nvidia.com/blog/introducing-grouped-gemm-apis-in-cublas-and-more-performance-updates/)).
-   Lets us collapse all 5 shared roles' `A·x` into a single launch per layer.
-   504 → ~100 extra launches/token. No custom CUDA.
+   Collapse same-`d_in` basis matmuls per layer into one grouped launch
+   (q/k/v/o share `d_in=hidden`; gate/up share `d_in=hidden`; down stands
+   alone at `d_in=intermediate`). Realistic target per layer: 3 grouped
+   basis launches + 1 grouped coefficient launch = ~4, so **504 → ~150
+   launches/token**, or ~100 if the coefficient matmuls also group cleanly.
+   No custom CUDA.
 3. **Megakernels** — compile the whole forward pass into one kernel.
    [Mirage MPK](https://arxiv.org/html/2512.22219v1) (14.5 → 12.5 ms on
    A100), [Hazy "No Bubbles" Llama-1B](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles)
@@ -81,18 +97,38 @@ Three attacks, weakest → strongest:
 
 ### 1.4 Transport — beyond pinned host memory
 
+**Bandwidth ceiling first (see JOURNAL Background reading).** Naïve "stream
+every coefficient every token" for Qwen 2.5 7B @ r=0.5 needs
+**220-440 GB/s** vs ~55 GB/s from a PCIe Gen5 x16 link. Transport upgrades
+alone do not close this — they have to combine with tile-fused kernels
+(§1.1, FlashSVD V1-style) so the working set in VRAM drops from 100s of
+MB/layer to O(MB). Without fusion, no transport option makes pure per-token
+streaming viable.
+
 - **GPUDirect Storage**
   ([NVIDIA blog](https://developer.nvidia.com/blog/gpudirect-storage/)) —
-  DMA engine moves coefficients NVMe → GPU, bypassing CPU RAM. For 70B this
-  is the difference between "fits in 64 GB host RAM" and "doesn't."
+  DMA engine moves coefficients NVMe → GPU, bypassing CPU RAM. Gets
+  streaming from ~6-8 GB/s (CPU-mediated) to ~25-45 GB/s on Gen5 NVMe.
+  **Platform blocker for us:** Linux-only, no Windows/WSL2 driver, so our
+  current dev box can't use it. The practical Windows substitute is pinned
+  host staging + dual-stream double-buffering, which captures ~70% of GDS's
+  benefit (gap is ~2-3× for our workload, not 10×). Revisit GDS only if
+  Phase 3.4 is measurably PCIe-bound in practice and worth a Linux dual-boot.
 - **HMM + `cudaMemPrefetchAsync`**
   ([CUDA docs](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html))
   — simpler than hand-coded pinned double-buffering. Less control, 80% of
   the benefit for 10% of the code. Linux kernel ≥ 6.1, Blackwell-ready.
+  Same Windows caveat as GDS.
+- **Pinned host + double-buffered streams (Windows-viable baseline).**
+  Pre-allocate pinned staging buffers once, one CUDA stream for compute and
+  one for copy, 2-16 MB chunk granularity tuned to SSD queue depth. This is
+  the design we can actually ship on the current dev box. Everything else
+  in this section is conditional on Linux.
 - **PIPO's tensor-merging pattern**
   ([arxiv:2504.03664](https://arxiv.org/abs/2504.03664)) — concat all layer
   coeffs, one `memcpyAsync`, block-subdivide on GPU. 40→90% GPU util on
-  RTX 3060 6 GB. Retrofit into the pinned-host-pool in DESIGN.md §3.3.
+  RTX 3060 6 GB. Platform-agnostic; retrofit into the pinned-host-pool in
+  DESIGN.md §3.3 regardless of whether we get GDS.
 
 ### 1.5 Coefficient quantization (halve PCIe bytes/layer)
 
@@ -149,16 +185,38 @@ which point the iteration loop is too slow for ablation work.
 
 `basis_sharing.py:356-374` D2H-copies every activation and computes the
 `d×d` gramian on CPU. This trades PCIe bandwidth for CPU FLOPs — currently
-the dominant calibration cost. The CPU gramian is ~130 TFLOPs per pass for
-3B `gate/up/down`.
+the dominant calibration cost.
 
 Fix: process one role at a time, keep the gramian GPU-resident, `addmm_`
-accumulate there, D2H once at end-of-role. Worst-case GPU pressure is
-`L_layers × d × d × 4 bytes` — 3B: 36 × 8192² × 4 = 9.2 GB, fits 12 GB.
-Run the forward 7× instead of 1× — each pass is far cheaper than the
-current CPU hotspot.
+accumulate there, D2H once at end-of-role. Run the forward 7× instead of
+1× — each pass is far cheaper than the current CPU hotspot.
 
-Expected: 10–20× on `collect_stats`.
+**Memory per role on Qwen 2.5 3B** (hidden=2048, intermediate=11008, L=36),
+keeping one gramian per layer GPU-resident during the pass:
+
+| role | d_in | L × d² × 4 | fits 12 GB? |
+|---|---|---|---|
+| q/k/v/o, gate/up | 2048 | 0.6 GB | ✓ |
+| **down_proj** | **11008** | **17.4 GB** | **✗** |
+
+The `down_proj` role doesn't fit in 12 GB on 3B, and gets worse at 7B
+(intermediate=18944 → 52 GB) and 13B. Concrete options:
+
+1. **Row-chunked accumulation for the wide role** — hold only `L × d × chunk × 4`
+   at a time, iterate chunk tiles of the gramian across the corpus. 3B
+   down_proj at chunk=1024: 36 × 11008 × 1024 × 4 ≈ 1.6 GB per chunk slice.
+   Adds ~11 passes over the corpus for that role, still far under the CPU
+   hotspot wall-time.
+2. **Per-layer evict-and-spill** — compute each layer's gramian fully
+   GPU-resident for the current layer, addmm, then D2H to pinned host
+   between layers. Single-layer working set: d² × 4 = 0.48 GB for down on 3B,
+   1.4 GB on 7B. Cheap, loses cross-layer overlap.
+3. **24 GB GPU floor** — brute-force fix; doesn't help at 13B+.
+
+Go with option 1 as the default; fall back to option 2 when
+`L × d² × 4 > 0.7 × free_vram`. Expected end-to-end: **10–20× on
+`collect_stats`** (the ratio survives either workaround because the CPU path
+remains the bottleneck we're removing).
 
 ### 2.2 Randomized / truncated SVD
 
@@ -166,9 +224,11 @@ Expected: 10–20× on `collect_stats`.
 `rank ≪ min(d_out, n·d_in)` — i.e. every window — this is wasted work.
 
 Replace with `torch.svd_lowrank` (Halko–Martinsson–Tropp) when rank < dim/4.
-For Qwen 3B window=2 gate_proj at rank 655 on d=8192: full SVD ≈ 1 PFLOPs,
-randomized at oversample=10 ≈ 130 TFLOPs → ~8× faster, no accuracy loss for
-low-rank approximation.
+For Qwen 2.5 3B window=2 `gate_proj` (m = 2×11008 = 22016 stacked rows,
+n = 2048, rank 655): full SVD ≈ 4 `m n²` ≈ 370 GFLOPs, randomized at
+oversample=10 ≈ `m n (r+o)` ≈ 30 GFLOPs → ~10× faster per matrix, no
+accuracy loss for low-rank approximation. (Order-of-magnitude numbers; exact
+depends on how the window is stacked.)
 
 Keep `gesvd` as fallback for rank-close-to-min cases and numerical escalation.
 
@@ -242,34 +302,49 @@ AutoAWQ and SqueezeLLM have moved in this direction.
 
 ## 3. Priority ordering
 
-### Runtime track (unblock Phase 3.3 / 3.4)
+**Cross-track dependency:** custom-CUDA work (Runtime items 3+) and Phase
+3.4 are gated on the Model-quality track clearing the scale-gate. No point
+tuning a fused factored-linear kernel for a decomposition that hasn't
+reached paper PPL at 7B. Pipeline track is the near-term unblocker for that
+gate.
 
-1. **cuBLAS Grouped GEMM** in `ggml-cuda` — 1 day, collapses kernel
-   launches without custom CUDA. If decode regression closes here, the
-   megakernel work gets deprioritized.
-2. **CUDA Graph capture verification** — confirm factored-linear doesn't
-   break the existing path; 1–2 days.
-3. **Adopt arxiv:2512.20861 Triton kernel layout** for
-   `ggml-cuda/factored-linear.cu` before hand-rolling. Reference
-   implementation is MIT-licensed.
-4. **Quantize streamed coeffs to INT4/INT8** via IntLoRA pattern. Halves
-   PCIe bytes/layer, aligns with DESIGN.md §3.3 "int8 streamed
-   coefficients" goal.
-5. **Defer megakernel / GPUDirect Storage to Phase 5+** unless 1–4 leave
-   measurable headroom.
+### Pipeline track — this week, unblocks 7B+ scale validation
 
-### Pipeline track (this week, blocks 7B+ scale validation)
-
-1. GPU-resident role-sequential gramian (§2.1).
-2. Randomized SVD (§2.2).
-3. Gramian caching across ratios (§2.5).
+1. **GPU-resident role-sequential gramian** (§2.1), with row-chunked
+   accumulation for `down_proj` (the d=11008 role doesn't fit 12 GB
+   otherwise).
+2. **Randomized SVD** via `torch.svd_lowrank` (§2.2).
+3. **Gramian caching across ratios** (§2.5).
 4. Then 2.3, 2.4 as needed for ablation velocity.
 
-### Model-quality track (complementary to runtime work)
+### Model-quality track — gates Runtime items 3+ and Phase 3.4
 
-1. Per-matrix rank allocation (SVD-LLM V2) — §1.7.
-2. Scale-gate before more C++ plumbing: 7B at 50% must land near paper
-   territory (PPL ~19–25) before Phase 3.4 is a good use of time.
+1. **Scale-gate: 7B at target_ratio=0.5 must land near paper territory
+   (PPL ~19–25).** This is the go/no-go for custom-CUDA kernel work and
+   Phase 3.4 streaming. Blocked on Pipeline track item 1.
+2. **Per-matrix rank allocation** (SVD-LLM V2) — §1.7. Small change in
+   `rank_shared` / `rank_permatrix`; run after the scale-gate passes.
+
+### Runtime track — unblock Phase 3.3 / 3.4
+
+1. **cuBLAS Grouped GEMM** in `ggml-cuda` — ~1 day, collapses kernel
+   launches without custom CUDA. If the −27% decode regression closes here,
+   custom-kernel and megakernel work gets deprioritized. Safe to do in
+   parallel with the Pipeline track.
+2. **CUDA Graph capture verification** — confirm factored-linear doesn't
+   break the existing `update_cuda_graph_executable` path; 1–2 days. Also
+   parallelizable.
+3. **Custom fused factored-linear kernel (prefill-only)** cribbing the
+   arxiv:2512.20861 Triton layout and FlashSVD V1-style partial fusion.
+   Gated on the quality scale-gate. Gate on an M threshold at runtime so
+   decode falls back to the dense path — FlashSVD-style V2 fusion regresses
+   at M=1, so shipping it blanket would hurt the chat path.
+4. **Quantize streamed coeffs to INT4/INT8** via IntLoRA pattern. Halves
+   PCIe bytes/layer, aligns with DESIGN.md §3.3 "int8 streamed
+   coefficients" goal. Order-independent with item 3.
+5. **Defer megakernel / GPUDirect Storage to Phase 5+** unless 1–4 leave
+   measurable headroom. GDS in particular needs a Linux dev box we don't
+   currently have.
 
 ---
 
