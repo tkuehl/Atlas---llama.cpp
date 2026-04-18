@@ -203,18 +203,25 @@ def sqrt_and_inv(M, eps_ratio=1e-5, device="cuda", need_inv=True,
     def _to_out(S, S_inv, dt=torch.float32):
         return (S.to(dt), S_inv.to(dt) if S_inv is not None else None)
 
-    # Fast path for known-rank-deficient gramians: skip the Cholesky ladder
-    # entirely. At d=18944 with 1.5K calibration rows (typical 7B down_proj
-    # setup), at most 1.5K eigenvalues are nonzero — every Cholesky tier
-    # fails mathematically regardless of fp32/fp64 precision. Going
-    # straight to GPU fp64 eigh with eigenvalue clamping is ~3-5× faster
-    # per layer than letting the ladder probe and fail.
+    # Fast path for known-rank-deficient gramians: skip the fp32/fp64
+    # probe tiers (both guaranteed to fail with "not positive definite"
+    # when calibration rows < d) and jump straight to the tier we've
+    # empirically observed succeeds — GPU fp64 Cholesky with eps×10
+    # regularization. Saves ~1-2s per layer of failed probes on 7B
+    # down_proj. The original attempt to use GPU fp64 eigh OOMs at
+    # d=18944 on a 12 GB card (eigh workspace is ~10 GB), which caused
+    # the skip path to fall all the way to the very slow CPU eigh tier.
+    # fp64 Cholesky workspace is much smaller (~3x the matrix) so it
+    # fits cleanly.
     if skip_cholesky and device == "cuda":
         try:
-            return _to_out(*_eigh("cuda", torch.float64))
+            result = _to_out(*_chol("cuda", torch.float64, eps_ratio * 10))
+            return result
         except RuntimeError as e:
-            # OOM or other CUDA error — fall through to the CPU tiers below.
-            _cuda_fallback_log("eigh", e)
+            msg = str(e).lower()
+            if "out of memory" in msg:
+                _cuda_fallback_log("eigh", e)
+            # Fall through to the CPU tiers below on failure.
 
     # Precision-first fallback ladder. Rank-deficient gramians (common for
     # down_proj when calibration tokens < d_in) break fp32 Cholesky; bumping
@@ -2090,15 +2097,16 @@ def main():
                         "sum-of-σ² is not a reliable PPL proxy at larger "
                         "scale. Needs a better utility function before "
                         "this is the default.")
-    p.add_argument("--skip-cholesky-above-d", type=int, default=0,
-                   help="Skip the fp32/fp64 Cholesky ladder in sqrt_and_inv "
-                        "for any gramian whose d exceeds this value, going "
-                        "straight to GPU fp64 eigh + eigenvalue clamp. Use "
-                        "when calibration rows < d (rank-deficient gramian) "
-                        "so the Cholesky path is mathematically guaranteed "
-                        "to fail — skipping avoids ~5-10s/layer of "
-                        "fp32-then-fp64 probing. 0 = always try Cholesky "
-                        "first.")
+    p.add_argument("--skip-cholesky-above-d", type=int, default=15000,
+                   help="Skip the fp32/fp64 Cholesky probe tiers in "
+                        "sqrt_and_inv for any gramian whose d exceeds this "
+                        "value; jump directly to GPU fp64 Cholesky with "
+                        "eps×10 regularization (the tier we empirically "
+                        "observe succeeds on rank-deficient wide-d "
+                        "gramians). Catches 7B+ down_proj (d=18944) and "
+                        "leaves 3B (d=11008) and smaller on the full "
+                        "ladder. Saves ~5% of 7B decomposition wall time "
+                        "by avoiding failed probes. 0 = never skip.")
     args = p.parse_args()
 
     dtype = getattr(torch, args.dtype)
