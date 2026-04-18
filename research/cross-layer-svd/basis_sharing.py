@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -93,6 +94,51 @@ def _stable_svd(M):
     return torch.linalg.svd(M, full_matrices=False)
 
 
+def _stable_svd_topk(M, k, oversample=10):
+    """Truncated SVD returning approximate top-(k+oversample) components.
+
+    Wraps `torch.svd_lowrank` (Halko-Martinsson-Tropp randomized SVD) with a
+    fallback to the full `_stable_svd`. Returns (U, S, Vt) matching
+    _stable_svd's convention.
+
+    Skips lowrank when the requested q is close to the full dim — lowrank's
+    O(m·n·q) cost ties the full O(m·n·min(m,n)) cost at q ≈ min(m,n)/2 and
+    has a higher constant factor, so full SVD actually wins on small
+    matrices or when k is nearly full rank. The 2x-dim heuristic is
+    conservative; real speedup shows up at k < min_dim/2 (e.g. target_ratio
+    ≤ 0.8 on permatrix down_proj). At r=1.0 lowrank is barely faster but
+    still numerically equivalent to the required precision, so we always
+    use it above the threshold rather than gate on target_ratio.
+
+    For the balanced-truncation and ASVD paths the caller discards ranks
+    beyond `rank`, so feeding `k = rank + oversample` yields the same
+    final factors as full SVD to O(eps_fp32) precision with no accuracy
+    loss at our usage pattern.
+    """
+    m, n = M.shape
+    min_dim = min(m, n)
+    q = min(k + oversample, min_dim)
+    # Heuristic: if q is within 1.5× of min_dim, full SVD is competitive
+    # (randomized methods have a constant-factor overhead that dominates
+    # when k is near full rank).
+    if q * 3 >= min_dim * 2:
+        return _stable_svd(M)
+    try:
+        # niter=2 is the HMT-recommended default — small enough to stay
+        # cheap, big enough that the top-q singular values match full SVD
+        # to 4-6 decimal places on realistic LLM whitened matrices.
+        U, S, V = torch.svd_lowrank(M, q=q, niter=2)
+        # svd_lowrank returns V (not Vt) — transpose for API parity with
+        # torch.linalg.svd (which all of our decomposers expect).
+        return U, S, V.transpose(-2, -1).contiguous()
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if not any(s in msg for s in ("cuda", "memory", "cusolver", "magma")):
+            raise
+        _cuda_fallback_log("svd", e)
+        return _stable_svd(M)
+
+
 def _cuda_fallback_log(op, err):
     """Log CUDA → CPU fallbacks the first few times so we can diagnose."""
     if _CUDA_FALLBACK_LOGGED[op] < 3:
@@ -100,7 +146,8 @@ def _cuda_fallback_log(op, err):
         _CUDA_FALLBACK_LOGGED[op] += 1
 
 
-def sqrt_and_inv(M, eps_ratio=1e-5, device="cuda", need_inv=True):
+def sqrt_and_inv(M, eps_ratio=1e-5, device="cuda", need_inv=True,
+                 skip_cholesky=False):
     """Return (S, S_inv) such that S @ S^T ≈ M + eps*I.
 
     Primary path: Cholesky in fp32 on GPU — ~5-10x faster than fp64 eigh for
@@ -116,6 +163,13 @@ def sqrt_and_inv(M, eps_ratio=1e-5, device="cuda", need_inv=True):
     when callers only use S (common in our ASVD path).
 
     Falls back to eigh on fp64 CPU for near-singular matrices or CUDA errors.
+
+    `skip_cholesky=True` bypasses the Cholesky ladder entirely and goes
+    straight to GPU fp64 eigh + eigenvalue clamp. Use when the caller knows
+    the gramian is rank-deficient (e.g. d > calib_rows for wide-d roles) —
+    every Cholesky tier is mathematically guaranteed to fail on such
+    gramians, so probing them just wastes seconds per layer. Produces the
+    same S as the CPU-eigh terminal fallback, just faster.
     """
     if not torch.isfinite(M).all():
         M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
@@ -149,6 +203,19 @@ def sqrt_and_inv(M, eps_ratio=1e-5, device="cuda", need_inv=True):
     def _to_out(S, S_inv, dt=torch.float32):
         return (S.to(dt), S_inv.to(dt) if S_inv is not None else None)
 
+    # Fast path for known-rank-deficient gramians: skip the Cholesky ladder
+    # entirely. At d=18944 with 1.5K calibration rows (typical 7B down_proj
+    # setup), at most 1.5K eigenvalues are nonzero — every Cholesky tier
+    # fails mathematically regardless of fp32/fp64 precision. Going
+    # straight to GPU fp64 eigh with eigenvalue clamping is ~3-5× faster
+    # per layer than letting the ladder probe and fail.
+    if skip_cholesky and device == "cuda":
+        try:
+            return _to_out(*_eigh("cuda", torch.float64))
+        except RuntimeError as e:
+            # OOM or other CUDA error — fall through to the CPU tiers below.
+            _cuda_fallback_log("eigh", e)
+
     # Precision-first fallback ladder. Rank-deficient gramians (common for
     # down_proj when calibration tokens < d_in) break fp32 Cholesky; bumping
     # eps aggressively distorts the whitening matrix and tanks ASVD quality.
@@ -158,7 +225,7 @@ def sqrt_and_inv(M, eps_ratio=1e-5, device="cuda", need_inv=True):
     #   3) GPU fp64 Cholesky @ eps×10   — if even fp64 fails, mild extra damping
     #   4) CPU fp64 eigh                — last resort (handles singular cleanly)
     tried = []
-    if device == "cuda":
+    if device == "cuda" and not skip_cholesky:
         for tier_name, dev, dt, factor in [
             ("gpu-fp32",       "cuda", torch.float32, eps_ratio),
             ("gpu-fp64",       "cuda", torch.float64, eps_ratio),
@@ -253,8 +320,28 @@ def _require_ram_headroom(bytes_needed: int, min_free_gb: float, label: str):
         )
 
 
+def _require_disk_headroom(bytes_needed: int, target_dir: Path,
+                           max_pct: float, label: str):
+    """Refuse the allocation if it would push used-disk above max_pct of
+    the drive's total size. Mirrors the RAM headroom check so runs that
+    trip against disk fail fast with a clear message instead of the generic
+    OSError(28) from the filesystem."""
+    usage = shutil.disk_usage(str(target_dir))
+    used_after = (usage.total - usage.free) + bytes_needed
+    cap_bytes = int(usage.total * max_pct / 100.0)
+    if used_after > cap_bytes:
+        raise OSError(
+            f"refusing to allocate {bytes_needed/1e9:.2f} GB on "
+            f"{target_dir} for {label}: would push used disk to "
+            f"{used_after/1e9:.1f} GB vs cap "
+            f"{cap_bytes/1e9:.1f} GB ({max_pct:.0f}% of "
+            f"{usage.total/1e9:.1f} GB total). Free space or raise "
+            f"--disk-max-pct."
+        )
+
+
 class XtxStore:
-    """Allocates and owns d×d fp32 accumulators for calibration.
+    """Allocates and owns d×d gramian accumulators for calibration.
 
     Modes:
       - "ram":  torch.zeros on CPU (current behavior)
@@ -263,12 +350,26 @@ class XtxStore:
       - "auto": per-tensor choice. If the allocation would trip the
                 --min-free-ram-gb threshold, fall back to disk; else RAM.
 
-    All tensors are CPU fp32 and safe to hand to downstream addmm_ and SVD
-    code unchanged. Call cleanup() when done to delete temp files.
+    Precision policy: gramians are allocated as float64 when d ≥
+    `accum_fp64_threshold` and float32 otherwise. Wide gramians (down_proj
+    on 7B+ has d=18944) accumulate ~10^3–10^4 hook updates worth of
+    fp32-matmul deltas, and the low-eigenvalue tail drowns in fp32
+    running-sum noise long before the Cholesky whitening step runs. Keeping
+    the accumulator in fp64 costs 2× memory (handled by disk backing on big
+    models) and zero GPU compute — the matmul stays fp32; PyTorch's
+    in-place `.add_()` auto-promotes to the destination dtype. The cast for
+    small-d roles stays fp32 to preserve the existing RAM/checkpoint path.
+
+    All returned tensors are CPU and safe to hand to downstream `addmm_` and
+    SVD code unchanged (`sqrt_and_inv` re-casts internally). Call `cleanup`
+    when done to delete temp files.
     """
 
     def __init__(self, mode: str, temp_dir: Path | None, min_free_gb: float,
-                 gpu_workspace_cap_gb: float = 4.0):
+                 gpu_workspace_cap_gb: float = 4.0,
+                 accum_fp64_threshold: int = 4096,
+                 disk_max_pct: float = 90.0,
+                 gpu_vram_max_pct: float = 90.0):
         assert mode in ("ram", "disk", "auto")
         self.mode = mode
         self.min_free_gb = min_free_gb
@@ -288,6 +389,15 @@ class XtxStore:
         self._gpu_workspaces: dict[int, torch.Tensor] = {}
         self._gpu_enabled = torch.cuda.is_available()
         self._gpu_workspace_cap_bytes = int(gpu_workspace_cap_gb * 1e9)
+        self.accum_fp64_threshold = int(accum_fp64_threshold)
+        self.disk_max_pct = float(disk_max_pct)
+        self.gpu_vram_max_pct = float(gpu_vram_max_pct)
+
+    def _accum_dtype(self, d: int) -> torch.dtype:
+        return torch.float64 if d >= self.accum_fp64_threshold else torch.float32
+
+    def _accum_nbytes(self, d: int) -> int:
+        return 8 if d >= self.accum_fp64_threshold else 4
 
     def _use_disk(self, bytes_needed: int) -> bool:
         if self.mode == "ram":
@@ -304,7 +414,9 @@ class XtxStore:
         return bytes_needed > avail - 2 * reserve
 
     def alloc(self, name: str, d: int) -> torch.Tensor:
-        bytes_needed = d * d * 4  # fp32
+        dtype = self._accum_dtype(d)
+        nbytes = self._accum_nbytes(d)
+        bytes_needed = d * d * nbytes
         use_disk = self._use_disk(bytes_needed)
         if use_disk:
             # No RAM safety check on the disk path. Memmap writes go to the
@@ -312,17 +424,25 @@ class XtxStore:
             # even when free RAM looks low, we are not actually allocating
             # new process memory. Guarding this on virtual_memory().available
             # produces false positives once the page cache fills up.
+            # Disk headroom *is* checked: memmap w+ pre-allocates the full
+            # file (Windows semantics), and running the drive past the cap
+            # trips OSError(28) mid-calibration as we saw on the first 7B
+            # fp64 attempt. Fail early with a clear message instead.
+            _require_disk_headroom(bytes_needed, self.temp_dir,
+                                   self.disk_max_pct, name)
             safe = name.replace("/", "_").replace(".", "_")
-            path = self.temp_dir / f"xtx_{safe}.f32"
+            suffix = "f64" if nbytes == 8 else "f32"
+            np_dtype = "float64" if nbytes == 8 else "float32"
+            path = self.temp_dir / f"xtx_{safe}.{suffix}"
             # mode='w+' truncates; freshly-extended pages are zero-initialized
             # by the OS, so we don't need (and shouldn't pay for) an explicit
             # arr[:] = 0 that dirties every page up front.
-            arr = np.memmap(str(path), dtype="float32", mode="w+", shape=(d, d))
+            arr = np.memmap(str(path), dtype=np_dtype, mode="w+", shape=(d, d))
             self._memmaps[name] = arr
             self._paths.append(path)
             return torch.from_numpy(arr)
         _require_ram_headroom(bytes_needed, self.min_free_gb, name)
-        return torch.zeros(d, d, dtype=torch.float32)
+        return torch.zeros(d, d, dtype=dtype)
 
     def get_gpu_workspace(self, d: int) -> torch.Tensor | None:
         """Return (lazily-allocated) CUDA fp32 d×d buffer for delta matmul.
@@ -330,6 +450,15 @@ class XtxStore:
         Returns None when CUDA is unavailable, the tensor would exceed the
         configured cap, or allocation fails (e.g. VRAM exhausted). Callers
         in the hook path fall back to CPU-side addmm in that case.
+
+        Two independent caps gate the allocation:
+        - `gpu_workspace_cap_gb`: absolute byte budget for any single
+          workspace (kept for backward compat; skips this d entirely if
+          the single tensor would exceed it).
+        - `gpu_vram_max_pct`: total-VRAM ceiling. Checks current free VRAM
+          via cudaMemGetInfo and allocates only if the resulting usage
+          stays under the cap. Lets multiple small workspaces coexist but
+          refuses to push VRAM past the configured percentage.
         """
         if not self._gpu_enabled:
             return None
@@ -337,6 +466,15 @@ class XtxStore:
             return self._gpu_workspaces[d]
         bytes_needed = d * d * 4
         if bytes_needed > self._gpu_workspace_cap_bytes:
+            return None
+        # VRAM percent cap: refuse the alloc if it would push used-VRAM
+        # above the configured fraction of total. free_vram is reported
+        # after the model + any prior workspaces have already been
+        # allocated, so this is an honest "what's left" signal.
+        free_vram, total_vram = torch.cuda.mem_get_info()
+        cap_bytes = int(total_vram * self.gpu_vram_max_pct / 100.0)
+        used_after = (total_vram - free_vram) + bytes_needed
+        if used_after > cap_bytes:
             return None
         try:
             ws = torch.empty(d, d, dtype=torch.float32, device="cuda")
@@ -378,10 +516,202 @@ class XtxStore:
                 pass  # dir not empty (leftover files or other artifacts)
 
 
+# ---------- streaming activation collector ----------
+#
+# For wide-d roles at 7B+ (mlp.down_proj with d_in=18944), an fp64 d×d
+# gramian is ~2.87 GB per layer. Keeping all 28 layers' gramians live
+# during calibration (80 GB) forces disk-backed memmaps whose random-access
+# write pattern pathologically thrashes Windows' page cache — we observed
+# 10-30 min per calibration sample on an HDD and 5-15 min/sample on NVMe
+# before the system stalled.
+#
+# This class sidesteps that: the forward hook captures raw activations to
+# a per-layer pinned-host buffer (bf16 to halve memory vs fp32). After all
+# calibration samples run, `finalize()` iterates layers, uploads each
+# layer's concatenated activations to GPU, computes the fp64 gramian via
+# chunked fp32 matmul with fp64 accumulate, and D2Hs the result into the
+# normal XtxStore accumulator.
+#
+# Memory vs the live-accumulate path, per role of d_in=D, L layers,
+# N samples at batch×seq=T tokens:
+#   live fp64 gramian: L × D × D × 8 bytes            (80 GB at 7B)
+#   streamed activations (bf16): L × N × T × D × 2     (17 GB at 7B/8smpl)
+# Win is specifically when D is big enough that L×D² dominates L×N×T×D,
+# i.e. D > N×T. For N×T ~ 16K and D=18944, streaming is ~5× less memory.
+# For D=3584 the math inverts and the regular hook path is cheaper.
+
+class StreamingCollector:
+    """Activation cache + post-pass gramian computer for wide-d roles.
+
+    Hook captures activations into pinned-host bf16 buffers keyed by
+    module name. `finalize()` computes fp64 gramians on GPU (chunked)
+    and writes them into the provided XtxStore so downstream code sees
+    them exactly like regular live-accumulated gramians.
+
+    Raises MemoryError if total pinned-host usage would cross the
+    configured budget — caller should reduce calib samples or narrow
+    `--streaming-roles`.
+    """
+
+    def __init__(self, xtx_store: "XtxStore", max_pinned_ram_gb: float,
+                 attn_mask_holder: list | None = None):
+        self.xtx_store = xtx_store
+        self.max_pinned_bytes = int(max_pinned_ram_gb * 1e9)
+        self.buffers: dict[str, list[torch.Tensor]] = {}
+        self._bytes_held = 0
+        # Holder reference shared with collect_stats. When batched
+        # calibration is active, the mask tensor lives at
+        # attn_mask_holder[0]; each capture zeros padded positions before
+        # stashing the activation. None means batch=1 (no padding).
+        self._attn_mask_holder = attn_mask_holder
+        # Running accumulators (xtx_store-backed fp64 gramians). Lazily
+        # allocated on the first drain that sees each name. Between drains
+        # we accumulate new deltas into these, so peak pinned-host usage
+        # stays bounded by the budget regardless of sample count.
+        self.accumulators: dict[str, torch.Tensor] = {}
+        # Rows contributed per name (for logging). Reset when we drain
+        # at finalize, useful only for the summary line.
+        self._rows_seen: dict[str, int] = {}
+        # Incremented per-drain; used only for log framing.
+        self._drain_idx = 0
+        # Largest per-sample byte growth seen so far. Used by should_drain
+        # to guarantee we always leave room for one more forward — if we
+        # let the buffer fill to the cap minus less-than-one-sample, the
+        # next forward's hooks trip the hard MemoryError before drain
+        # gets a chance to run. Grows monotonically.
+        self._peak_sample_bytes = 0
+        self._bytes_before_forward = 0
+
+    def register(self, name: str) -> None:
+        self.buffers.setdefault(name, [])
+        self._rows_seen.setdefault(name, 0)
+
+    def capture_hook(self, name: str):
+        """Return a forward_pre_hook that stashes activations for `name`."""
+        def hook(mod, inputs):
+            x = inputs[0].detach()
+            flat = x.reshape(-1, x.shape[-1])
+            # Batched calibration: mask padded positions to zero before
+            # we stash them. Otherwise finalize() would add padded
+            # positions' outer products to the fp64 gramian, distorting
+            # the spectrum used by the downstream SVD.
+            if (self._attn_mask_holder is not None
+                    and self._attn_mask_holder[0] is not None):
+                m = self._attn_mask_holder[0].reshape(-1, 1).to(
+                    dtype=flat.dtype, device=flat.device)
+                flat = flat * m
+            # Preserve the activation's native dtype. For Qwen loaded as
+            # fp16 (default), this retains 11-bit mantissa precision;
+            # hardcoding bf16 here would downcast to 7 bits and contaminate
+            # the gramian with ~1% relative input noise before the matmul
+            # even runs. Pinned so the D2H back to GPU in finalize() is
+            # overlap-friendly. Allocate + copy is fast vs the model's
+            # own per-layer compute, so the hook stays off the hot path.
+            pinned = torch.empty_like(flat, device="cpu", pin_memory=True)
+            pinned.copy_(flat)
+            self.buffers[name].append(pinned)
+            self._bytes_held += pinned.numel() * pinned.element_size()
+            if self._bytes_held > self.max_pinned_bytes:
+                raise MemoryError(
+                    f"StreamingCollector exceeded pinned-host budget: "
+                    f"{self._bytes_held/1e9:.1f} GB vs cap "
+                    f"{self.max_pinned_bytes/1e9:.1f} GB. Reduce "
+                    f"--calib-samples or increase drain frequency."
+                )
+        return hook
+
+    def note_forward_start(self) -> None:
+        """Mark the pinned-bytes level before the next forward. Pair with
+        `note_forward_end` / `should_drain` so the collector can size the
+        drain window against the actual per-sample growth, not a guess."""
+        self._bytes_before_forward = self._bytes_held
+
+    def note_forward_end(self) -> None:
+        """Update the running max-per-sample tally. Called after each
+        forward so should_drain knows how much room the next sample needs."""
+        grew = self._bytes_held - self._bytes_before_forward
+        if grew > self._peak_sample_bytes:
+            self._peak_sample_bytes = grew
+
+    def should_drain(self) -> bool:
+        """True when the next forward would exceed the budget. Uses the
+        peak per-sample growth seen so far as the guard — before the first
+        forward finishes, peak is 0 so this returns False and the first
+        sample fills freely."""
+        # Require room for one more sample plus a 10% safety margin.
+        projected = self._bytes_held + int(self._peak_sample_bytes * 1.1)
+        return projected > self.max_pinned_bytes
+
+    def drain(self, device: str = "cuda", chunk_rows: int = 4096) -> None:
+        """Compute gramian contributions from current buffers, add into the
+        running per-name accumulators, release pinned memory. Can be called
+        repeatedly during calibration to keep peak pinned bounded across
+        many samples; the final call should be `finalize()` which also
+        returns the dict for collect_stats to merge."""
+        gpu_ok = device == "cuda" and torch.cuda.is_available()
+        drained_bytes = 0
+        for name, bufs in list(self.buffers.items()):
+            if not bufs:
+                continue
+            d = bufs[0].shape[1]
+            # Lazy-alloc the running accumulator on first drain for this
+            # name. Allocating later means we never reserve xtx_store space
+            # for a streaming role whose buffers never received any data.
+            if name not in self.accumulators:
+                self.accumulators[name] = self.xtx_store.alloc(name, d)
+            dest = self.accumulators[name]
+            rows_in_drain = sum(b.shape[0] for b in bufs)
+            self._rows_seen[name] = self._rows_seen.get(name, 0) + rows_in_drain
+            if gpu_ok:
+                gram = torch.zeros(d, d, dtype=torch.float64, device="cuda")
+                for b in bufs:
+                    for chunk in b.split(chunk_rows):
+                        chunk_gpu = chunk.to(device="cuda",
+                                             dtype=torch.float32,
+                                             non_blocking=True)
+                        delta = chunk_gpu.T @ chunk_gpu
+                        gram.add_(delta)
+                        del chunk_gpu, delta
+                # Accumulate: dest is fp64, gram is fp64 → in-place add
+                # preserves dest dtype and semantics across multiple drains.
+                dest.add_(gram.cpu().to(dest.dtype))
+                del gram
+                torch.cuda.empty_cache()
+            else:
+                for b in bufs:
+                    chunk_cpu = b.to(dtype=dest.dtype)
+                    dest.addmm_(chunk_cpu.T, chunk_cpu)
+                    del chunk_cpu
+            # Release this drain's buffers and subtract their weight from
+            # the pinned-bytes tally. _bytes_held is a tracking int, not
+            # directly tied to tensor lifetimes, so we update it manually.
+            self.buffers[name] = []
+            drained_bytes += sum(b.shape[0] for b in bufs) * d * (
+                bufs[0].element_size())
+        self._bytes_held = max(0, self._bytes_held - drained_bytes)
+        self._drain_idx += 1
+
+    def finalize(self, device: str = "cuda",
+                 chunk_rows: int = 4096) -> dict[str, torch.Tensor]:
+        """Flush remaining buffers, log a summary, return the accumulator
+        dict for collect_stats to merge into xtx."""
+        self.drain(device=device, chunk_rows=chunk_rows)
+        total = len(self.accumulators)
+        for idx, (name, dest) in enumerate(self.accumulators.items()):
+            d = dest.shape[0]
+            rows = self._rows_seen.get(name, 0)
+            print(f"    [streaming] finalized {idx+1}/{total} {name}: "
+                  f"d={d} rows={rows}", flush=True)
+        return dict(self.accumulators)
+
+
 # ---------- calibration (forward + optional backward) ----------
 
 def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_grad,
-                  xtx_store: XtxStore, ggt_store: XtxStore | None = None):
+                  xtx_store: XtxStore, ggt_store: XtxStore | None = None,
+                  streaming_roles: set[str] | None = None,
+                  streaming_max_ram_gb: float = 20.0,
+                  batch_size: int = 1):
     """Run calibration and accumulate X^T X (input cov) and optionally G^T G
     (output-gradient cov) for every linear we care about.
 
@@ -402,6 +732,33 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
     """
     xtx = {}
     ggt = {} if need_grad else None
+    streaming_roles = streaming_roles or set()
+    # Batched calibration needs to zero out padding-token activations
+    # before they're summed into the gramian — otherwise padded positions
+    # add their (meaningless) outer products to X^T X, distorting the
+    # spectrum the downstream SVD relies on. We share the current batch's
+    # attention mask through this holder so every hook (standard,
+    # streaming, backward) can mask its activations in place. None means
+    # batch=1 mode — no padding.
+    _attn_mask_holder: list = [None]
+    # The streaming collector is a no-op if no role is flagged for it.
+    # When present, forward hooks for those roles cache activations
+    # to pinned host bf16; finalize() after all passes computes fp64
+    # gramians on GPU in chunks, writing through the same xtx_store.
+    sc = (StreamingCollector(xtx_store, streaming_max_ram_gb,
+                             attn_mask_holder=_attn_mask_holder)
+          if streaming_roles else None)
+    if streaming_roles and need_grad:
+        # Backward-gradient streaming isn't implemented — ggt accumulation
+        # for streamed roles would need the same treatment and we haven't
+        # needed it (refit is off for wide-d scale tests). Fail loud
+        # instead of silently dropping ggt samples.
+        raise NotImplementedError(
+            "streaming_roles with need_grad=True is not supported yet — "
+            "the backward hook path still uses live ggt accumulation. "
+            "Pass --no-refit or extend StreamingCollector to cache "
+            "gradients as well."
+        )
     # Every module we'll touch across every pass — we grad-enable the whole
     # set upfront so the backward hooks installed later don't hit frozen
     # params.
@@ -425,18 +782,38 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
                 x = inputs[0].detach()
                 flat = x.reshape(-1, x.shape[-1])
                 flat_gpu = flat.to(device="cuda", dtype=torch.float32, non_blocking=True)
+                # Batched calibration: mask padded positions to zero so
+                # they don't contribute to the gramian. Mask shape is
+                # (B, T); reshape to (B*T, 1) to broadcast across d.
+                m = _attn_mask_holder[0]
+                if m is not None:
+                    mask_flat = m.reshape(-1, 1).to(device="cuda",
+                                                     dtype=torch.float32,
+                                                     non_blocking=True)
+                    flat_gpu = flat_gpu * mask_flat
                 # In-place matmul into the pre-allocated workspace, then D2H
                 # into a fresh CPU tensor. .cpu() is synchronous in torch's
                 # default stream, so the next hook's overwrite of `ws` is
-                # safely ordered after this copy completes.
+                # safely ordered after this copy completes. `.add_()`
+                # promotes fp32→fp64 when the accumulator is fp64 (wide-d
+                # roles), so a single workspace dtype covers both tracks.
                 torch.mm(flat_gpu.T, flat_gpu, out=ws)
                 xtx[name].add_(ws.cpu())
             return hook
 
         # CPU fallback — identical semantics, just slower for big d.
+        # Match the flat activation dtype to the accumulator's dtype so
+        # `addmm_` works (it does not do dtype promotion). For fp64
+        # accumulators this also means the matmul itself runs in fp64, which
+        # on CPU is only ~2× slower than fp32 and is numerically stricter.
+        dest_dtype = xtx[name].dtype
         def hook(mod, inputs):
             x = inputs[0].detach()
-            flat_cpu = x.reshape(-1, x.shape[-1]).to(device="cpu", dtype=torch.float32)
+            flat_cpu = x.reshape(-1, x.shape[-1]).to(device="cpu", dtype=dest_dtype)
+            m = _attn_mask_holder[0]
+            if m is not None:
+                flat_cpu = flat_cpu * m.reshape(-1, 1).to(dtype=dest_dtype,
+                                                           device="cpu")
             xtx[name].addmm_(flat_cpu.T, flat_cpu)
         return hook
 
@@ -449,13 +826,24 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
                 g = grad_output[0].detach()
                 flat = g.reshape(-1, g.shape[-1])
                 flat_gpu = flat.to(device="cuda", dtype=torch.float32, non_blocking=True)
+                m = _attn_mask_holder[0]
+                if m is not None:
+                    mask_flat = m.reshape(-1, 1).to(device="cuda",
+                                                     dtype=torch.float32,
+                                                     non_blocking=True)
+                    flat_gpu = flat_gpu * mask_flat
                 torch.mm(flat_gpu.T, flat_gpu, out=ws)
                 ggt[name].add_(ws.cpu())
             return hook
 
+        dest_dtype = ggt[name].dtype
         def hook(mod, grad_input, grad_output):
             g = grad_output[0].detach()
-            flat_cpu = g.reshape(-1, g.shape[-1]).to(device="cpu", dtype=torch.float32)
+            flat_cpu = g.reshape(-1, g.shape[-1]).to(device="cpu", dtype=dest_dtype)
+            m = _attn_mask_holder[0]
+            if m is not None:
+                flat_cpu = flat_cpu * m.reshape(-1, 1).to(dtype=dest_dtype,
+                                                           device="cpu")
             ggt[name].addmm_(flat_cpu.T, flat_cpu)
         return hook
 
@@ -465,30 +853,97 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
         pass_groups = find_layers(model, pass_roles)
         hooks = []
         for role, entries in pass_groups.items():
+            is_streamed = role in streaming_roles
             for _, name, mod in entries:
-                hooks.append(mod.register_forward_pre_hook(
-                    fwd_hook_factory(name, mod.in_features)))
-                if need_grad:
+                if is_streamed:
+                    sc.register(name)
+                    hooks.append(mod.register_forward_pre_hook(
+                        sc.capture_hook(name)))
+                else:
+                    hooks.append(mod.register_forward_pre_hook(
+                        fwd_hook_factory(name, mod.in_features)))
+                # ggt is only needed for LS-refit, which streaming doesn't
+                # support yet — we raised earlier if both were requested.
+                if need_grad and not is_streamed:
                     hooks.append(mod.register_full_backward_hook(
                         bwd_hook_factory(name, mod.out_features)))
 
+        # Report accumulator precision per role so the fp64 promotion is
+        # visible in logs. Grouped by (role, d, dtype) since all layers of a
+        # role share the same d_in → same dtype. Streaming roles report
+        # dtype as "stream/fp64" since the accumulator isn't allocated
+        # until finalize() runs.
+        precision_summary = []
+        for role, entries in pass_groups.items():
+            if not entries:
+                continue
+            _, sample_name, sample_mod = entries[0]
+            d_in = sample_mod.in_features
+            if role in streaming_roles:
+                precision_summary.append(f"{role}(d={d_in},stream->fp64)")
+            else:
+                dtype = xtx[sample_name].dtype
+                precision_summary.append(f"{role}(d={d_in},{str(dtype).replace('torch.','')})")
+        if precision_summary:
+            print(f"  [xtx] pass {pass_idx+1}/{n_passes} accumulators: "
+                  f"{', '.join(precision_summary)}", flush=True)
+
         desc = (f"calib pass {pass_idx+1}/{n_passes} "
                 f"({sum(len(e) for e in pass_groups.values())} modules)")
-        for text in tqdm(texts, desc=desc):
-            enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
-            input_ids = enc.input_ids.to(device)
+        # Batched mode (batch_size > 1) tokenizes + pads in groups. At
+        # batch_size=1 the old codepath is preserved (no padding, no mask
+        # in the hook). Qwen's tokenizer pads on the right by default
+        # with the eos_token as pad; attention_mask zeros those tokens
+        # for attention, and our hooks zero them for gramian contribution.
+        if batch_size < 1:
+            batch_size = 1
+        n_texts = len(texts)
+        batches = [texts[i:i + batch_size] for i in range(0, n_texts, batch_size)]
+        for batch_texts in tqdm(batches, desc=desc):
+            if batch_size == 1:
+                enc = tokenizer(batch_texts[0], return_tensors="pt",
+                                truncation=True, max_length=seq_len)
+                input_ids = enc.input_ids.to(device)
+                attn_mask = None
+                _attn_mask_holder[0] = None
+            else:
+                enc = tokenizer(batch_texts, return_tensors="pt",
+                                padding=True, truncation=True,
+                                max_length=seq_len)
+                input_ids = enc.input_ids.to(device)
+                attn_mask = enc.attention_mask.to(device)
+                _attn_mask_holder[0] = attn_mask
             if input_ids.shape[1] < 8:
+                _attn_mask_holder[0] = None
                 continue
+            if sc is not None:
+                sc.note_forward_start()
             if need_grad:
-                out = model(input_ids, labels=input_ids)
+                out = model(input_ids, attention_mask=attn_mask,
+                            labels=input_ids)
                 out.loss.backward()
                 model.zero_grad(set_to_none=True)
             else:
                 with torch.no_grad():
-                    model(input_ids)
+                    model(input_ids, attention_mask=attn_mask)
+            _attn_mask_holder[0] = None  # clear between batches
+            if sc is not None:
+                sc.note_forward_end()
+                # Drain if the NEXT sample would overflow the pinned cap.
+                # The collector tracks the largest per-sample growth seen
+                # so far, so this is safe starting from sample 2.
+                if sc.should_drain():
+                    sc.drain(device=device)
 
         for h in hooks:
             h.remove()
+
+    # Streaming finalize: convert cached activations into fp64 gramians
+    # per-layer on GPU and merge into xtx. Runs once, after the last
+    # calibration sample goes through.
+    if sc is not None:
+        streamed = sc.finalize(device=device)
+        xtx.update(streamed)
 
     if need_grad:
         for p in model.parameters():
@@ -509,9 +964,151 @@ def rank_permatrix(d_out, d_in, target_ratio):
     return max(1, int(target_ratio * d_out * d_in / (d_out + d_in)))
 
 
+def _whitened_svdvals(W_list, XTX, device="cuda", skip_cholesky_above_d=0):
+    """Compute σ(W_stack) where W_stack = cat([W_i @ S_in], dim=1) and
+    S_in = sqrt(XTX + eps*I). Used by both the shared-window analyzer
+    (len(W_list) == n) and the permatrix analyzer (len(W_list) == 1) so
+    both tracks apply the SAME regularized whitening — the water-fill
+    allocator was producing pathological results when the two tracks
+    used inconsistent spectra (unregularized vs regularized).
+
+    Returns 1D fp64 tensor of singular values in descending order."""
+    skip_chol = (XTX.shape[0] > skip_cholesky_above_d
+                 if skip_cholesky_above_d > 0 else False)
+    S_in, _ = sqrt_and_inv(XTX, device=device, need_inv=False,
+                           skip_cholesky=skip_chol)
+    # sqrt_and_inv may fall back to CPU (cpu-eigh-fp64 terminal tier) for
+    # ill-conditioned gramians, so pin downstream ops to S_in's actual
+    # device, not the requested one.
+    work_device = S_in.device
+    work_dtype = S_in.dtype
+    parts = [W.to(device=work_device, dtype=work_dtype) @ S_in for W in W_list]
+    W_stack = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+    del parts, S_in
+    if not torch.isfinite(W_stack).all():
+        W_stack = torch.nan_to_num(W_stack, nan=0.0, posinf=0.0, neginf=0.0)
+    # svdvals skips U and Vt — ~30% faster than full SVD.
+    try:
+        sigma = torch.linalg.svdvals(W_stack)
+    except RuntimeError:
+        sigma = torch.linalg.svdvals(W_stack.cpu())
+    return sigma.to(torch.float64).cpu()
+
+
+def _analyze_spectrum_permatrix(W, XTX, device="cuda",
+                                skip_cholesky_above_d=0,
+                                eps_ratio=1e-5):
+    """σ(W @ S_in) via direct eigh, no sqrt_and_inv needed.
+
+    Identity: σ²(W @ S_in) = eigenvalues of W @ (S_in S_in^T) @ W^T
+                          = W @ (XTX + eps*I) @ W^T
+                          = W@XTX@W^T + eps * W@W^T
+
+    For permatrix roles where d_out < d_in (e.g. down_proj at 7B:
+    3584 < 18944), this computes eigh on a d_out × d_out matrix in
+    well under a second — vs sqrt_and_inv(XTX) at d_in=18944 which
+    ladders through multiple tiers and can take minutes per call on
+    rank-deficient gramians. Regularization matches sqrt_and_inv's
+    default (`eps_ratio * mean_diag`), so the resulting spectrum is
+    consistent with what the shared-window analyzer sees via
+    sqrt_and_inv + svdvals. Only the spectrum tail near-or-below eps
+    differs between paths, and water-fill never allocates rank there."""
+    W64 = W.to(device=device, dtype=torch.float64)
+    XTX64 = XTX.to(device=device, dtype=torch.float64)
+    mean_diag = XTX64.diag().abs().mean().item()
+    eps = eps_ratio * mean_diag + 1e-8
+    # W@XTX@W^T is d_out × d_out (cheap when d_out < d_in). The eps·W@W^T
+    # term absorbs the `sqrt(XTX + eps*I)` regularization without ever
+    # forming S_in.
+    M = W64 @ XTX64 @ W64.T + eps * (W64 @ W64.T)
+    try:
+        evals = torch.linalg.eigvalsh(M)
+    except RuntimeError:
+        evals = torch.linalg.eigvalsh(M.cpu())
+    evals = evals.flip(0).clamp(min=0.0)
+    return evals.sqrt().to(torch.float64).cpu()
+
+
+def _analyze_spectrum_shared_window(W_list, xtx_list, device="cuda",
+                                    skip_cholesky_above_d=0):
+    """σ(W_stack) for a shared window via the unified helper."""
+    XTX_joint = sum(xtx_list)
+    return _whitened_svdvals(W_list, XTX_joint, device=device,
+                             skip_cholesky_above_d=skip_cholesky_above_d)
+
+
+def allocate_ranks_waterfill(specs, total_budget_elements,
+                             min_rank_frac=0.75, log=True):
+    """Greedy rank allocation across matrices by marginal utility.
+
+    specs: dict keyed by matrix id, each value a dict with:
+      - sigma: 1D descending torch.Tensor of singular values
+      - cost: int, bytes (elements) added per unit rank
+      - max_rank: int, cap from matrix geometry
+      - baseline_rank: int, the rank the global formula would use
+    total_budget_elements: sum over matrices of baseline_rank * cost
+    min_rank_frac: floor each matrix at `min_rank_frac × baseline`. This
+      prevents the allocator from reducing any single matrix's rank below
+      a safe fraction — water-fill on sum-of-σ² is a proxy for total
+      reconstruction error, which isn't a reliable proxy for PPL when any
+      one matrix is decimated. Empirically 0.5 preserves per-layer
+      coherence while still letting water-fill redistribute ~50% of
+      total budget where it's most useful.
+
+    Returns {id: rank} with sum(rank[i] * cost[i]) ≤ total_budget_elements.
+
+    Strategy: classic water-filling. Start each matrix at its floor. At
+    each step, add 1 rank to the matrix maximizing (σ_{r_i}² / cost_i) —
+    biggest error reduction per byte spent. Uses a heap for O(log N)
+    lookup. Converges in O(total_ranks_added × log N)."""
+    import heapq
+    ids = list(specs.keys())
+    ranks = {mid: max(1, min(
+        int(min_rank_frac * specs[mid]["baseline_rank"]),
+        specs[mid]["max_rank"])) for mid in ids}
+    spent = sum(ranks[mid] * specs[mid]["cost"] for mid in ids)
+    remaining = max(0, total_budget_elements - spent)
+
+    # Max-heap keyed by -utility so Python's min-heap gives max.
+    heap: list = []
+    for mid in ids:
+        spec = specs[mid]
+        if ranks[mid] < spec["max_rank"]:
+            sigma = spec["sigma"]
+            if ranks[mid] < sigma.numel():
+                u = float(sigma[ranks[mid]]) ** 2 / max(1, spec["cost"])
+                heapq.heappush(heap, (-u, mid))
+
+    while remaining > 0 and heap:
+        neg_u, mid = heapq.heappop(heap)
+        spec = specs[mid]
+        if ranks[mid] >= spec["max_rank"]:
+            continue
+        cost = spec["cost"]
+        if remaining < cost:
+            break
+        ranks[mid] += 1
+        remaining -= cost
+        if ranks[mid] < spec["max_rank"]:
+            sigma = spec["sigma"]
+            if ranks[mid] < sigma.numel():
+                u = float(sigma[ranks[mid]]) ** 2 / max(1, cost)
+                heapq.heappush(heap, (-u, mid))
+
+    if log:
+        bumped = sum(1 for mid in ids if ranks[mid] > specs[mid]["baseline_rank"])
+        cut = sum(1 for mid in ids if ranks[mid] < specs[mid]["baseline_rank"])
+        print(f"  [rank-alloc] {bumped} matrices gained rank, "
+              f"{cut} matrices lost rank, {len(ids)-bumped-cut} unchanged; "
+              f"{remaining} elements unused of {total_budget_elements}",
+              flush=True)
+    return ranks
+
+
 # ---------- decomposition ----------
 
-def decompose_shared_window(W_list, xtx_list, ggt_list, rank, refit=True, device="cpu"):
+def decompose_shared_window(W_list, xtx_list, ggt_list, rank, refit=True, device="cpu",
+                             skip_cholesky_above_d=0):
     """Window decomposition.
 
     Paper's method (refit=False): single SVD of horizontally concatenated
@@ -528,7 +1125,10 @@ def decompose_shared_window(W_list, xtx_list, ggt_list, rank, refit=True, device
 
     # Sum XTX across the window to get the joint calibration covariance.
     XTX_joint = sum(xtx_list)
-    S_in, _ = sqrt_and_inv(XTX_joint, device=device, need_inv=False)
+    skip_chol = (XTX_joint.shape[0] > skip_cholesky_above_d
+                 if skip_cholesky_above_d > 0 else False)
+    S_in, _ = sqrt_and_inv(XTX_joint, device=device, need_inv=False,
+                           skip_cholesky=skip_chol)
 
     # Stack activation-weighted matrices horizontally and SVD.
     # Work in fp32 (S_in is fp32 from the Cholesky path); fp32 SVD is stable
@@ -544,7 +1144,11 @@ def decompose_shared_window(W_list, xtx_list, ggt_list, rank, refit=True, device
               f"clamping and retrying")
         W_stack = torch.nan_to_num(W_stack, nan=0.0, posinf=0.0, neginf=0.0)
 
-    U, _, _ = _stable_svd(W_stack)
+    # Partial SVD: we only ever take the top-rank U columns below, so
+    # computing the remaining (min_dim - rank) singular vectors is pure
+    # waste. _stable_svd_topk falls back to full SVD when rank is close
+    # to full, preserving correctness at r ≈ 1.0.
+    U, _, _ = _stable_svd_topk(W_stack, rank)
     B = U[:, :rank].contiguous()                           # [d_out, rank]
     # SVD may have fallen back to CPU. Lock all subsequent ops to B's device.
     work_device = B.device
@@ -555,7 +1159,10 @@ def decompose_shared_window(W_list, xtx_list, ggt_list, rank, refit=True, device
         W_i_t = W_i.to(device=work_device, dtype=work_dtype)
         if refit and ggt_list is not None:
             # Balanced-weighted LS refit: A_i = (B^T S_out^T S_out B)^-1 B^T S_out^T S_out W_i
-            S_out_i, _ = sqrt_and_inv(ggt_list[i], device=work_device, need_inv=False)
+            ggt_skip = (ggt_list[i].shape[0] > skip_cholesky_above_d
+                        if skip_cholesky_above_d > 0 else False)
+            S_out_i, _ = sqrt_and_inv(ggt_list[i], device=work_device, need_inv=False,
+                                       skip_cholesky=ggt_skip)
             M = S_out_i.to(device=work_device, dtype=work_dtype) @ B
             gram = M.T @ M                                 # [rank, rank]
             rhs = M.T @ (S_out_i.to(device=work_device, dtype=work_dtype) @ W_i_t)
@@ -570,17 +1177,19 @@ def decompose_shared_window(W_list, xtx_list, ggt_list, rank, refit=True, device
     return B.to("cpu"), coeffs
 
 
-def decompose_permatrix(W, XTX, GGT, rank, device="cpu"):
+def decompose_permatrix(W, XTX, GGT, rank, device="cpu", skip_cholesky_above_d=0):
     """Per-matrix balanced truncation. If GGT is None, fall back to input-only
     ASVD (no output-gradient weighting) — cheaper calibration, still respects
     activation distribution.
     """
-    S_in, S_in_inv = sqrt_and_inv(XTX, device=device)
+    skip_in = (XTX.shape[0] > skip_cholesky_above_d
+               if skip_cholesky_above_d > 0 else False)
+    S_in, S_in_inv = sqrt_and_inv(XTX, device=device, skip_cholesky=skip_in)
     W64 = W.to(device=device, dtype=torch.float64)
 
     if GGT is None:
         # ASVD path: project onto top-r output directions of (W @ S_in).
-        U, _, _ = _stable_svd(W64 @ S_in)
+        U, _, _ = _stable_svd_topk(W64 @ S_in, rank)
         r = min(rank, U.shape[1])
         U_r = U[:, :r]
         W_r = U_r @ (U_r.T @ W64)
@@ -590,9 +1199,11 @@ def decompose_permatrix(W, XTX, GGT, rank, device="cpu"):
         return U_out.cpu(), V_out.cpu()
 
     # Balanced truncation with both input and output weighting
-    S_out, S_out_inv = sqrt_and_inv(GGT, device=device)
+    skip_out = (GGT.shape[0] > skip_cholesky_above_d
+                if skip_cholesky_above_d > 0 else False)
+    S_out, S_out_inv = sqrt_and_inv(GGT, device=device, skip_cholesky=skip_out)
     M = S_out @ W64 @ S_in
-    U, sigma, Vt = _stable_svd(M)
+    U, sigma, Vt = _stable_svd_topk(M, rank)
     work = U.device
     if work != M.device:
         S_in_inv = S_in_inv.to(work)
@@ -692,7 +1303,11 @@ def _install_weight(mod, new_weight):
 
 
 def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
-                    window_size, target_ratio, device, refit=True):
+                    window_size, target_ratio, device, refit=True,
+                    skip_cholesky_above_d=0,
+                    rank_alloc="per-matrix",
+                    factor_output_dir=None,
+                    materialize_dtype=torch.float16):
     """Compute all decomposition factors WITHOUT modifying the model.
 
     Returns a dict:
@@ -718,6 +1333,154 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
     result = {"shared": {}, "permatrix": {}}
     t_start = time.time()
 
+    # Streaming factor output: instead of collecting every U/V/basis/coeff
+    # into `result` (~22 GB peak for 7B at r=0.8), write each factor to a
+    # small per-window/per-layer .pt file as soon as it's computed and
+    # install the reconstructed dense weight into `model` in place. The
+    # result dict then holds only metadata + file paths. save_factored
+    # assembles the final single safetensors from those files.
+    streaming = factor_output_dir is not None
+    if streaming:
+        factor_output_dir = Path(factor_output_dir)
+        factor_output_dir.mkdir(parents=True, exist_ok=True)
+        # Clean any stale streamed tensors from a previous run's tmpdir
+        # so we don't mix old factors into the new safetensors assembly.
+        for old in factor_output_dir.glob("*.pt"):
+            try:
+                os.unlink(old)
+            except OSError:
+                pass
+        # Flag downstream that model.weight is already holding reconstructed
+        # factored weights — materialize_factors_in_place should no-op.
+        result["already_materialized"] = True
+        result["streamed_tmpdir"] = str(factor_output_dir)
+
+    def _stream_shared(role, w_idx, layer_indices, mods, B_cpu, coeffs_cpu, rank, mode):
+        """Inline-install reconstructed weights into the model, persist
+        factors to per-window .pt files, free locals. Returns the metadata
+        entry for result['shared'][role]['windows']."""
+        for i_local, layer_i in enumerate(layer_indices):
+            W_recon = (B_cpu @ coeffs_cpu[i_local]).to(materialize_dtype)
+            _install_weight(mods[layer_i], W_recon)
+            del W_recon
+        safe_role = role.replace(".", "_")
+        basis_path = factor_output_dir / f"shared_{safe_role}_w{w_idx:03d}_basis.pt"
+        torch.save(B_cpu.contiguous(), str(basis_path))
+        coeffs_paths = []
+        for i_local, layer_i in enumerate(layer_indices):
+            cp = (factor_output_dir /
+                  f"shared_{safe_role}_w{w_idx:03d}_coeffs_{layer_i:03d}.pt")
+            torch.save(coeffs_cpu[i_local].contiguous(), str(cp))
+            coeffs_paths.append(str(cp))
+        return {
+            "window_id": w_idx,
+            "layers": list(layer_indices),
+            "rank": rank,
+            "basis_path": str(basis_path),
+            "coeffs_paths": coeffs_paths,
+            "mode": mode,
+        }
+
+    def _stream_permatrix(role, layer_i, mod, U_cpu, V_cpu, rank):
+        """Inline-install U @ V into the model, persist U/V to .pt files,
+        return metadata entry."""
+        W_recon = (U_cpu @ V_cpu).to(materialize_dtype)
+        _install_weight(mod, W_recon)
+        del W_recon
+        safe_role = role.replace(".", "_")
+        u_path = factor_output_dir / f"permatrix_{safe_role}_layer{layer_i:03d}_U.pt"
+        v_path = factor_output_dir / f"permatrix_{safe_role}_layer{layer_i:03d}_V.pt"
+        torch.save(U_cpu.contiguous(), str(u_path))
+        torch.save(V_cpu.contiguous(), str(v_path))
+        return {"layer": layer_i, "rank": rank,
+                "U_path": str(u_path), "V_path": str(v_path)}
+
+    # Phase 1+2: per-matrix rank allocation via water-filling. We compute
+    # each matrix's singular-value spectrum (cheap — eigh of a small
+    # gramian), then greedily assign rank under the same total byte budget
+    # the global formula would use. The existing decomposition loop below
+    # consumes `allocated_ranks` when set, falling back to the formula
+    # otherwise. Global mode is preserved for regression comparison.
+    allocated_ranks: dict | None = None
+    if rank_alloc == "per-matrix":
+        specs: dict = {}
+        total_budget = 0
+        have_ggt_global = ggt is not None
+        for role, entries in groups_shared.items():
+            _, names, mods = zip(*entries)
+            L = len(mods)
+            xtx_list_all = [xtx[n] for n in names]
+            d_out, d_in = _weight_to_cpu(mods[0]).shape
+            windows = make_windows(L, window_size)
+            for w_idx, layer_indices in enumerate(windows):
+                n = len(layer_indices)
+                if n == 1:
+                    # Singleton shared window falls through to the
+                    # permatrix-fallback code path. Allocate like a
+                    # permatrix layer: spectrum from W @ XTX @ W^T.
+                    i = layer_indices[0]
+                    W_i = _weight_to_cpu(mods[i])
+                    sigma = _analyze_spectrum_permatrix(
+                        W_i, xtx_list_all[i], device=device,
+                        skip_cholesky_above_d=skip_cholesky_above_d)
+                    cost = d_out + d_in
+                    r_base = rank_permatrix(d_out, d_in, target_ratio)
+                    specs[("shared", role, w_idx)] = {
+                        "sigma": sigma, "cost": cost,
+                        "max_rank": min(d_out, d_in),
+                        "baseline_rank": r_base,
+                    }
+                    total_budget += r_base * cost
+                else:
+                    W_sub = [_weight_to_cpu(mods[i]) for i in layer_indices]
+                    xtx_sub = [xtx_list_all[i] for i in layer_indices]
+                    sigma = _analyze_spectrum_shared_window(
+                        W_sub, xtx_sub, device=device,
+                        skip_cholesky_above_d=skip_cholesky_above_d)
+                    cost = d_out + n * d_in
+                    r_base = rank_shared(d_out, d_in, n, target_ratio)
+                    specs[("shared", role, w_idx)] = {
+                        "sigma": sigma, "cost": cost,
+                        "max_rank": min(d_out, n * d_in),
+                        "baseline_rank": r_base,
+                    }
+                    total_budget += r_base * cost
+        for role, entries in groups_permatrix.items():
+            _, names, mods = zip(*entries)
+            d_out, d_in = _weight_to_cpu(mods[0]).shape
+            r_base = rank_permatrix(d_out, d_in, target_ratio)
+            cost = d_out + d_in
+            for i, (name, mod) in enumerate(zip(names, mods)):
+                W_i = _weight_to_cpu(mod)
+                sigma = _analyze_spectrum_permatrix(
+                    W_i, xtx[name], device=device,
+                    skip_cholesky_above_d=skip_cholesky_above_d)
+                specs[("permatrix", role, i)] = {
+                    "sigma": sigma, "cost": cost,
+                    "max_rank": min(d_out, d_in),
+                    "baseline_rank": r_base,
+                }
+                total_budget += r_base * cost
+        print(f"[{time.time()-t_start:7.1f}s] rank-alloc phase 1 done "
+              f"({len(specs)} matrices, total_budget={total_budget:.2e} "
+              f"elements)", flush=True)
+        allocated_ranks = allocate_ranks_waterfill(specs, total_budget)
+        # Emit a per-role summary so we can see where rank moved.
+        from collections import defaultdict as _dd
+        role_summary = _dd(lambda: {"n": 0, "base_sum": 0, "alloc_sum": 0})
+        for (mtype, mrole, _idx), spec in specs.items():
+            r = role_summary[f"{mtype}/{mrole}"]
+            r["n"] += 1
+            r["base_sum"] += spec["baseline_rank"]
+            r["alloc_sum"] += allocated_ranks[(mtype, mrole, _idx)]
+        for key in sorted(role_summary.keys()):
+            r = role_summary[key]
+            avg_base = r["base_sum"] / r["n"]
+            avg_alloc = r["alloc_sum"] / r["n"]
+            delta = (avg_alloc - avg_base) / avg_base * 100 if avg_base else 0
+            print(f"  [rank-alloc] {key}: avg rank {avg_base:.0f} -> "
+                  f"{avg_alloc:.0f} ({delta:+.1f}%)", flush=True)
+
     for role, entries in groups_shared.items():
         _, names, mods = zip(*entries)
         L = len(mods)
@@ -737,18 +1500,26 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
                 # Trailing short window — emit a synthetic 1-layer "window".
                 # If GGT is available use balanced truncation; else ASVD.
                 i = layer_indices[0]
-                r = rank_permatrix(d_out, d_in, target_ratio)
+                r = (allocated_ranks[("shared", role, w_idx)]
+                     if allocated_ranks is not None
+                     else rank_permatrix(d_out, d_in, target_ratio))
                 have_ggt = ggt_list_all is not None
+                skip_in = (xtx_list_all[i].shape[0] > skip_cholesky_above_d
+                            if skip_cholesky_above_d > 0 else False)
                 S_in, S_in_inv = sqrt_and_inv(xtx_list_all[i], device=device,
-                                              need_inv=have_ggt)
+                                              need_inv=have_ggt,
+                                              skip_cholesky=skip_in)
                 W_t = W_list_all[i].to(device=S_in.device, dtype=S_in.dtype)
                 if have_ggt:
+                    skip_out = (ggt_list_all[i].shape[0] > skip_cholesky_above_d
+                                 if skip_cholesky_above_d > 0 else False)
                     S_out, S_out_inv = sqrt_and_inv(ggt_list_all[i], device=device,
-                                                    need_inv=True)
+                                                    need_inv=True,
+                                                    skip_cholesky=skip_out)
                     S_out = S_out.to(dtype=S_in.dtype)
                     S_out_inv = S_out_inv.to(dtype=S_in.dtype)
                     M = S_out @ W_t @ S_in
-                    U, sigma, Vt = _stable_svd(M)
+                    U, sigma, Vt = _stable_svd_topk(M, r)
                     if U.device != M.device:
                         S_in_inv = S_in_inv.to(U.device)
                         S_out_inv = S_out_inv.to(U.device)
@@ -758,38 +1529,58 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
                 else:
                     # ASVD path
                     M = W_t @ S_in
-                    U, _, _ = _stable_svd(M)
+                    U, _, _ = _stable_svd_topk(M, r)
                     r_eff = min(r, U.shape[1])
                     U_r = U[:, :r_eff]
                     V_r = U_r.T @ W_t.to(U_r.device)
-                role_windows.append({
-                    "window_id": w_idx,
-                    "layers": [i],
-                    "rank": r_eff,
-                    "basis": U_r.cpu().to(torch.float32),
-                    "coeffs": [V_r.cpu().to(torch.float32)],
-                    "mode": "permatrix_fallback",
-                })
+                U_r_cpu = U_r.cpu().to(torch.float32)
+                V_r_cpu = V_r.cpu().to(torch.float32)
+                if streaming:
+                    entry = _stream_shared(role, w_idx, [i], mods,
+                                           U_r_cpu, [V_r_cpu], r_eff,
+                                           "permatrix_fallback")
+                    role_windows.append(entry)
+                    del U_r, V_r, U_r_cpu, V_r_cpu
+                else:
+                    role_windows.append({
+                        "window_id": w_idx,
+                        "layers": [i],
+                        "rank": r_eff,
+                        "basis": U_r_cpu,
+                        "coeffs": [V_r_cpu],
+                        "mode": "permatrix_fallback",
+                    })
                 continue
 
-            r = rank_shared(d_out, d_in, n, target_ratio)
+            r = (allocated_ranks[("shared", role, w_idx)]
+                 if allocated_ranks is not None
+                 else rank_shared(d_out, d_in, n, target_ratio))
             W_list = [W_list_all[i] for i in layer_indices]
             xtx_list = [xtx_list_all[i] for i in layer_indices]
             ggt_list_w = [ggt_list_all[i] for i in layer_indices] if ggt_list_all else None
             t_win = time.time()
             B, coeffs = decompose_shared_window(W_list, xtx_list, ggt_list_w, r,
-                                                refit=refit, device=device)
+                                                refit=refit, device=device,
+                                                skip_cholesky_above_d=skip_cholesky_above_d)
             print(f"[{time.time()-t_start:7.1f}s]   win {w_idx+1}/{len(windows)} "
                   f"layers={layer_indices} r={r} ({time.time()-t_win:.1f}s) "
                   f"{_gpu_mem_str()}", flush=True)
-            role_windows.append({
-                "window_id": w_idx,
-                "layers": list(layer_indices),
-                "rank": r,
-                "basis": B.to(torch.float32),
-                "coeffs": [c.to(torch.float32) for c in coeffs],
-                "mode": "shared",
-            })
+            B_cpu = B.to(torch.float32)
+            coeffs_cpu = [c.to(torch.float32) for c in coeffs]
+            if streaming:
+                entry = _stream_shared(role, w_idx, layer_indices, mods,
+                                       B_cpu, coeffs_cpu, r, "shared")
+                role_windows.append(entry)
+                del B, coeffs, B_cpu, coeffs_cpu
+            else:
+                role_windows.append({
+                    "window_id": w_idx,
+                    "layers": list(layer_indices),
+                    "rank": r,
+                    "basis": B_cpu,
+                    "coeffs": coeffs_cpu,
+                    "mode": "shared",
+                })
 
         result["shared"][role] = {"L": L, "d_out": d_out, "d_in": d_in,
                                   "windows": role_windows}
@@ -797,24 +1588,41 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
     for role, entries in groups_permatrix.items():
         _, names, mods = zip(*entries)
         d_out, d_in = mods[0].weight.shape
-        r = rank_permatrix(d_out, d_in, target_ratio)
-        print(f"[{time.time()-t_start:7.1f}s] permatrix {role}: "
-              f"{d_out}x{d_in} x{len(mods)} rank={r} {_gpu_mem_str()}", flush=True)
+        r_default = rank_permatrix(d_out, d_in, target_ratio)
+        if allocated_ranks is not None:
+            role_ranks = [allocated_ranks[("permatrix", role, i)]
+                          for i in range(len(mods))]
+            print(f"[{time.time()-t_start:7.1f}s] permatrix {role}: "
+                  f"{d_out}x{d_in} x{len(mods)} "
+                  f"rank range={min(role_ranks)}-{max(role_ranks)} "
+                  f"(base={r_default}) {_gpu_mem_str()}", flush=True)
+        else:
+            role_ranks = [r_default] * len(mods)
+            print(f"[{time.time()-t_start:7.1f}s] permatrix {role}: "
+                  f"{d_out}x{d_in} x{len(mods)} rank={r_default} "
+                  f"{_gpu_mem_str()}", flush=True)
         layer_factors = []
         t_role_start = time.time()
         for i, (name, mod) in enumerate(zip(names, mods)):
             t_layer = time.time()
+            r = role_ranks[i]
             have_ggt = ggt is not None
+            skip_in = (xtx[name].shape[0] > skip_cholesky_above_d
+                        if skip_cholesky_above_d > 0 else False)
             S_in, S_in_inv = sqrt_and_inv(xtx[name], device=device,
-                                          need_inv=have_ggt)
+                                          need_inv=have_ggt,
+                                          skip_cholesky=skip_in)
             W_t = _weight_to_cpu(mod).to(device=S_in.device, dtype=S_in.dtype)
             if have_ggt:
+                skip_out = (ggt[name].shape[0] > skip_cholesky_above_d
+                             if skip_cholesky_above_d > 0 else False)
                 S_out, S_out_inv = sqrt_and_inv(ggt[name], device=device,
-                                                need_inv=True)
+                                                need_inv=True,
+                                                skip_cholesky=skip_out)
                 S_out = S_out.to(dtype=S_in.dtype)
                 S_out_inv = S_out_inv.to(dtype=S_in.dtype)
                 M = S_out @ W_t @ S_in
-                U, sigma, Vt = _stable_svd(M)
+                U, sigma, Vt = _stable_svd_topk(M, r)
                 if U.device != M.device:
                     S_in_inv = S_in_inv.to(U.device)
                     S_out_inv = S_out_inv.to(U.device)
@@ -824,21 +1632,33 @@ def compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
             else:
                 # ASVD path — no output gradient weighting
                 M = W_t @ S_in
-                U, _, _ = _stable_svd(M)
+                U, _, _ = _stable_svd_topk(M, r)
                 r_eff = min(r, U.shape[1])
                 U_r = U[:, :r_eff]
                 V_r = U_r.T @ W_t.to(U_r.device)
-            layer_factors.append({
-                "layer": i,
-                "U": U_r.cpu().to(torch.float32),
-                "V": V_r.cpu().to(torch.float32),
-            })
+            U_cpu = U_r.cpu().to(torch.float32)
+            V_cpu = V_r.cpu().to(torch.float32)
+            if streaming:
+                layer_factors.append(_stream_permatrix(role, i, mod,
+                                                        U_cpu, V_cpu, r_eff))
+                del U_r, V_r, U_cpu, V_cpu
+            else:
+                layer_factors.append({
+                    "layer": i,
+                    "rank": r_eff,
+                    "U": U_cpu,
+                    "V": V_cpu,
+                })
             if (i + 1) % 8 == 0 or i == len(mods) - 1:
                 print(f"[{time.time()-t_start:7.1f}s]   {role} layer "
-                      f"{i+1}/{len(mods)} done ({time.time()-t_layer:.1f}s last) "
+                      f"{i+1}/{len(mods)} done r={r_eff} "
+                      f"({time.time()-t_layer:.1f}s last) "
                       f"{_gpu_mem_str()}", flush=True)
+        # Role-level "rank" is the baseline (what the global formula
+        # would have assigned). Per-layer allocated rank lives on each
+        # layer_factors entry for readers that care.
         result["permatrix"][role] = {"L": len(mods), "d_out": d_out, "d_in": d_in,
-                                     "rank": r, "layers": layer_factors}
+                                     "rank": r_default, "layers": layer_factors}
 
     return result
 
@@ -847,7 +1667,30 @@ def materialize_factors_in_place(model, factors, groups_shared, groups_permatrix
                                   dtype=torch.float16):
     """Apply factor reconstruction back into model.weight tensors in place.
     Used for PPL evaluation of the factored model before GGUF emission.
-    Returns a summary report for logging."""
+    Returns a summary report for logging.
+
+    No-op when `compute_factors` streamed its output (factors dict has
+    `already_materialized=True`). Weights were installed inline during
+    decomposition, so the model is already at the factored state."""
+    if factors.get("already_materialized"):
+        # Emit a matching report so callers that inspect it stay happy.
+        report = {}
+        for role, info in factors["shared"].items():
+            role_report = []
+            for win in info["windows"]:
+                role_report.append({"window": win["window_id"],
+                                    "layers": win["layers"],
+                                    "mode": win["mode"],
+                                    "rank": win["rank"]})
+            report[role] = role_report
+        for role, info in factors["permatrix"].items():
+            role_report = []
+            for lf in info["layers"]:
+                role_report.append({"layer": lf["layer"],
+                                    "rank": lf.get("rank", info["rank"])})
+            report[role] = role_report
+        return report
+
     report = {}
 
     for role, entries in groups_shared.items():
@@ -870,7 +1713,8 @@ def materialize_factors_in_place(model, factors, groups_shared, groups_permatrix
             i = lf["layer"]
             W_r = (lf["U"] @ lf["V"]).to(dtype)
             _install_weight(mods[i], W_r)
-            role_report.append({"layer": i, "rank": pm_info["rank"]})
+            role_report.append({"layer": i,
+                                "rank": lf.get("rank", pm_info["rank"])})
         report[role] = role_report
 
     return report
@@ -933,18 +1777,47 @@ def save_factored(model, factors, groups_shared, groups_permatrix,
         untouched[name] = tensor.detach().cpu().contiguous()
     save_file(untouched, str(out / "untouched.safetensors"))
 
-    # Factored tensors with structured names
+    # Factored tensors with structured names. When factors came from
+    # streaming compute_factors, each tensor lives in a per-window/per-
+    # layer .pt file rather than in the dict — load each right before
+    # stuffing into `factored_tensors`. Peak RAM during this step is the
+    # same as before (safetensors.save_file is atomic), but outside this
+    # step we're not holding the 22 GB of factors any more.
+    def _fetch(entry, key):
+        """Return tensor for `key` from a dict entry; load from .pt when
+        streamed."""
+        if key in entry:
+            return entry[key]
+        # Streamed: lookup the matching *_path
+        path_key = key + "_path"
+        if path_key in entry:
+            return torch.load(entry[path_key], map_location="cpu",
+                              weights_only=True)
+        raise KeyError(f"no tensor or path for '{key}' in entry")
+
     factored_tensors = {}
+    streamed_paths: list[str] = []  # to unlink after safetensors write
     manifest_shared = {}
     for role, info in factors["shared"].items():
         tag = _role_tag(role)
         windows_manifest = []
         for win in info["windows"]:
             key_base = f"shared.{tag}.w{win['window_id']:03d}"
-            factored_tensors[f"{key_base}.basis"] = win["basis"].contiguous()
+            if "basis" in win:
+                factored_tensors[f"{key_base}.basis"] = win["basis"].contiguous()
+                coeffs_list = win["coeffs"]
+            else:
+                factored_tensors[f"{key_base}.basis"] = torch.load(
+                    win["basis_path"], map_location="cpu",
+                    weights_only=True).contiguous()
+                streamed_paths.append(win["basis_path"])
+                coeffs_list = [torch.load(p, map_location="cpu",
+                                           weights_only=True)
+                               for p in win["coeffs_paths"]]
+                streamed_paths.extend(win["coeffs_paths"])
             for i_local, layer_i in enumerate(win["layers"]):
                 factored_tensors[f"{key_base}.coeffs.{layer_i:03d}"] = \
-                    win["coeffs"][i_local].contiguous()
+                    coeffs_list[i_local].contiguous()
             windows_manifest.append({
                 "window_id": win["window_id"],
                 "layers": win["layers"],
@@ -966,8 +1839,17 @@ def save_factored(model, factors, groups_shared, groups_permatrix,
             i = lf["layer"]
             u_key = f"permatrix.{tag}.{i:03d}.U"
             v_key = f"permatrix.{tag}.{i:03d}.V"
-            factored_tensors[u_key] = lf["U"].contiguous()
-            factored_tensors[v_key] = lf["V"].contiguous()
+            if "U" in lf:
+                factored_tensors[u_key] = lf["U"].contiguous()
+                factored_tensors[v_key] = lf["V"].contiguous()
+            else:
+                factored_tensors[u_key] = torch.load(
+                    lf["U_path"], map_location="cpu",
+                    weights_only=True).contiguous()
+                factored_tensors[v_key] = torch.load(
+                    lf["V_path"], map_location="cpu",
+                    weights_only=True).contiguous()
+                streamed_paths.extend([lf["U_path"], lf["V_path"]])
             layers_manifest.append({"layer": i, "U_key": u_key, "V_key": v_key})
         manifest_permatrix[role] = {
             "tag": tag, "d_out": info["d_out"], "d_in": info["d_in"],
@@ -975,6 +1857,20 @@ def save_factored(model, factors, groups_shared, groups_permatrix,
         }
 
     save_file(factored_tensors, str(out / "factored.safetensors"))
+    # With streaming, the .pt tmp files have served their purpose — unlink
+    # them and free the ~22 GB of disk staging once safetensors is on disk.
+    del factored_tensors
+    for p in streamed_paths:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    # Also try to remove the streaming tmpdir if empty
+    if factors.get("streamed_tmpdir"):
+        try:
+            Path(factors["streamed_tmpdir"]).rmdir()
+        except OSError:
+            pass  # non-empty (unexpected) or already gone
 
     manifest = {
         "format_version": 1,
@@ -1073,10 +1969,23 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     p.add_argument("--window", type=int, default=2)
-    p.add_argument("--target-ratio", type=float, default=0.5,
-                   help="target compression ratio; k chosen to hit this")
+    p.add_argument("--target-ratio", type=float, default=1.0,
+                   help="target compression ratio; k chosen to hit this. "
+                        "Default 1.0 is the lossless-ish validation point "
+                        "(rank ≈ dense-equivalent storage, small residual "
+                        "from truncation). Production runs typically use "
+                        "0.8; r=0.5 is a stress test that catastrophically "
+                        "over-compresses at every scale tested.")
     p.add_argument("--calib-samples", type=int, default=32)
     p.add_argument("--calib-seq-len", type=int, default=512)
+    p.add_argument("--calib-batch-size", type=int, default=1,
+                   help="Samples per forward pass during calibration. "
+                        "Batch>1 pads to longest-in-batch and masks padded "
+                        "positions out of the gramian accumulation, so the "
+                        "numerics are equivalent to batch=1 processing. "
+                        "Biggest wall-clock lever on calibration — batch=8 "
+                        "typically cuts calibration time 4-6× vs batch=1 "
+                        "since the GPU isn't compute-bound at small batch.")
     p.add_argument("--eval-tokens", type=int, default=2048)
     p.add_argument("--no-refit", action="store_true",
                    help="use paper's SVD-slice coeffs (disables LS refit)")
@@ -1098,27 +2007,98 @@ def main():
                    help="HuggingFace device_map, e.g. 'auto' for transformers-managed "
                         "GPU+CPU dispatch on models that don't fit entirely in VRAM. "
                         "When set, skips the manual .to(device)/.cpu() moves.")
-    p.add_argument("--min-free-ram-gb", type=float, default=4.0,
-                   help="OS headroom: refuse gramian allocations that would leave "
-                        "less than this much free RAM. Safety net against OOM "
-                        "locking up the machine.")
+    p.add_argument("--min-free-ram-gb", type=float, default=0.0,
+                   help="Legacy absolute lower bound on free RAM during "
+                        "gramian allocation. Effective reserve is the max "
+                        "of this and the reserve derived from "
+                        "--cpu-ram-max-pct. Leave at 0 to rely on the "
+                        "percentage cap alone.")
+    p.add_argument("--cpu-ram-max-pct", type=float, default=90.0,
+                   help="Max %% of total system RAM this run may hold. "
+                        "Auto-backend spills to disk when approaching the "
+                        "cap; ram-backend refuses the allocation. Default 90.")
+    p.add_argument("--disk-max-pct", type=float, default=90.0,
+                   help="Max %% of total disk space on the xtx temp dir's "
+                        "drive that memmap allocations may consume. Refuses "
+                        "the allocation loudly instead of crashing mid-run "
+                        "with OSError(28). Default 90.")
+    p.add_argument("--gpu-vram-max-pct", type=float, default=90.0,
+                   help="Max %% of total GPU VRAM the calibration workspaces "
+                        "may occupy (on top of the model already loaded). "
+                        "Workspaces that would cross the cap fall back to "
+                        "the CPU addmm hook path. Default 90.")
     p.add_argument("--xtx-backend", default="auto", choices=["auto", "ram", "disk"],
                    help="Where to store d*d calibration gramians. 'ram' matches "
                         "legacy behavior; 'disk' memmaps them to NVMe; 'auto' "
-                        "picks per-tensor based on --min-free-ram-gb.")
+                        "picks per-tensor based on the RAM cap.")
     p.add_argument("--xtx-temp-dir", default=None,
                    help="Directory for disk-backed gramians (default: "
                         "{checkpoint-dir}/xtx or {save-dir}/xtx).")
     p.add_argument("--xtx-gpu-workspace-gb", type=float, default=4.0,
-                   help="Max VRAM budget for the d*d delta-matmul workspace "
-                        "used during gramian accumulation. Set to 0 to force "
+                   help="Absolute per-workspace byte cap (single d*d delta-"
+                        "matmul buffer). Complements --gpu-vram-max-pct: a "
+                        "workspace must pass BOTH gates. Set to 0 to force "
                         "the CPU addmm path.")
+    p.add_argument("--accum-fp64-threshold", type=int, default=4096,
+                   help="Allocate gramian accumulators in float64 when d >= "
+                        "this value; float32 otherwise. Wide gramians "
+                        "(down_proj on 7B+ has d=18944) lose the "
+                        "low-eigenvalue tail in fp32 accumulation noise "
+                        "across thousands of hook updates, which wrecks the "
+                        "Cholesky whitening and the downstream SVD. Pass a "
+                        "very large value (e.g. 1000000) to disable fp64.")
     p.add_argument("--calib-passes", default="single",
                    choices=["single", "by-role"],
                    help="single: accumulate all gramians in one forward sweep "
                         "(fastest when RAM fits). by-role: run separate sweeps "
                         "for shared roles, o_proj, and down_proj so only one "
                         "role's gramians co-exist in RAM — enables 14B+ models.")
+    p.add_argument("--streaming-roles", default="",
+                   help="Comma-separated role suffixes (e.g. 'mlp.down_proj') "
+                        "for which the calibration hook caches activations in "
+                        "pinned host bf16 instead of live-accumulating a d*d "
+                        "gramian. Post-pass, the fp64 gramian is computed on "
+                        "GPU in chunks. Use for wide-d roles whose fp64 "
+                        "gramian wouldn't fit RAM — eliminates the disk "
+                        "memmap thrash seen at 7B down_proj. Empty = legacy "
+                        "path everywhere.")
+    p.add_argument("--streaming-max-ram-gb", type=float, default=20.0,
+                   help="Pinned-host budget for activation caching across all "
+                        "streaming roles. Trip this and the run fails fast "
+                        "with a clear message. Default 20 GB fits 8 samples "
+                        "of 7B down_proj comfortably (17 GB peak).")
+    p.add_argument("--no-stream-factors", action="store_true",
+                   help="Disable factor-output streaming. By default, "
+                        "compute_factors writes each decomposed matrix's "
+                        "U/V/basis/coeffs to a per-layer .pt file on disk "
+                        "and installs the reconstructed dense weight into "
+                        "the model inline — keeping peak RAM during the "
+                        "multi-minute decomposition phase below ~1 GB of "
+                        "factor staging (vs ~22 GB at 7B r=0.8 without "
+                        "streaming). save_factored then assembles the "
+                        "final safetensors from those .pt files. Pass "
+                        "this flag to force the legacy all-in-RAM path.")
+    p.add_argument("--rank-alloc", default="global",
+                   choices=["global", "per-matrix"],
+                   help="How to assign rank across matrices. 'global' "
+                        "(default) uses the target_ratio formula per "
+                        "matrix. 'per-matrix' computes each matrix's "
+                        "singular-value spectrum and water-fills rank by "
+                        "marginal utility (σ²/bytes_per_rank) under the same "
+                        "total byte budget. EXPERIMENTAL: helped 0.5B at "
+                        "r=0.8 (PPL 162→114) but hurt 7B (22.28→28.32) — "
+                        "sum-of-σ² is not a reliable PPL proxy at larger "
+                        "scale. Needs a better utility function before "
+                        "this is the default.")
+    p.add_argument("--skip-cholesky-above-d", type=int, default=0,
+                   help="Skip the fp32/fp64 Cholesky ladder in sqrt_and_inv "
+                        "for any gramian whose d exceeds this value, going "
+                        "straight to GPU fp64 eigh + eigenvalue clamp. Use "
+                        "when calibration rows < d (rank-deficient gramian) "
+                        "so the Cholesky path is mathematically guaranteed "
+                        "to fail — skipping avoids ~5-10s/layer of "
+                        "fp32-then-fp64 probing. 0 = always try Cholesky "
+                        "first.")
     args = p.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -1172,10 +2152,34 @@ def main():
     xtx_store: XtxStore | None = None
     ggt_store: XtxStore | None = None
     cached_calib = checkpoint_load(ckpt_dir, "calibration") if ckpt_dir else None
+    calib_policy_invalidated = False
     if cached_calib is not None:
         xtx, ggt = cached_calib["xtx"], cached_calib["ggt"]
-        print(f"  reused cached calibration ({len(xtx)} modules)")
-    else:
+        # Reject caches that predate a precision-policy change. If any
+        # gramian whose d would now demand fp64 is on disk as fp32, the
+        # running-sum noise baked into that accumulator is the exact bug
+        # we're fixing — reusing it would negate the change. Recalibrate
+        # AND force a factors recompute (the saved factors were derived
+        # from the stale gramians and are equally invalid).
+        mismatches = []
+        for name, t in xtx.items():
+            expected = (torch.float64 if t.shape[0] >= args.accum_fp64_threshold
+                        else torch.float32)
+            if t.dtype != expected:
+                mismatches.append((name, t.shape[0], t.dtype, expected))
+        if mismatches:
+            sample = mismatches[0]
+            print(f"  [stale] cached calibration has {len(mismatches)} "
+                  f"accumulator(s) with dtype mismatching "
+                  f"--accum-fp64-threshold={args.accum_fp64_threshold}; "
+                  f"example {sample[0]} d={sample[1]} got={sample[2]} "
+                  f"want={sample[3]}. Recalibrating and discarding "
+                  f"any cached factors.")
+            cached_calib = None
+            calib_policy_invalidated = True
+        else:
+            print(f"  reused cached calibration ({len(xtx)} modules)")
+    if cached_calib is None:
         # Resolve the temp dir for disk-backed gramians. Falls through a
         # preference chain so single-shot runs without a checkpoint dir still
         # have somewhere reasonable to spill to.
@@ -1188,6 +2192,24 @@ def main():
         else:
             xtx_temp_dir = Path(".") / "xtx_tmp"
         avail_gb = psutil.virtual_memory().available / 1e9
+        # Translate the percentage caps to the absolutes the XtxStore and
+        # friends consume. The RAM reserve is max(legacy absolute, percent-
+        # derived) so a stricter absolute floor always wins; the disk and
+        # VRAM caps flow through directly.
+        total_ram_gb = psutil.virtual_memory().total / 1e9
+        pct_ram_reserve_gb = total_ram_gb * (100.0 - args.cpu_ram_max_pct) / 100.0
+        effective_min_free_gb = max(args.min_free_ram_gb, pct_ram_reserve_gb)
+        total_vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9
+                         if torch.cuda.is_available() else 0.0)
+        # Walk up to an existing ancestor before querying disk_usage —
+        # --xtx-temp-dir on a fresh save-dir has several non-existent
+        # parents and shutil rejects paths it can't stat.
+        probe = xtx_temp_dir
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        disk_usage = shutil.disk_usage(str(probe))
+        disk_total_gb = disk_usage.total / 1e9
+        disk_free_gb = disk_usage.free / 1e9
         # Per-role pass selection. `single` keeps all hooks live for one sweep
         # through the calibration texts (fastest when RAM fits). `by-role`
         # splits into three sweeps so only one role's gramians are resident
@@ -1204,22 +2226,44 @@ def main():
             role_groups = [SHARED_ROLES + PERMATRIX_ROLES]
         print(f"calibration ({len(calib)} samples, need_grad={need_grad}); "
               f"passes={args.calib_passes} ({len(role_groups)} sweep(s)), "
-              f"xtx backend={args.xtx_backend}, min-free-ram={args.min_free_ram_gb:.1f} GB, "
-              f"gpu-workspace={args.xtx_gpu_workspace_gb:.1f} GB, "
-              f"free now={avail_gb:.1f} GB, temp_dir={xtx_temp_dir}")
+              f"xtx backend={args.xtx_backend}, "
+              f"temp_dir={xtx_temp_dir}")
+        print(f"  caps: cpu-ram<={args.cpu_ram_max_pct:.0f}% of "
+              f"{total_ram_gb:.1f} GB (reserve {effective_min_free_gb:.1f} GB; "
+              f"free now {avail_gb:.1f} GB) | "
+              f"disk<={args.disk_max_pct:.0f}% of "
+              f"{disk_total_gb:.1f} GB (free now {disk_free_gb:.1f} GB) | "
+              f"gpu-vram<={args.gpu_vram_max_pct:.0f}% of "
+              f"{total_vram_gb:.1f} GB | "
+              f"gpu-workspace-abs<={args.xtx_gpu_workspace_gb:.1f} GB")
         xtx_store = XtxStore(args.xtx_backend, xtx_temp_dir,
-                             args.min_free_ram_gb,
-                             gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb)
+                             effective_min_free_gb,
+                             gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb,
+                             accum_fp64_threshold=args.accum_fp64_threshold,
+                             disk_max_pct=args.disk_max_pct,
+                             gpu_vram_max_pct=args.gpu_vram_max_pct)
         ggt_store = (XtxStore(args.xtx_backend, xtx_temp_dir,
-                              args.min_free_ram_gb,
-                              gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb)
+                              effective_min_free_gb,
+                              gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb,
+                              accum_fp64_threshold=args.accum_fp64_threshold,
+                              disk_max_pct=args.disk_max_pct,
+                              gpu_vram_max_pct=args.gpu_vram_max_pct)
                      if need_grad else None)
+        streaming_role_set = {r.strip() for r in args.streaming_roles.split(",")
+                              if r.strip()}
+        if streaming_role_set:
+            print(f"  streaming roles: {sorted(streaming_role_set)} "
+                  f"(pinned-host budget {args.streaming_max_ram_gb:.1f} GB)",
+                  flush=True)
         t0 = time.time()
         try:
             xtx, ggt, _ = collect_stats(model, tokenizer, calib, input_device,
                                         args.calib_seq_len, role_groups, need_grad,
                                         xtx_store=xtx_store,
-                                        ggt_store=ggt_store)
+                                        ggt_store=ggt_store,
+                                        streaming_roles=streaming_role_set,
+                                        streaming_max_ram_gb=args.streaming_max_ram_gb,
+                                        batch_size=args.calib_batch_size)
             print(f"  done in {time.time()-t0:.1f}s")
             # Free GPU scratch buffers now so compute_factors gets full VRAM.
             xtx_store.free_gpu_workspaces()
@@ -1252,7 +2296,8 @@ def main():
 
     print(f"computing factors (shared={len(groups_shared)} roles, "
           f"permatrix={len(groups_permatrix)} roles)")
-    cached_factors = checkpoint_load(ckpt_dir, "factors") if ckpt_dir else None
+    cached_factors = (checkpoint_load(ckpt_dir, "factors")
+                      if ckpt_dir and not calib_policy_invalidated else None)
     if cached_factors is not None:
         factors = cached_factors
         print(f"  reused cached factors")
@@ -1266,12 +2311,35 @@ def main():
             torch.cuda.empty_cache()
             print(f"  model moved to CPU for compute_factors {_gpu_mem_str()}", flush=True)
         t0 = time.time()
+        # Streaming factor output: dumps each decomposed matrix's U/V
+        # straight to a per-layer .pt file, avoiding a multi-GB dict in
+        # RAM during the long decomposition phase. Only disabled by the
+        # explicit --no-stream-factors flag.
+        factor_tmp_dir = None
+        if not args.no_stream_factors:
+            factor_tmp_dir = (Path(args.save_dir) / ".streamed_factors"
+                              if args.save_dir
+                              else Path("./.streamed_factors"))
         factors = compute_factors(model, xtx, ggt, groups_shared, groups_permatrix,
                                   args.window, args.target_ratio, args.eigh_device,
-                                  refit=not args.no_refit)
+                                  refit=not args.no_refit,
+                                  skip_cholesky_above_d=args.skip_cholesky_above_d,
+                                  rank_alloc=args.rank_alloc,
+                                  factor_output_dir=factor_tmp_dir,
+                                  materialize_dtype=dtype)
         print(f"  done in {time.time()-t0:.1f}s")
-        if ckpt_dir:
+        if ckpt_dir and not factors.get("already_materialized"):
+            # Streaming compute_factors keeps tensors in per-layer .pt
+            # files that save_factored unlinks. Checkpointing a dict of
+            # disk paths would leave dangling references after resume,
+            # so we skip the factor checkpoint in streaming mode. Resume
+            # replays compute_factors from cached calibration, which is
+            # cheap relative to the factor-disk-IO savings.
             checkpoint_save(ckpt_dir, "factors", factors)
+        elif ckpt_dir:
+            print("  skipping factors checkpoint "
+                  "(streaming mode - per-layer .pt files aren't safely "
+                  "re-usable after save_factored assembles them)")
         # Gramians are no longer needed — factors are cached. Drop strong refs
         # and delete any disk-backed memmaps before PPL eval and save_factored
         # load the model back into RAM.

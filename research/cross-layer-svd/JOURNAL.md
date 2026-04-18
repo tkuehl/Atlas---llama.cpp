@@ -368,3 +368,89 @@ When we pick up Phase 3.4:
 2. **Prototype a fused factored-linear kernel for prefill only.** Long-context gain, no decode regression. Gate on a batch/seq threshold. ~2-3 weeks of work.
 3. **Design the streaming data plane around tile-fused kernels**, not full coefficient residency. This is the combination that makes the "larger model than fits" thesis actually achievable.
 4. **Revisit GDS if we productionize.** The Linux port becomes worth it once Phase 3.4 is PCIe-bound in practice.
+
+---
+
+## 2026-04-18 — calibration precision, compression ratio, and rank allocation
+
+Multi-day session refining the Python decomposition pipeline. Key results below; see `basis_sharing.py` for the shipped implementation.
+
+### Compression ratio findings — r=0.5 is broken, r=1.0 is the validation regime
+
+Started at r=0.5 (paper's headline ratio) and got catastrophic PPL at every scale tested:
+
+| model | baseline | factored r=0.5 | ratio |
+|---|---|---|---|
+| Qwen 2.5 0.5B | 12.22 | 1391 | 114× |
+| Qwen 2.5 3B | 7.66 | 2611 | 341× |
+| Qwen 2.5 7B | 5.88 | 1389 | 236× |
+
+Our `window=2 shared + permatrix` scheme at r=0.5 loses coherence entirely — model output is degenerate pattern-loops ("the sky is blue because its surface is blue"). Paper's r=0.5 must be using a different byte accounting or different window strategy; attempts to match their claimed PPL ~20 on 7B never worked.
+
+Pivoted to **r=1.0 as the validation regime**: rank ≈ dense-equivalent storage, small residual truncation error. Clean monotonic curve confirms the pipeline is mathematically correct at every scale:
+
+| model | r=1.0 factored PPL | baseline | ratio |
+|---|---|---|---|
+| 0.5B | 22.95 | 12.22 | 1.88× |
+| 3B | 12.26 | 7.66 | 1.60× |
+| **7B** | **8.75** | **5.88** | **1.49×** |
+
+Larger models compress cleaner at r=1.0 — bigger spectrum tail amortizes the truncation residual. **7B r=1.0 PPL 8.75 is now our reference-point for runtime regression testing.** r=1.0 with 32 calibration samples stays the default; r=0.8 and lower are opt-in stress tests.
+
+### Precision and rank deficiency
+
+At 7B r=0.8 the Cholesky ladder in `sqrt_and_inv` fires aggressively on `down_proj` (d=18944). Initially hypothesized fp32 gramian accumulation noise; shipped full fp64 accumulation via a new `StreamingCollector` that caches activations in pinned host (fp16) and computes fp64 gramians on GPU in chunks after the forward pass.
+
+**Result: precision was not the bottleneck at r=0.8.** Both fp32 and fp64-streamed runs at 8 samples gave PPL ≈ 37 (6.3× baseline). Moving to 32 samples dropped PPL to 22.3 — **sample count is the dominant lever**, not precision.
+
+Mechanically: 32 × ~200 tokens = ~6400 rows per layer, still `< d_in=18944`, so the gramian stays rank-deficient. Every down_proj layer triggers `gpu-fp64-eps10` regularization. The paper territory (PPL ~19-25) would need ~100+ calibration samples to fully span d_in. Left for a future quality pass.
+
+### Per-matrix rank allocation (SVD-LLM V2 style)
+
+Shipped water-fill rank allocator behind `--rank-alloc per-matrix`: computes σ(W @ S_in) via a fast `eigvalsh(W @ (XTX + eps·I) @ W^T)` for each matrix, greedy-allocates rank by marginal utility (σ² / bytes_per_rank) under the global byte budget. Floor at 50% baseline rank to prevent any matrix from being decimated.
+
+Empirical result:
+
+| model | global rank PPL | per-matrix alloc PPL | delta |
+|---|---|---|---|
+| 0.5B r=0.8 | 162 | 114 | −30% (win) |
+| **7B r=0.8** | **22.28** | **28.32** | **+27% (regression)** |
+
+At 7B the allocator moves rank AWAY from `down_proj`/`o_proj` toward shared `gate/up/k/v` (gate/up +12-14%, k/v +22-26%). This minimizes sum-of-σ² truncation error but **hurts PPL** — in the actual loss landscape, down_proj rank is more PPL-critical than its spectrum magnitude suggests. `sum-of-σ²` is not a reliable PPL proxy at 7B scale.
+
+Default reverted to `--rank-alloc global`. Per-matrix stays available as an experimental flag; a better utility function (gradient-weighted, or empirical per-role PPL sensitivity) would be needed to make it the default.
+
+### Infrastructure shipped
+
+- **Streaming activation cache** (`StreamingCollector` in `basis_sharing.py:~500`). For wide-d roles, hook captures raw activations to pinned-host buffers, finalizes to fp64 gramians on GPU post-pass. Incremental drain keeps peak pinned-RAM bounded (`--streaming-max-ram-gb`). Replaces the 80 GB disk-backed memmap approach that thrashed A: mechanical HDD into a system hang.
+- **Streaming factor output**. `compute_factors` writes each layer's U/V to per-layer `.pt` files and installs the reconstructed dense weight into the model inline. Peak RAM during the 25-minute decomposition phase drops from ~22 GB → ~1 GB on 7B. `save_factored` assembles the final `factored.safetensors` from the per-layer files at the end.
+- **Memory caps** (`--cpu-ram-max-pct`, `--disk-max-pct`, `--gpu-vram-max-pct`, all default 90%). Prevents a run from filling system disk or OOM'ing under memory pressure.
+- **fp64 gramian accumulation** via `--accum-fp64-threshold` (default 4096). Auto-routes wide-d roles through fp64 on-disk memmap; narrow-d stays fp32 in RAM for speed.
+- **Cholesky-skip hook** for known-rank-deficient gramians (buggy — currently routes to CPU eigh; backlog item to fix the fall-through).
+- **Drive routing** (`reference_drive_speeds.md` memory). C: = NVMe (calibration temp I/O), A: = spinning HDD (cold storage only). Mechanical HDD thrash was the root cause of the first 7B fp64 failure.
+
+### Speed experiments (2026-04-18)
+
+Tested three speedup ideas against the 3B r=1.0 baseline (190.9s decomposition, PPL 12.255):
+
+| optimization | decomp time | PPL | verdict |
+|---|---|---|---|
+| `torch.svd_lowrank` partial SVD (#1) | 181.2s | 12.30 | marginal at r=1.0 (threshold gates out most cases); helps at r<1.0 |
+| batched calibration (batch=8) on 7B | ~same | ~same | hook-path dominates at 7B; no wall-time benefit |
+| **8 samples × seq 2048 (same total tokens)** | **199.9s** | **14.59** | **regression on both axes** (killed) |
+
+**Partial SVD** integrated cleanly. Heuristic `q ≥ 2/3 × min_dim → skip lowrank` correctly falls back to full SVD when rank is near-full. Only `o_proj` at 3B r=1.0 triggers the lowrank path (speedup 14s → 4s on that role). At r=0.8 and below, more matrices fall under the threshold — speedup projected ~30% on down_proj.
+
+**Batched calibration** does NOT help at 7B because the hook path (not model-forward) dominates. At 3B batch=4 gave 3.4× speedup; at 7B batch=8 was a wash. Batching kept as `--calib-batch-size` flag, off by default.
+
+**Seq-len retune** is a loss: fewer samples means less activation diversity, so gramian becomes MORE rank-deficient → more eps10 regularization → PPL drift. Sample count matters beyond just token count.
+
+### Backlog (runtime hardening, pre-quality-work)
+
+1. **GPU-resident shared-role accumulators** — eliminates per-hook D2H (~270s of 400s hook-path at 7B). Fits 3B cleanly; 7B needs VRAM budget management.
+2. **Fix `--skip-cholesky-above-d`** — currently mis-routes to slow CPU Cholesky when GPU eigh OOMs on d=18944. Correct behavior: skip directly to `gpu-fp64-eps10`.
+3. **Pipeline prefetch** — overlap layer k+1 load with layer k SVD via async CUDA streams. ~20% decomp speedup.
+4. **Cross-run gramian caching** — save fp64 gramians to safetensors after streaming finalize; reuse across rank/ratio experiments.
+5. **Per-window safetensors format** — eliminates the brief 22 GB peak during save_factored assembly. Requires C++ loader update.
+
+Quality work (per-matrix allocation with a better utility function, calibration at >100 samples, refit=True with LS solve) is deferred until the runtime backlog clears.
