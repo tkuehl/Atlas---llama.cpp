@@ -1153,3 +1153,166 @@ Any novel scheme has to clear Q4_K_M speed or it doesn't ship.
 - **Per-matrix / per-batch-size autotuner** over multiple decode
   strategies. Applies to CALDERA too (full-dequant vs
   fused-reconstruct paths).
+
+---
+
+## 2026-04-19 (later) — Cloudflare kernel-pattern investigation: MMVQ already optimal for batch=1
+
+Dug into llama.cpp's Q4_K_M CUDA path to see if porting Cloudflare
+Unweight's producer/consumer kernel pattern (on-chip decompression
+feeding tensor cores, no HBM round-trip) would speed up batch=1
+decode on the 5070. Short answer: **no — llama.cpp already has the
+right kernel architecture for batch=1, and Cloudflare's specific
+pattern is a no-op on this path.**
+
+### The two Q4_K_M paths
+
+llama.cpp has two architecturally different Q4_K_M kernels:
+
+**MMQ (batch ≥ 2)** — [mmq.cuh](../../ggml/src/ggml-cuda/mmq.cuh).
+Tile-based. All threads cooperatively load Q4_K blocks and
+dequantize into shared memory (`load_tiles_q4_K`, lines 2151-2258),
+then all threads run `vec_dot` via MMA intrinsics (`mul_mat_q_process_tile`,
+lines 3591-3604). Dequant outputs live in shmem and never
+round-trip to HBM — so Cloudflare's "no HBM round-trip" half is
+already achieved. What's missing is the thread-group split: all
+threads do both roles in a single sequential pass. No `__pipeline_`,
+no `cuda::barrier`, no async-copy. **Porting a producer/consumer
+split with double-buffering would likely help here — but this path
+only runs at batch ≥ 2.**
+
+**MMVQ (batch = 1)** — [mmvq.cu:22](../../ggml/src/ggml-cuda/mmvq.cu)
+dispatches `vec_dot_q4_K_q8_1` for Q4_K GEMV. Element-wise vec-dot
+per thread, dequant inline in registers, no tile materialization,
+no shmem staging. Our interactive decode runs entirely on this path.
+
+Tensor-core gating: MMA uses `TURING_MMA_AVAILABLE` (sm_75+), so
+Ada sm_89 (5070) is in scope. WGMMA is Hopper-only (sm_90+),
+irrelevant to us.
+
+### Why Cloudflare's pattern doesn't apply at batch=1
+
+The producer/consumer trick assumes there is **tile-level work** to
+split across thread groups — one group loads/decompresses, another
+feeds tensor cores. At batch=1 there is no output tile to compute;
+each thread computes one scalar accumulator by pulling weights
+through the vec-dot loop. Dequant is already one register-local
+instruction. No tile round-trip to eliminate and no thread-group
+split that would help — the pattern has no purchase here.
+
+### Implication
+
+**Batch=1 Q4_K_M on the 5070 is approximately at the VRAM-bandwidth
+ceiling today.** The kernel shape is already optimal for a
+bandwidth-bound GEMV. We cannot kernel-polish our way to faster
+interactive tok/s on Q4_K_M.
+
+The only remaining lever for batch=1 tok/s is **reading fewer bytes
+per token** — genuine compression below Q4_K_M's ~4.5 bpw with
+acceptable quality. Three attacks, ordered by research cost:
+
+1. **CALDERA aggressive quant** (Q3_K / Q2_K + rank correction) —
+   Stage 5 of the pivot plan. Lowest risk, closest to shipping.
+2. **Speculative decoding** — doesn't cut bytes-per-forward, but
+   amortizes the forward over k drafted tokens. Stage 4, pure
+   llama.cpp config.
+3. **Cross-matrix structure** — if the SVD hypothesis test shows
+   shared structure, global-codebook schemes could go below 3 bpw.
+   Parallel research track, higher risk, higher novelty.
+
+### Updated priorities
+
+- **Dropped:** Nsight profile + MMVQ kernel port for batch=1. MMVQ
+  is already architecturally optimal — no headroom. The Nsight
+  phase-0 step was a sanity check we no longer need to run.
+- **Running:** [`entropy_char.py`](entropy_char.py) against a
+  Qwen 2.5 7B GGUF — measures the lossless compression ceiling on
+  top of existing quant representations. Tells us how much a
+  Huffman/ANS layer on CALDERA's Q output could buy. Small
+  stackable win if any. ~5 min to run.
+- **Parked:** MMQ producer/consumer port. Real engineering
+  opportunity for server/batched inference workloads if those ever
+  become a primary use case; not our target today.
+- **Active:** CALDERA Stage 1 smoke + Stage 2 (qtype × rank) sweep
+  including Q3_K / Q2_K, plus the SVD cross-matrix hypothesis test
+  in parallel. Both attack the "read fewer bytes" constraint.
+
+Cloudflare research paid off without being ported: it told us
+*cleanly* where **not** to spend effort. At batch=1 the kernel is
+already doing everything right. The constraint is genuinely the
+bits on disk.
+
+---
+
+## 2026-04-19 — CALDERA Stage 1: smoke + real-matrix validation across 0.5B / 3B / 7B
+
+Validated the CALDERA math end-to-end on real model weights. Math
+holds at every scale; RPCD iteration converges monotonically. Q4_K /
+Q3_K / Q2_K still untested because gguf-py's Python quantizer isn't
+implemented for those qtypes — that unblocks in Stage 2 via a
+`llama-quantize` subprocess.
+
+### Smoke test (synthetic 1024×2048, r=128, Q4_0, 3 iters)
+
+| method | Σ-rel-err |
+|---|---|
+| pure quant (Q4_0) | 0.0859 |
+| pure LR (r=128) | 0.5341 |
+| CALDERA | **0.0632** (history 0.0694 → 0.0652 → 0.0632) |
+
+Beats both baselines, assertion passes.
+
+### Real-matrix — Qwen 2.5 `mlp.gate_proj` L12 across three scales
+
+Same role, same layer, 32 WikiText-2 calibration samples, forward-only
+bf16 calibration via new [`extract_matrix_caldera.py`](extract_matrix_caldera.py).
+
+| scale | shape | pure Q4_0 | CALDERA r=32 | r=64 | r=128 | r=256 |
+|---|---|---|---|---|---|---|
+| 0.5B | 4864 × 896 | 0.0587 | 0.0365 (−38%) | 0.0319 (−46%) | 0.0259 (−56%) | 0.0187 (−68%) |
+| 3B | 11008 × 2048 | 0.0393 | 0.0248 (−37%) | 0.0228 (−42%) | 0.0201 (−49%) | 0.0166 (−58%) |
+| 7B | 18944 × 3584 | 0.0554 | 0.0439 (**−21%**) | 0.0409 (−26%) | 0.0369 (−33%) | 0.0316 (−43%) |
+
+Improvement ratio shrinks with model size because fixed ranks are a
+smaller fraction of d_in at bigger matrices (r=32 is 3.6% of d_in on
+0.5B, 0.9% on 7B). The L·R overhead also shrinks proportionally:
+CALDERA Q4_0 + r=32 at 7B is 4.84 bpw (vs 5.85 on 0.5B) — only 0.34
+bpw on top of pure Q4_0 for a 21% error cut. Still a favorable trade,
+just at a different operating point per-scale. Stage 2's 7B sweep
+should extend ranks to r=512 / r=1024 to find the quality sweet spot.
+
+### What the validation doesn't tell us yet
+
+All tested qtypes are Q4_0 (4.5 bpw floor) or Q8_0 (8.5 bpw, already
+near-lossless). The CALDERA value proposition is specifically
+**low-bpw quant with rank correction** — Q3_K (~3.5 bpw), Q2_K (~2.8
+bpw). Those are exactly the qtypes gguf-py does not implement in
+Python: `quantize_blocks` raises `NotImplementedError` for Q4_K, Q3_K,
+Q2_K. Q4_0 is "compression floor that barely matters"; the interesting
+regime is where pure-quant error is large enough for LR correction to
+have real work.
+
+### Infra produced this stage
+
+- [`caldera_validate.py`](caldera_validate.py) — compares pure quant /
+  pure LR / CALDERA at multiple (qtype, rank) points, reports
+  Σ-weighted rel-err and effective bpw side-by-side.
+- [`extract_matrix_caldera.py`](extract_matrix_caldera.py) — bf16
+  forward-only extractor; 3B calibration in 2.1s, 7B in 21.1s with
+  `device_map="auto"` (some layers offloaded to CPU).
+- Snapshots (gitignored, regenerable):
+  `snapshot_{3b,7b}_gate12.pkl` contain (W, XTX, metadata) for the
+  validated matrices.
+- Result JSONs: `caldera_validate_{05b,3b,7b}.json`.
+
+### Stage 2 entry criteria
+
+- Wire up `llama-quantize` subprocess (C++ path) so any gguf-py qtype
+  is accessible. Write W to minimal single-tensor GGUF → invoke
+  `llama-quantize --pure --output-tensor-type Q3_K_M` etc. → read
+  back dequantized W. Matches what ships in production GGUFs exactly.
+- Extend rank sweep for 7B to include r ∈ {32, 64, 128, 256, 512,
+  1024}. Small models can stay at existing range.
+- Evaluate on more than one role: gate_proj, down_proj, o_proj are
+  the three roles with different activation spectra (permatrix roles
+  vs shared roles in the old factored nomenclature).
