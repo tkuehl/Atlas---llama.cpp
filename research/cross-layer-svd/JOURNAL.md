@@ -940,3 +940,216 @@ for the streaming runtime to start):**
 
 The compression-as-primary thesis is dead. The streaming-runtime
 thesis is alive, and today it got its first viable input.
+
+---
+
+## 2026-04-19 — pivot to CALDERA (Q + L·R)
+
+**TL;DR:** The 7B r=1.5 factored run was ungodly slow at inference time
+(not calibration — decode). Root cause is architectural, not a tuning
+issue. Pivoting the primary research direction to CALDERA
+(`W ≈ Q + L·R`, arxiv:2405.18886). The factored-SVD streaming runtime
+is shelved.
+
+### Why the factored forward path is slow
+
+Three compounding problems, none fixable with kernel polish:
+
+1. **No mainline kernel for `y = B(Ax)`.** llama.cpp's fast path is
+   `mul_mat` against GGUF-quantized tensors with CUDA-graph capture.
+   The factored forward is two sequential `ggml_mul_mat` nodes —
+   2× kernel launches per linear, 252 linears per token on Qwen 7B
+   (7 roles × 28 layers × 2 matmuls = 504 launches vs 252 for dense).
+   This is exactly the anti-pattern `optimization_path.md §1.1`
+   flagged but we hadn't gotten around to fusing.
+2. **r=1.5 is more bytes than dense.** The factored storage is
+   `r · (d_out + d_in)` vs dense's `d_out · d_in`; at r=1.5 that's
+   150% of dense. A forward pass *reads more memory* than the dense
+   model it's replacing. For a memory-bandwidth-bound decode step
+   (which single-request autoregressive decode always is on a
+   consumer card), that's a strict regression — no runtime cleverness
+   recovers it.
+3. **PCIe streaming at batch=1 is bandwidth-impossible.** The
+   DESIGN.md thesis was to stream per-layer coefficients from CPU RAM
+   over PCIe. PCIe 4.0 x16 ≈ 32 GB/s vs VRAM ≈ 500+ GB/s. Hiding
+   PCIe transfer behind compute requires arithmetic intensity that
+   single-request decode doesn't have; at batch=1 you cannot amortize
+   the transfer. Double-buffering doesn't help — the transfer
+   *itself* is the bottleneck. This was implicit in the DESIGN.md
+   math but we hadn't tested it end-to-end until the 7B r=1.5 bench.
+
+The base vs factored 7B comparison exposed all three:
+`comparison_7b_r1.5.md` reports model load 8.2s → 224s (+2627%), TTFT
++128%, decode throughput ~flat because the base was *also* Python/HF
+bound at 4.7 tok/s. Neither is representative of what llama.cpp can do
+with a standard GGUF.
+
+### Why CALDERA
+
+`W ≈ Q + L·R` — Q is a standard GGUF-quantized tensor, L and R are
+small fp16 low-rank correction factors.
+
+- **Q rides the mainline kernel path.** Q4_K_M GEMV is
+  hand-optimized CUDA, CUDA-graph captured, already fast. Expected
+  7B tok/s: 4.7 (PyTorch/HF) → ~60–80 (llama.cpp Q4_K_M), before we
+  add anything new.
+- **L·R is LoRA-shaped.** The `build_lora_mm` intercept from Phase 3.2
+  (commit `55a9e6bdb`) already runs the forward correctly. Load-time
+  GGUF scan and tensor creation helpers (`create_tensor_factored`,
+  `fd67cd178`) are reusable.
+- **Streaming becomes optional, not the core mechanism.** 7B at Q4
+  fits in ~4 GB — no streaming needed on the 5070. For bigger models
+  we can layer on llama.cpp's existing `-ngl` partial offload, which
+  is already a tested PCIe-streaming path.
+- **Calibration infra transfers wholesale.** CALDERA's low-rank fit
+  is Σ-weighted Frobenius minimization, the same whitening
+  (`sqrt_and_inv`) + gramian collection we already built in
+  `basis_sharing.py`. Plus the GPU-resident accumulators from commit
+  `6c221e192`.
+
+### What's reusable vs deprecated from the factored track
+
+**Reusable:**
+- `caldera.py` prototype (commit `ef08245f7`) — single-matrix RPCD,
+  standalone smoke test.
+- `basis_sharing.collect_stats` — gramian collection, whitening.
+- `bench_model.py` + `bench_compare.py` + `bench_prompts.json` — the
+  15-prompt bench with greedy-agreement + top-5-overlap metrics.
+  **PPL-is-misleading lesson from 2026-04-18 still holds.**
+- Loader plumbing: `create_tensor_factored`, factored-GGUF scan,
+  `build_lora_mm` intercept. CALDERA's L·R slots into the same path.
+- Calibration optimizations: GPU-resident shared-role accumulators,
+  cholesky-skip, streaming activation cache.
+
+**Deprecated (don't resume):**
+- `y = B(Ax)` forward path / custom `GGML_OP_FACTORED_LINEAR` — we
+  were going to fuse the two matmuls into one kernel; moot now that
+  the mainline Q-kernel path is the target.
+- `target_ratio` knob — CALDERA has (qtype, rank) instead.
+- r=1.5 "structured decomposition" thesis — the pitch ("stream
+  coefficients, keep basis resident") doesn't survive batch=1 PCIe
+  math.
+- DESIGN.md §3 streaming runtime — architecture still sound for a
+  hypothetical batch>>1 server regime, but out of scope.
+
+### Next steps (gated)
+
+1. **Smoke + real-matrix validation** (~1 hr).
+   `python caldera.py --smoke` first. Then single-matrix CALDERA on
+   a real Qwen 7B `down_proj` with its saved gramian: does it beat
+   pure Q4_K in Σ-weighted rel_err at r=32 / 64 / 128? Synthetic
+   passing tells us the math; real-matrix tells us whether real weight
+   spectra benefit.
+2. **Full-model integration** in `basis_sharing.py` (~4 hr). Apply
+   per-matrix across all 252 linears, sweep (qtype ∈ {Q4_K, Q3_K},
+   rank ∈ {32, 64, 128, 256}), evaluate PPL + greedy-agreement +
+   top-5 overlap on the 15-prompt bench. Target: find the
+   (qtype, rank) pair that gets back to ≥90% greedy agreement at
+   ≤4.5 bpw.
+3. **GGUF emission + loader** (~variable). Q as standard GGUF quant
+   tensor, L/R as companion tensors. The loader scan pattern from
+   Phase 3.2 already handles companion tensors; mostly GGUF schema
+   + `build_lora_mm` verification.
+4. **Bench against llama.cpp mainline Q4_K_M** on the same 15-prompt
+   fixture. This is the real win-condition: does CALDERA ≥ Q4_K_M
+   quality at comparable speed? If yes, ship. If not, tune
+   (qtype, rank) or look at Q3_K + larger rank.
+
+### Tradeoff being accepted
+
+The factored-SVD thesis was "novel PCIe-streamed coefficients let us
+run a 30GB+ model on a 12GB card." That research bet is being
+abandoned. The replacement thesis is "fit the same-size models with
+less quantization damage, at mainline llama.cpp speed." Less novel,
+much faster path to something usable.
+
+For the bigger-model-on-small-card problem specifically, the honest
+path is (a) more aggressive CALDERA compression (Q3_K + rank
+correction, Q2_K + larger rank), plus (b) llama.cpp's existing
+`-ngl` partial offload, plus (c) speculative decoding for additional
+throughput. None of that needs a custom streaming kernel.
+
+### Extended plan — big-model target (added 2026-04-19)
+
+30 GB target on 12 GB VRAM has a hard PCIe ceiling at ~1.3 tok/s for
+18 GB streamed per token. Three levers, stackable:
+
+1. **Compress harder so more fits resident.** CALDERA-Q3_K + rank-64
+   on 30B ≈ 12–13 GB — may squeeze into VRAM with KV-cache tradeoffs.
+   CALDERA-Q2_K + rank-256 on 70B ≈ 22 GB — still partial offload,
+   but less of it. This is where CALDERA's "less damage at low bits"
+   actually delivers for big models (see Stage 5 below).
+2. **Speculative decoding.** Small same-family draft model (0.5–1B)
+   runs resident, big model verifies k proposed tokens per forward
+   pass. 2–5× effective speedup, stacks cleanly on partial offload
+   or full-resident. Zero custom code — llama.cpp has
+   `--draft-model` on mainline. Added as Stage 4.
+3. **Hardware.** 5090 has 32 GB; problem dissolves. Noted but not
+   planned.
+
+Realistic target for 5070 + 30 GB stored model via
+CALDERA-Q3_K + spec decode: **~8–12 tok/s interactive**. Below that,
+the constraint is PCIe bandwidth, not software.
+
+### Parallel research track — cross-matrix shared structure
+
+Separately from the CALDERA main track, queued a research bet on
+whether transformer weight matrices share compact common structure
+across layers and roles that a global codebook + per-matrix sparse
+coefficients could exploit. Does not block CALDERA shipping.
+
+**Motivation from hardware math:** 5070 at batch=1 decode has
+~60 FLOPs/byte of unused compute (tensor cores process data
+~500× faster than VRAM delivers it). Today's Q4_K_M dequant spends
+3–5 FLOPs/byte. Huge headroom to "emulate" weights via compute. The
+Cloudflare "Unweight" kernel pattern
+(https://blog.cloudflare.com/unweight-tensor-compression/) is the
+production precedent — producer/consumer thread groups decompress
+in shared memory and feed tensor cores without an HBM round-trip,
+shipping on H100 with 13–22% lossless size reduction. Same bandwidth-
+compute imbalance argument they cite ("tensor cores process data
+nearly 600× faster than memory can deliver it" on H100) holds on
+consumer cards.
+
+**Hypothesis-test experiment (~2 hr, does not block CALDERA):**
+
+1. Load all 252 Qwen 7B linears, normalize each by Frobenius norm.
+2. Stack columns across all matrices as one `d_out × (252·d_in)`
+   tensor.
+3. Randomized SVD, inspect singular-value spectrum.
+4. If top K≈1024 captures >90% energy → shared-dictionary thesis
+   viable, pursue global-codebook scheme. If spectrum is flat →
+   matrices genuinely independent, archive this direction.
+
+**Prior art to read first** (so we don't reinvent AQLM):
+
+- **AQLM** (arxiv:2401.06118) — per-matrix small codebook, ~2 bpw,
+  in llama.cpp, loses to Q4_K_M on tok/s despite being smaller.
+  Cross-matrix codebook sharing is the unshipped extension.
+- **QuIP#** (arxiv:2402.04396) — randomized Hadamard + lattice
+  quant, near-fp16 at 2 bpw, zero-storage "codebook."
+- **Monarch / Butterfly** (arxiv:2204.00595) — structured product
+  of block-sparse matrices, `d log d` storage, decode via compute
+  can be faster than dense matmul.
+- **Basis Sharing** (arxiv:2410.03765) — cross-layer SVD, already
+  tried (shelved above).
+
+**Novelty window:** cross-matrix global codebook (~1–10 MB resident)
++ per-matrix sparse index + scale. Decoded via gather + mul +
+accumulate on GPU. AQLM does this per-matrix; sharing across all 252
+matrices is the open research bet.
+
+**Risk:** custom codebook kernels have to beat Q4_K_M on tok/s,
+not just on size. AQLM already failed this bar on consumer cards.
+Any novel scheme has to clear Q4_K_M speed or it doesn't ship.
+
+**Operational insights borrowed from Cloudflare Unweight:**
+- **Selective compression** — don't compress attention / embeddings
+  / layer norms; different tensors have different value/byte, MLP
+  is where compression pays off. Applies to CALDERA Stage 2 sweep
+  design too (consider excluding non-MLP from low-bpw experiments).
+- **Producer/consumer kernels** with shared-memory decompression as
+  the kernel target for any cross-matrix scheme that ships.
+- **Per-matrix / per-batch-size autotuner** over multiple decode
+  strategies. Applies to CALDERA too (full-dequant vs
+  fused-reconstruct paths).

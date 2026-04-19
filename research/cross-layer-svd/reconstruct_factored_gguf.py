@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from gguf import GGUFReader, GGUFWriter, GGUFValueType
+from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter, GGUFValueType
 
 
 ROLE_TAGS = ["attn_q", "attn_k", "attn_v", "attn_output",
@@ -48,15 +48,30 @@ def _gguf_tensor_to_torch(t, dtype=torch.float32):
     return tt
 
 
-def _torch_to_f16_np(t):
-    return t.to(torch.float16).contiguous().cpu().numpy()
+def _torch_to_np(t, out_dtype=torch.float16):
+    """Return (numpy_array, raw_dtype) for a reconstructed dense weight.
+
+    For bf16 we reinterpret the raw 2-byte payload as int16 and tag the write
+    with GGMLQuantizationType.BF16 so the writer stores true bf16 (numpy has
+    no bf16 dtype). For fp16/fp32 the writer infers from the numpy dtype, so
+    raw_dtype is None.
+    """
+    t = t.to(out_dtype).contiguous().cpu()
+    if t.dtype == torch.bfloat16:
+        return t.view(torch.int16).numpy(), GGMLQuantizationType.BF16
+    return t.numpy(), None
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--factored", required=True, help="factored GGUF from convert_factored_gguf.py")
     p.add_argument("--out", required=True, help="output dense GGUF")
+    p.add_argument("--out-dtype", default="float16",
+                   choices=["float16", "bfloat16", "float32"],
+                   help="dtype for reconstructed dense weights (default: float16)")
     args = p.parse_args()
+
+    out_dtype = getattr(torch, args.out_dtype)
 
     reader = GGUFReader(args.factored)
 
@@ -139,7 +154,8 @@ def main():
                 A = _gguf_tensor_to_torch(coeff_info)
                 W = B @ A  # [d_out × r] @ [r × d_in] = [d_out × d_in]
                 out_name = f"blk.{layer_i}.{role}.weight"
-                writer.add_tensor(out_name, _torch_to_f16_np(W))
+                arr, raw = _torch_to_np(W, out_dtype)
+                writer.add_tensor(out_name, arr, raw_dtype=raw)
                 n_reconstructed += 1
     # permatrix: W = U @ V per layer
     for role, layers in permatrix.items():
@@ -150,7 +166,8 @@ def main():
             V = _gguf_tensor_to_torch(pair["V"])
             W = U @ V
             out_name = f"blk.{layer_i}.{role}.weight"
-            writer.add_tensor(out_name, _torch_to_f16_np(W))
+            arr, raw = _torch_to_np(W, out_dtype)
+            writer.add_tensor(out_name, arr, raw_dtype=raw)
             n_reconstructed += 1
 
     # Copy passthrough tensors verbatim

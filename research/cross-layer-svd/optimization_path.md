@@ -1,6 +1,17 @@
 # Factored Inference — Optimization Path
 
-**Status:** Research aggregation, post-Phase 3.2.
+> **⚠️ SUPERSEDED 2026-04-19.** The optimizations below target the
+> shelved cross-layer-SVD streaming runtime. Primary direction is now
+> CALDERA (`W ≈ Q + L·R`), which reuses llama.cpp's mainline Q4_K_M
+> GEMV + CUDA graphs and the existing `build_lora_mm` intercept — so
+> most of the §1 runtime work (kernel fusion, stream management,
+> cudaMemcpyAsync double-buffering) is moot. The §2 decomposition-
+> pipeline items (gramian caching, partial SVD, pipeline prefetch)
+> transfer directly to CALDERA calibration. See the 2026-04-19 entry
+> in [JOURNAL.md](JOURNAL.md) for the pivot rationale.
+
+**Status:** SUPERSEDED — see banner above.
+**Original status:** Research aggregation, post-Phase 3.2.
 **Date:** 2026-04-17.
 **Relates to:** [DESIGN.md](DESIGN.md), [JOURNAL.md](JOURNAL.md).
 

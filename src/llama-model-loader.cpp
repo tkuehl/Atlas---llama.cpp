@@ -1115,6 +1115,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+            consumed_tensor_names.insert(tn.str());
 
             return nullptr;
         }
@@ -1289,6 +1290,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(cur);
     } else {
         n_created++;
+        consumed_tensor_names.insert(tn.str());
     }
 
     return tensor;
@@ -1309,6 +1311,14 @@ llama_model_loader::create_tensor_factored(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             int max_n_tensors = n_tensors + 1 + hparams.n_layer*2;
+            // Factored loads allocate two ggml_tensors per logical weight and
+            // duplicate shared bases per referencing layer (see build_one
+            // below). Match the 2x budget create_tensor applies when
+            // factored_enabled so we don't exhaust the no-alloc ctx on larger
+            // models or wider factorization coverage.
+            if (factored_enabled) {
+                max_n_tensors *= 2;
+            }
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer*256;
             }
@@ -1371,16 +1381,39 @@ llama_model_loader::create_tensor_factored(
             throw std::runtime_error(format(
                 "factored GGUF references '%s' but tensor is missing", gguf_name.c_str()));
         }
+        // Early shape sanity: factors must be 2D with positive extents.
+        // Catches malformed factored GGUFs at load time instead of surfacing
+        // later as an opaque mul_mat dimension mismatch.
+        if (t_meta->ne[0] <= 0 || t_meta->ne[1] <= 0 ||
+            t_meta->ne[2] != 1 || t_meta->ne[3] != 1) {
+            throw std::runtime_error(format(
+                "factored tensor '%s' has invalid shape %s; expected 2D with positive extents",
+                gguf_name.c_str(), llama_format_tensor_shape(t_meta).c_str()));
+        }
         ggml_backend_buffer_type_t buft = buft_for_meta(t_meta, gguf_name.c_str());
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * t = ggml_dup_tensor(ctx, t_meta);
         ggml_set_name(t, gguf_name.c_str());
         n_created++;
+        // Only the first occurrence of each physical tensor name counts
+        // toward consumption — shared bases are referenced by multiple layers
+        // but appear once in the GGUF.
+        consumed_tensor_names.insert(gguf_name);
         return t;
     };
 
     ggml_tensor * basis  = build_one(fs->basis_name);
     ggml_tensor * coeffs = build_one(fs->coeffs_name);
+
+    // Pair sanity: y = basis @ (coeffs @ x). In ggml layout mul_mat contracts
+    // on ne[0], so the shared rank dim is basis->ne[0] (coeffs' output rows)
+    // matched against coeffs->ne[1] (coeffs' rows = rank).
+    if (basis->ne[0] != coeffs->ne[1]) {
+        throw std::runtime_error(format(
+            "factored pair '%s'/'%s' rank mismatch: basis ne[0]=%lld vs coeffs ne[1]=%lld",
+            fs->basis_name.c_str(), fs->coeffs_name.c_str(),
+            (long long) basis->ne[0], (long long) coeffs->ne[1]));
+    }
 
     // flags is accepted for API symmetry with create_tensor; TENSOR_NOT_REQUIRED
     // doesn't apply to factored weights (factoring is all-or-nothing per role).
@@ -1413,19 +1446,21 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     ggml_set_name(tensor, name.c_str());
 
     n_created++;
+    consumed_tensor_names.insert(name);
 
     return tensor;
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    // Factored loads legitimately allocate more ggml_tensors than there are
-    // entries in weights_map: each shared basis is duplicated per referencing
-    // layer (see create_tensor_factored). Allow n_created to exceed n_tensors
-    // when loading a factored GGUF.
-    const bool ok = factored_enabled ? (n_created >= n_tensors)
-                                     : (n_created == n_tensors);
-    if (!ok) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    // Use the distinct-consumed-names set as the canonical check: it's
+    // immune to the shared-basis duplication that inflates n_created in
+    // factored loads, so the old `n_created >= n_tensors` relaxation
+    // (which could mask a missing canonical weight) is no longer needed.
+    // Every GGUF tensor must have been either created or explicitly skipped.
+    if ((int) consumed_tensor_names.size() != n_tensors) {
+        throw std::runtime_error(format(
+            "%s: wrong number of tensors; expected %d, got %d distinct (n_created=%d)",
+            __func__, n_tensors, (int) consumed_tensor_names.size(), n_created));
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",

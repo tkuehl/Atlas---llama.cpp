@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from gguf import GGUFReader, GGUFWriter
+from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter
 from safetensors import safe_open
 
 
@@ -58,20 +58,20 @@ def _parse_blk_tensor(name):
     return layer, parts[1]
 
 
-def _np_dtype_for(torch_dtype):
-    return {
-        torch.float16: np.float16,
-        torch.bfloat16: np.float32,  # numpy has no bf16; store as fp32
-        torch.float32: np.float32,
-    }.get(torch_dtype, np.float32)
-
-
 def _tensor_to_np(t, out_dtype=torch.float16):
-    """Convert a torch tensor to a numpy array suitable for gguf writer."""
+    """Convert a torch tensor to (numpy_array, raw_dtype) suitable for gguf.
+
+    For bf16 the returned array is an int16 view of the raw 2-byte payload and
+    raw_dtype is GGMLQuantizationType.BF16 so the writer stores it as true bf16
+    (2 bytes/element) instead of silently promoting to fp32. For fp16/fp32 the
+    writer infers the dtype from the numpy array, so raw_dtype is None.
+    """
     t = t.to(out_dtype).contiguous().cpu()
     if t.dtype == torch.bfloat16:
-        t = t.to(torch.float32)
-    return t.numpy()
+        # numpy has no bf16; reinterpret the underlying bits as int16 and tell
+        # the writer the true ggml type via raw_dtype.
+        return t.view(torch.int16).numpy(), GGMLQuantizationType.BF16
+    return t.numpy(), None
 
 
 def build_factored_tensor_map(manifest, factored_tensors):
@@ -167,11 +167,14 @@ def main():
 
     # Emit tensors: copy base tensors, swap factored ones for their factor pairs
     n_copied = n_replaced = n_extra = 0
+    consumed = set()
     for tensor_info in reader.tensors:
         orig_name = tensor_info.name
         if orig_name in replaced:
+            consumed.add(orig_name)
             for new_name, t in replaced[orig_name]:
-                writer.add_tensor(new_name, _tensor_to_np(t, out_dtype))
+                arr, raw = _tensor_to_np(t, out_dtype)
+                writer.add_tensor(new_name, arr, raw_dtype=raw)
                 n_extra += 1
             n_replaced += 1
         else:
@@ -179,6 +182,18 @@ def main():
             data = np.array(tensor_info.data)
             writer.add_tensor(orig_name, data, raw_dtype=tensor_info.tensor_type)
             n_copied += 1
+
+    # Fail loudly if the manifest referenced tensors the base GGUF doesn't
+    # contain. Silently dropping those factors would yield a partially factored
+    # artifact tagged factored.enabled=true — poisonous for benchmarking.
+    missing = sorted(set(replaced.keys()) - consumed)
+    if missing:
+        sample = ", ".join(missing[:5])
+        more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise RuntimeError(
+            f"factored manifest references {len(missing)} tensor(s) absent from "
+            f"base GGUF {args.base_gguf!r}: {sample}{more}. "
+            f"Refusing to write a partial factored artifact.")
 
     print(f"wrote {n_copied} copied tensors + {n_extra} factored tensors "
           f"(replaced {n_replaced} originals)")

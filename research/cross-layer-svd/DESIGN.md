@@ -1,6 +1,22 @@
 # Factored Inference — Phase 0 Design Document
 
-**Status:** Phase 0 (investigation + design). No kernel code yet.
+> **⚠️ SUPERSEDED 2026-04-19.** Primary research direction pivoted to
+> CALDERA (`W ≈ Q + L·R`, arxiv:2405.18886). This document remains as
+> reference for the shelved cross-layer-SVD + PCIe-streaming runtime
+> branch. See the 2026-04-19 entry in [JOURNAL.md](JOURNAL.md) for the
+> pivot rationale. Do not resume work against this design unless
+> CALDERA hits a blocker.
+>
+> **What's still valid below:** decomposition math notes (§2.1-2.3),
+> SparseGPT/OBS empirical findings, activation-aware SVD derivations.
+> **What's not:** §3 streaming runtime architecture (PCIe bandwidth
+> ceiling at batch=1 makes the custom kernel moot); GGUF sidecar
+> naming convention (CALDERA uses LoRA-shaped companion tensors
+> instead); §7 upstream strategy (CALDERA changes fit mainline better
+> and don't need a fork-level divergence for the kernel).
+
+**Status:** SUPERSEDED — see banner above.
+**Original status:** Phase 0 (investigation + design). No kernel code yet.
 **Date:** 2026-04-17
 **Supersedes decisions in:** earlier sections of `JOURNAL.md`.
 

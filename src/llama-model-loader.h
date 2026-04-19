@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -71,6 +72,13 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+
+    // Distinct physical (GGUF-side) tensor names the loader has created or
+    // explicitly skipped. Used by done_getting_tensors() to verify that every
+    // GGUF tensor was consumed, independent of how many ggml_tensor objects
+    // were allocated (factored loads legitimately duplicate shared bases
+    // across layers, which inflates n_created but not this set).
+    std::unordered_set<std::string> consumed_tensor_names;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
