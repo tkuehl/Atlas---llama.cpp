@@ -377,7 +377,8 @@ class XtxStore:
                  accum_fp64_threshold: int = 4096,
                  disk_max_pct: float = 90.0,
                  gpu_vram_max_pct: float = 90.0,
-                 gpu_accum_budget_gb: float = 4.0):
+                 gpu_accum_budget_gb: float = 4.0,
+                 file_prefix: str = "xtx"):
         assert mode in ("ram", "disk", "auto")
         self.mode = mode
         self.min_free_gb = min_free_gb
@@ -409,6 +410,11 @@ class XtxStore:
         self._gpu_accum_budget_bytes = int(gpu_accum_budget_gb * 1e9)
         self._gpu_accum_bytes_used = 0
         self._gpu_accum_tensors: dict[str, torch.Tensor] = {}
+        # Per-store file prefix — xtx and ggt stores must NOT share
+        # filenames when both run disk-backed (would clobber each other's
+        # memmap files). Default "xtx" preserves legacy behavior; pass
+        # "ggt" for the output-gradient store when refit=True.
+        self.file_prefix = file_prefix
 
     def _accum_dtype(self, d: int) -> torch.dtype:
         return torch.float64 if d >= self.accum_fp64_threshold else torch.float32
@@ -486,7 +492,7 @@ class XtxStore:
             safe = name.replace("/", "_").replace(".", "_")
             suffix = "f64" if nbytes == 8 else "f32"
             np_dtype = "float64" if nbytes == 8 else "float32"
-            path = self.temp_dir / f"xtx_{safe}.{suffix}"
+            path = self.temp_dir / f"{self.file_prefix}_{safe}.{suffix}"
             # mode='w+' truncates; freshly-extended pages are zero-initialized
             # by the OS, so we don't need (and shouldn't pay for) an explicit
             # arr[:] = 0 that dirties every page up front.
@@ -2373,7 +2379,8 @@ def main():
                               accum_fp64_threshold=args.accum_fp64_threshold,
                               disk_max_pct=args.disk_max_pct,
                               gpu_vram_max_pct=args.gpu_vram_max_pct,
-                              gpu_accum_budget_gb=args.gpu_accum_budget_gb)
+                              gpu_accum_budget_gb=args.gpu_accum_budget_gb,
+                              file_prefix="ggt")
                      if need_grad else None)
         streaming_role_set = {r.strip() for r in args.streaming_roles.split(",")
                               if r.strip()}

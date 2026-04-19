@@ -454,3 +454,262 @@ Tested three speedup ideas against the 3B r=1.0 baseline (190.9s decomposition, 
 5. **Per-window safetensors format** — eliminates the brief 22 GB peak during save_factored assembly. Requires C++ loader update.
 
 Quality work (per-matrix allocation with a better utility function, calibration at >100 samples, refit=True with LS solve) is deferred until the runtime backlog clears.
+
+---
+
+## 2026-04-18 (late) — runtime polish, bench suite, refit regression
+
+### Runtime optimizations shipped
+
+**Cholesky-skip fix (commit `e29ea935a`).** Previous skip path for
+rank-deficient gramians routed to GPU fp64 eigh, which OOMs at d=18944
+on a 12 GB card and then fell through to the very slow CPU Cholesky
+ladder. Fixed to jump directly to `gpu-fp64-eps10` Cholesky (the tier
+empirically observed to succeed on rank-deficient wide-d gramians).
+Default `--skip-cholesky-above-d` bumped from 0 → 15000 (catches 7B+
+down_proj, leaves 3B and smaller on the full ladder). Validated on
+7B r=1.0 reference: 1507s → 1433s decomposition (-5%), PPL 8.75 →
+8.765 (within noise).
+
+**GPU-resident shared-role accumulators (commit `6c221e192`).**
+`XtxStore` gains a GPU-residency path for fp32 gramians under a
+`--gpu-accum-budget-gb` budget (default 4 GB). Forward hook does
+in-place `addmm_` into the gramian on device, skipping the legacy
+GPU-mm → D2H → CPU-add round trip per hook. `consolidate_to_cpu()`
+moves gramians back to CPU between calibration and decomposition so
+downstream code sees uniform CPU tensors and GPU workspace is free for
+SVD. Symmetric treatment for xtx (forward) and ggt (backward). fp64
+accumulators always stay on CPU (GPU fp64 is 1/64 throughput on
+consumer cards).
+
+Results vs the r=1.0 references:
+
+| model | calibration | decomp | PPL |
+|---|---|---|---|
+| 3B (before) | 34.9s | 190.9s | 12.26 |
+| 3B (+GPU-resident) | **21.8s** (−38%) | 193.8s | 12.21 |
+| 7B (before) | 417s | 1507s | 8.75 |
+| 7B (+GPU-resident) | ~420s (neutral) | 1400s | 8.76 |
+
+The 7B neutral result exposed a miscalculation in my earlier hook-path
+accounting — I had estimated D2H dominated shared-role hooks (~270s of
+~400s hook-path at 7B), but the real number is closer to ~27s. The
+remaining ~300s at 7B is dominated by the StreamingCollector
+pin_memory + drain loop for down_proj, which is a separate target.
+
+**File prefix fix (same commit stack).** When `refit=True` the
+ggt_store and xtx_store both want disk-backed memmaps and both used
+the `xtx_` filename prefix — file collisions that showed up as
+`OSError(Errno 22)` on the second store's alloc. Added
+`file_prefix` parameter defaulting to `"xtx"`; ggt_store passes
+`"ggt"`.
+
+### Benchmark suite (commit `e2a1d41f5`)
+
+Three files under `research/cross-layer-svd/`:
+
+- `bench_prompts.json` — 15-prompt fixture (5 factual w/ exact-match
+  keys, 3 completion, 3 reasoning, 2 code, 2 summary).
+- `bench_model.py` — runs one model (base HF or base+factored overlay)
+  through the fixture. Records per-prompt timing (prefill / TTFT /
+  total / per-token / tok/s), generated text + token ids + per-token
+  log-probs + top-k ids per step. Background resource sampler polls
+  VRAM / GPU util% / CPU% / RSS every 100 ms; reports peak + mean.
+- `bench_compare.py` — diffs two JSONs; emits markdown with speed
+  deltas, resource deltas, exact-match scoring, greedy token agreement
+  (% of leading tokens identical), top-5 overlap, plus a side-by-side
+  response dump for qualitative judgment.
+
+Greedy decode (`temperature=0.0`) default so base-vs-factored is
+deterministic. Top-k computed offline from the JSONs so compare
+doesn't re-run the model. UTF-8 output required on Windows (arrow +
+check glyphs can't encode in cp1252).
+
+### First bench run: 3B base vs factored (r=1.0, no-refit)
+
+On our PPL reference pair (base 7.66, factored 12.26):
+
+| metric | base | factored | delta |
+|---|---|---|---|
+| Mean tok/s | 41.0 | 41.7 | +1.5% (noise) |
+| VRAM peak | 6325 MB | 6327 MB | 0 |
+| **Model load** | **3.7 s** | **37.4 s** | **+902%** |
+| RSS peak | 8.0 GB | 20.4 GB | +153% |
+| Exact-match (factual) | 4/5 | 3/5 | −1 |
+| **Greedy token agreement** | ref | **1.9%** | — |
+| **Top-5 overlap** | ref | 11.3% | — |
+
+Inference-time speed and VRAM are essentially identical — expected,
+since `chat_factored.py` reconstructs dense weights in memory. The
+model-load and RSS overhead are the cost of that reconstruction path;
+they go away once llama.cpp loads the factored form natively.
+
+**The striking number is greedy-agreement = 1.9%.** PPL of 12.26
+vs base 7.66 (1.60× baseline) sounds like a modest compression tax,
+but the argmax at the very first decoded position diverges from base
+on 13 of 15 prompts. Qualitatively the factored model loops ("Berlin
+is the capital of Berlin, Germany..."), contradicts itself ("whales
+are cold-blooded"), produces broken code, and gives wrong arithmetic
+answers. On the two prompts where greedy agreement was high (a
+hard-constrained fox completion and a one-word factual), outputs were
+indistinguishable.
+
+**PPL is an unreliable proxy for generation quality at our
+compression regime.** It averages token-level likelihood, so a factored
+model can keep average per-token loss close while its peak tokens
+shuffle — which is exactly what breaks autoregressive decoding. The
+greedy-agreement and top-5-overlap metrics from the new bench suite
+track this failure mode directly and should be the regression
+indicator for quality work going forward.
+
+### Refit=True at r=1.0 on 3B — regression, not improvement
+
+Enabled `refit=True` (balanced truncation: per-layer coefficients
+refit via closed-form weighted LS with output-gradient covariance
+ggt) to test whether balancing in/out sensitivity would reduce the
+argmax-shifting. Run setup:
+
+- `--target-ratio 1.0`, `--calib-samples 32`, `--dtype bfloat16`
+- 252 hooked modules (7 roles × 36 layers); backward pass + per-layer
+  ggt accumulation during calibration
+- No streaming (forces all gramians in fp32 through the regular hook
+  path so both fwd+bwd hook flavors work)
+
+Result:
+
+| config | factored PPL | ratio | greedy agreement | qualitative |
+|---|---|---|---|---|
+| no-refit (reference) | 12.26 | 1.60× | 1.9% | loops + factual errors |
+| **refit=True** | **21.07** | **2.75×** | **1.0%** | **word salad, tighter loops, no valid code** |
+
+Refit **nearly doubled PPL** and made generation strictly worse:
+
+- "Berlin" prompt: loops immediately — "The capital of Germany is
+  Berlin, which is the capital of Germany. The capital of Germany is
+  Berlin..." — whereas no-refit at least listed other capitals
+  coherently for a few tokens before losing the plot.
+- Math prompt: "a number of people's the number of people's a number
+  of people's..." — no longer attempts arithmetic at all.
+- Code prompt: "Return the n-th return (n) using, 3003: n = f (n)..."
+  — incoherent tokens, no Python syntax.
+- Fox completion: fabricates "bridge and the green one goes to the
+  river" — loses the canonical "lazy dog" entirely.
+
+Calibration wall time: ~80 min on 3B (forward+backward, 150-165
+s/sample), vs 35s for no-refit. ~23× slower, not the 2× I projected.
+The backward pass + hook-path cost compounds.
+
+**Likely causes of the quality regression:**
+
+1. **bf16 backward underflow.** bf16 has a 7-bit mantissa. Gradients
+   for weights with small activations underflow to zero. The
+   accumulated ggt captures only the large-gradient directions
+   reliably; small but non-negligible directions get lost to noise.
+   The LS solve `A = (B^T S_out^T S_out B)^-1 B^T S_out^T S_out W`
+   inverts S_out's spectrum, which means any ggt eigenvalues that
+   underflowed get enormous weight in the solve — amplifying noise
+   into the coefficients.
+2. **Compound regularization.** sqrt_and_inv is now called on both
+   S_in (from xtx) and S_out (from ggt). Eps regularization applied
+   on both sides compounds: coefficients get distorted by both
+   whitenings' regularization error.
+3. **Over-parameterization at r=1.0.** At r ≈ dense-equivalent rank,
+   the ASVD path (input-only) already captures ~all the signal. The
+   LS refit has little headroom to improve and plenty to overfit to
+   noise. Refit may only show its benefit at aggressive
+   compression (r=0.5–0.7) where input-only SVD genuinely loses
+   information.
+
+### What to try next on the quality front
+
+1. **Refit with fp32 calibration.** Repeat the experiment at
+   `--dtype float32`. Rules out bf16 as the cause. ~4× slower
+   calibration than bf16 but isolates the variable.
+2. **Refit at lower ratio.** Try `--target-ratio 0.8` with refit to
+   test the "refit only matters when truncation bites" hypothesis.
+3. **Refit only a subset of roles.** Apply balanced truncation only to
+   down_proj (the role we see struggling qualitatively); leave shared
+   roles on ASVD. Small code change.
+4. **Investigate ggt quality directly.** Log condition number and
+   effective rank of ggt per layer. If bf16 noise is the problem, it
+   will show up as low effective rank.
+5. **Sample count at r=1.0.** Push samples from 32 → 128 (tolerable
+   wall time without refit) to see whether the 1.9% greedy agreement
+   floor is calibration-noise-bound or fundamental to the scheme.
+
+### Default settings as of this entry
+
+Shipped as defaults in `basis_sharing.py`:
+
+- `--target-ratio 1.0` — validation regime
+- `--rank-alloc global` — per-matrix experimental (regresses 7B)
+- `--skip-cholesky-above-d 15000` — catches 7B+ down_proj
+- `--gpu-accum-budget-gb 4.0` — fits 3B shared+o_proj on GPU
+- `--calib-batch-size 1` — batching neutral on 7B, helps 3B but
+  asymmetric; left at 1 for consistency
+- `--streaming-roles ""` (empty) — streaming opt-in per-run
+- Factor streaming (per-layer .pt temp files + inline materialize)
+  on by default, `--no-stream-factors` to disable.
+
+### Current backlog (supersedes the 2026-04-18 list)
+
+**Runtime — shipped since last entry:**
+- ✓ Cholesky-skip fix (commit `e29ea935a`)
+- ✓ GPU-resident shared-role accumulators (commit `6c221e192`)
+- ✓ ggt / xtx file-prefix fix (same stack)
+- ✓ Bench suite `bench_model.py` + `bench_compare.py` (commit `e2a1d41f5`)
+
+**Runtime — still open, ordered by impact:**
+
+1. **StreamingCollector pin_memory speedup** — _new target_, identified
+   as the real 7B calibration bottleneck (~300s of the 420s total) now
+   that GPU-resident nailed the shared-role hook path. Options: async
+   pinning + double-buffered drain, or bf16-on-disk + lazy fp64
+   promotion during drain. ~2-3 hr.
+2. **Cross-run gramian caching** — save fp64 gramians to safetensors
+   after streaming finalize, reuse across rank/ratio/refit experiments.
+   Zero-cost re-runs when only decomposition params change. Huge
+   iteration-speed multiplier for the quality experiments below. ~2 hr.
+3. **Pipeline prefetch** — overlap layer k+1 load from disk with
+   layer k SVD via async CUDA streams. ~20% decomp speedup. ~2-3 hr.
+4. **Per-window safetensors output format** — eliminates the ~22 GB
+   peak during save_factored assembly. Requires C++ loader update.
+   Deferred until runtime is otherwise optimized.
+
+**Quality — where we pivoted today, but refit regressed:**
+
+Refit=True with bf16 backward + 32 samples at r=1.0 nearly doubled PPL
+and catastrophically degraded generation (word salad, tighter loops,
+no valid code). Five follow-up experiments queued:
+
+1. **Refit with fp32 calibration** — rules out bf16 underflow as the
+   noise source. ~4× slower than bf16 but isolates the variable.
+2. **Refit at lower ratio (r=0.8)** — tests the "refit only matters
+   when truncation actually loses information" hypothesis.
+3. **Partial refit (down_proj only)** — apply balanced truncation only
+   to the role that's qualitatively struggling; leave shared roles
+   on ASVD. Small code change.
+4. **ggt diagnostics** — log condition number / effective rank of
+   per-layer ggt. If bf16 underflow is the culprit it shows up as
+   rank collapse.
+5. **Calibration at 128 samples (no refit)** — push past 32 to see
+   whether the 1.9% greedy agreement floor is calibration-noise-bound
+   or structural to our scheme.
+
+**New quality lever from bench findings:**
+
+The bench suite exposed **greedy agreement as a better
+generation-quality indicator than PPL**. Future quality experiments
+should report greedy agreement + top-5 overlap alongside PPL; any
+change that regresses either is suspect even if PPL holds. Qualitative
+judgment remains the final word — the side-by-side markdown from
+`bench_compare.py` is the artifact to review per-experiment.
+
+**Quality experiments deferred indefinitely:**
+
+- Per-matrix rank allocation (sum-of-σ² not a PPL proxy at 7B).
+  Needs a better utility function — ggt-weighted if refit works, or
+  empirical PPL sensitivity if not.
+- r < 1.0 production compression. Returning to this once generation
+  quality at r=1.0 is understood; no point chasing compression when
+  the lossless-ish regime already loops.
