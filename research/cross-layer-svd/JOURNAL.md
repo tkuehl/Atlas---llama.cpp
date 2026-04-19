@@ -1424,3 +1424,107 @@ next moves, in priority order:
 3. **Archive CALDERA and run plain Q4_K_M + spec decode** for the
    interactive-tok/s problem. Pragmatic. Nothing novel to write about
    but gets the best fast path on the 5070 today.
+
+---
+
+## 2026-04-19 — Cross-matrix shared-dictionary hypothesis: DEAD
+
+Ran the gate experiment from `project_unweight_research.md` on
+Qwen 2.5 7B. Goal: does transformer weight structure across matrices
+concentrate in a compact shared subspace of the residual stream
+that a global codebook could exploit?
+
+### Setup
+
+197 `nn.Linear` modules (all attention and MLP projections across 28
+layers, plus `lm_head`) projected into the 3584-dim hidden-space:
+matrices where `d_out == 3584` use `G_i = W_norm @ W_norm.T`; matrices
+where `d_in == 3584` (gate / up) use `G_i = W_norm.T @ W_norm`. Each
+W normalized by its Frobenius norm so `tr(G_i) = 1`. Accumulate
+`G_stacked = Σ_i G_i`, compare its spectrum to per-matrix baseline.
+Computed in fp64 on CPU; run took 287s.
+
+### Result
+
+| | effective rank | k=256 | k=1024 | k=2048 |
+|---|---|---|---|---|
+| stacked-all (197 matrices) | **3303** / 3584 | 12.3% | **38.3%** | 66.2% |
+| per-matrix mean | 1333 | 41.9% | 74.0% | 90.3% |
+| random baseline | — | 7.1% | 28.5% | 57.1% |
+
+Stacked top-1024 = 38.3% — far below the 90% gate. Only 10 points
+above a uniformly-random subspace. **Stacked effective rank (3303) is
+LARGER than per-matrix mean (1333), not smaller.**
+
+Per-role stacked concentration (k=1024):
+| role | n | k=1024 |
+|---|---|---|
+| down_proj | 28 | 35.8% |
+| gate_proj | 28 | 39.7% |
+| k_proj | 28 | 64.5% |
+| o_proj | 28 | 44.7% |
+| q_proj | 28 | 45.5% |
+| up_proj | 28 | 36.1% |
+| v_proj | 28 | 54.5% |
+
+`k_proj` is the best sharer (64.5%) — likely because GQA replicates
+K projections across query heads, giving some structural reuse.
+Still nowhere near the 90% gate.
+
+### Interpretation
+
+Matrices actively use **complementary** directions in hidden-space —
+not random-independent, but **anti-aligned**. Each matrix's preferred
+~1333-dim subspace is distinct from other matrices'. When you stack
+197 such matrices, the combined distribution almost fills the whole
+3584-dim space.
+
+This is the structure predicted by transformer superposition
+interpretability: different attention heads and MLP neurons encode
+different features, the residual stream is the shared coordinate
+system where features sum. Weight matrices orthogonalize during
+training to maximize feature distinguishability. "Space-filling
+matrix distributions" is the correct null for a well-trained
+transformer.
+
+### Implications
+
+- **Cross-matrix shared-dictionary schemes have no compression headroom
+  to exploit.** Global codebook (AQLM-across-matrices), shared basis
+  (Basis Sharing extended to all matrices), or any other cross-matrix
+  structure-exploitation is fighting the nature of trained weights.
+- **Per-matrix approaches are structurally correct.** CALDERA
+  (per-matrix Q + L·R), K-quants (per-matrix super-block scales),
+  AQLM (per-matrix codebook) — all the right shape.
+- **This is consistent with the Stage 2 CALDERA finding** that pure
+  K-quants beat CALDERA Q3_K+rank at matched bpw. Per-matrix structure
+  is what matters; nothing at the cross-matrix level helps.
+- **Basis Sharing paper's `window=2` ablation** (PPL degrades sharply
+  past window=2) is explained: the larger the shared window, the
+  more it's fighting the matrix anti-alignment we observe here.
+
+### Remaining research axes (unrelated to this hypothesis)
+
+- **Block-VQ within a matrix** (AQLM-style 8-dim codebook per-matrix)
+  — different question, not directly invalidated, but the per-matrix
+  structural picture suggests most of the benefit already lives
+  inside K-quants' block design.
+- **Temporal / activation-flow compression** (Mixture of Depths,
+  early-exit, draft-then-verify) — a completely different axis.
+  Speculative decoding with a small draft (already in CALDERA pivot
+  plan as Stage 4) is the pragmatic version.
+- **Memory-hierarchy exploitation for batch≥2** (the shelved
+  factored-SVD DESIGN.md plan) — still valid for server workloads,
+  still not our target.
+
+### Verdict
+
+Archive the cross-matrix research track. Return to the CALDERA
+main-track question: does CALDERA Q3_K + rank correction beat pure
+Q4_K on **downstream PPL and greedy agreement** (not just Σ-rel-err)?
+If yes, CALDERA has a narrow-but-real use case as an in-between-tier
+compressor. If no, CALDERA is archived too and the research track
+collapses to "use llama.cpp mainline + spec decoding."
+
+Files produced: [cross_matrix_svd_test.py](cross_matrix_svd_test.py),
+[shared_basis_test_7b.pkl](shared_basis_test_7b.pkl).
