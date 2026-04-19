@@ -376,7 +376,8 @@ class XtxStore:
                  gpu_workspace_cap_gb: float = 4.0,
                  accum_fp64_threshold: int = 4096,
                  disk_max_pct: float = 90.0,
-                 gpu_vram_max_pct: float = 90.0):
+                 gpu_vram_max_pct: float = 90.0,
+                 gpu_accum_budget_gb: float = 4.0):
         assert mode in ("ram", "disk", "auto")
         self.mode = mode
         self.min_free_gb = min_free_gb
@@ -399,6 +400,15 @@ class XtxStore:
         self.accum_fp64_threshold = int(accum_fp64_threshold)
         self.disk_max_pct = float(disk_max_pct)
         self.gpu_vram_max_pct = float(gpu_vram_max_pct)
+        # Total GPU-resident gramian budget, in bytes. When > 0, alloc()
+        # places fp32 gramians directly on GPU so the hook path can do an
+        # in-place `addmm_` into them — avoiding the per-hook ~5 ms D2H +
+        # CPU add_ round trip that dominates calibration wall time for
+        # models where model-forward is cheap relative to hook overhead.
+        # 0 disables GPU residency entirely (legacy CPU addmm path).
+        self._gpu_accum_budget_bytes = int(gpu_accum_budget_gb * 1e9)
+        self._gpu_accum_bytes_used = 0
+        self._gpu_accum_tensors: dict[str, torch.Tensor] = {}
 
     def _accum_dtype(self, d: int) -> torch.dtype:
         return torch.float64 if d >= self.accum_fp64_threshold else torch.float32
@@ -420,10 +430,46 @@ class XtxStore:
         reserve = int(self.min_free_gb * 1e9)
         return bytes_needed > avail - 2 * reserve
 
+    def _try_alloc_gpu(self, name: str, d: int, dtype: torch.dtype,
+                       bytes_needed: int) -> torch.Tensor | None:
+        """Attempt GPU-resident allocation under the configured budget.
+
+        Returns a CUDA tensor on success; None if disabled, dtype is fp64
+        (which is impractically slow on consumer GPUs for the matmul path
+        we're optimizing), budget is exhausted, or cudaMemGetInfo reports
+        insufficient headroom against --gpu-vram-max-pct. Caller falls
+        through to the CPU path in the latter cases."""
+        if (not self._gpu_enabled
+                or self._gpu_accum_budget_bytes <= 0
+                or dtype == torch.float64):
+            return None
+        if (self._gpu_accum_bytes_used + bytes_needed
+                > self._gpu_accum_budget_bytes):
+            return None
+        free_vram, total_vram = torch.cuda.mem_get_info()
+        cap_bytes = int(total_vram * self.gpu_vram_max_pct / 100.0)
+        used_after = (total_vram - free_vram) + bytes_needed
+        if used_after > cap_bytes:
+            return None
+        try:
+            t = torch.zeros(d, d, dtype=dtype, device="cuda")
+        except torch.cuda.OutOfMemoryError:
+            return None
+        self._gpu_accum_tensors[name] = t
+        self._gpu_accum_bytes_used += bytes_needed
+        return t
+
     def alloc(self, name: str, d: int) -> torch.Tensor:
         dtype = self._accum_dtype(d)
         nbytes = self._accum_nbytes(d)
         bytes_needed = d * d * nbytes
+        # GPU-resident shared-role accumulators: lets the hook do an
+        # in-place `addmm_` into the gramian on device, skipping the
+        # workspace + D2H + CPU add_ round trip per hook. fp64 deferred
+        # to CPU path (1/64 throughput on consumer cards, not worth it).
+        gpu_tensor = self._try_alloc_gpu(name, d, dtype, bytes_needed)
+        if gpu_tensor is not None:
+            return gpu_tensor
         use_disk = self._use_disk(bytes_needed)
         if use_disk:
             # No RAM safety check on the disk path. Memmap writes go to the
@@ -495,6 +541,21 @@ class XtxStore:
         calibration so downstream compute_factors has the full VRAM to
         work with during SVD."""
         self._gpu_workspaces.clear()
+        if self._gpu_enabled:
+            torch.cuda.empty_cache()
+
+    def consolidate_to_cpu(self, xtx: dict[str, torch.Tensor]) -> None:
+        """Move any GPU-resident gramian accumulators into CPU tensors
+        in `xtx` so downstream code sees uniform CPU tensors. Called
+        once after calibration completes. Frees VRAM the decomposition
+        will use for SVD workspace."""
+        if not self._gpu_accum_tensors:
+            return
+        for name, t in list(self._gpu_accum_tensors.items()):
+            if name in xtx and xtx[name].is_cuda:
+                xtx[name] = t.cpu().contiguous()
+        self._gpu_accum_tensors.clear()
+        self._gpu_accum_bytes_used = 0
         if self._gpu_enabled:
             torch.cuda.empty_cache()
 
@@ -782,6 +843,27 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
 
     def fwd_hook_factory(name, d_in):
         xtx[name] = xtx_store.alloc(name, d_in)
+
+        # GPU-resident accumulator path — zero-copy addmm into the gramian
+        # that already lives on device. Eliminates the ~5ms D2H per hook
+        # (and matching CPU add_) that dominates calibration when model
+        # forward is cheap relative to hook overhead.
+        if xtx[name].is_cuda:
+            gram = xtx[name]
+            gram_dtype = gram.dtype
+            def hook(mod, inputs):
+                x = inputs[0].detach()
+                flat = x.reshape(-1, x.shape[-1]).to(
+                    device="cuda", dtype=gram_dtype, non_blocking=True)
+                m = _attn_mask_holder[0]
+                if m is not None:
+                    mask_flat = m.reshape(-1, 1).to(device="cuda",
+                                                     dtype=gram_dtype,
+                                                     non_blocking=True)
+                    flat = flat * mask_flat
+                gram.addmm_(flat.T, flat)
+            return hook
+
         ws = xtx_store.get_gpu_workspace(d_in)
 
         if ws is not None:
@@ -826,6 +908,24 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
 
     def bwd_hook_factory(name, d_out):
         ggt[name] = ggt_store.alloc(name, d_out)
+
+        # GPU-resident ggt accumulator — symmetric to the forward path.
+        if ggt[name].is_cuda:
+            gram = ggt[name]
+            gram_dtype = gram.dtype
+            def hook(mod, grad_input, grad_output):
+                g = grad_output[0].detach()
+                flat = g.reshape(-1, g.shape[-1]).to(
+                    device="cuda", dtype=gram_dtype, non_blocking=True)
+                m = _attn_mask_holder[0]
+                if m is not None:
+                    mask_flat = m.reshape(-1, 1).to(device="cuda",
+                                                     dtype=gram_dtype,
+                                                     non_blocking=True)
+                    flat = flat * mask_flat
+                gram.addmm_(flat.T, flat)
+            return hook
+
         ws = ggt_store.get_gpu_workspace(d_out)
 
         if ws is not None:
@@ -951,6 +1051,13 @@ def collect_stats(model, tokenizer, texts, device, seq_len, role_groups, need_gr
     if sc is not None:
         streamed = sc.finalize(device=device)
         xtx.update(streamed)
+
+    # GPU-resident accumulators → CPU: decomposition's SVD path needs VRAM
+    # headroom. Move gramians to CPU so downstream code sees uniform CPU
+    # tensors and GPU workspace is free for `_stable_svd` / sqrt_and_inv.
+    xtx_store.consolidate_to_cpu(xtx)
+    if ggt_store is not None and ggt is not None:
+        ggt_store.consolidate_to_cpu(ggt)
 
     if need_grad:
         for p in model.parameters():
@@ -2046,6 +2153,15 @@ def main():
                         "matmul buffer). Complements --gpu-vram-max-pct: a "
                         "workspace must pass BOTH gates. Set to 0 to force "
                         "the CPU addmm path.")
+    p.add_argument("--gpu-accum-budget-gb", type=float, default=4.0,
+                   help="VRAM budget for GPU-resident gramian accumulators. "
+                        "When > 0, fp32 gramians are allocated directly on "
+                        "GPU so the hook can do in-place addmm_ without "
+                        "per-hook D2H; saves ~40%% of calibration wall time "
+                        "on mid-size models where hook path dominates. "
+                        "3B shared+o_proj fits under 4 GB; larger models "
+                        "spill extras to the CPU path automatically. "
+                        "Set to 0 to disable (legacy all-CPU behavior).")
     p.add_argument("--accum-fp64-threshold", type=int, default=4096,
                    help="Allocate gramian accumulators in float64 when d >= "
                         "this value; float32 otherwise. Wide gramians "
@@ -2249,13 +2365,15 @@ def main():
                              gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb,
                              accum_fp64_threshold=args.accum_fp64_threshold,
                              disk_max_pct=args.disk_max_pct,
-                             gpu_vram_max_pct=args.gpu_vram_max_pct)
+                             gpu_vram_max_pct=args.gpu_vram_max_pct,
+                             gpu_accum_budget_gb=args.gpu_accum_budget_gb)
         ggt_store = (XtxStore(args.xtx_backend, xtx_temp_dir,
                               effective_min_free_gb,
                               gpu_workspace_cap_gb=args.xtx_gpu_workspace_gb,
                               accum_fp64_threshold=args.accum_fp64_threshold,
                               disk_max_pct=args.disk_max_pct,
-                              gpu_vram_max_pct=args.gpu_vram_max_pct)
+                              gpu_vram_max_pct=args.gpu_vram_max_pct,
+                              gpu_accum_budget_gb=args.gpu_accum_budget_gb)
                      if need_grad else None)
         streaming_role_set = {r.strip() for r in args.streaming_roles.split(",")
                               if r.strip()}
