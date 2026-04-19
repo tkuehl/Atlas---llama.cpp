@@ -1,0 +1,25 @@
+{
+  "fixture_version": 1,
+  "description": "Benchmark prompts for comparing base vs factored models. Types are metadata for the comparison report — 'factual' prompts have an 'expected' field for exact-match scoring.",
+  "prompts": [
+    {"id": "fact_cap_germany", "type": "factual", "text": "The capital of Germany is", "expected": "Berlin"},
+    {"id": "fact_cap_japan", "type": "factual", "text": "The capital of Japan is", "expected": "Tokyo"},
+    {"id": "fact_cap_brazil", "type": "factual", "text": "The capital of Brazil is", "expected": "Brasilia"},
+    {"id": "fact_math", "type": "factual", "text": "Seventeen plus twenty-three equals", "expected": "40"},
+    {"id": "fact_year", "type": "factual", "text": "The year the Berlin Wall fell was", "expected": "1989"},
+
+    {"id": "comp_fox", "type": "completion", "text": "The quick brown fox jumps over the"},
+    {"id": "comp_road", "type": "completion", "text": "Two roads diverged in a yellow wood, and"},
+    {"id": "comp_storm", "type": "completion", "text": "It was a dark and stormy night when"},
+
+    {"id": "reason_syllogism", "type": "reasoning", "text": "All mammals are warm-blooded. A whale is a mammal. Therefore, a whale is"},
+    {"id": "reason_inverse", "type": "reasoning", "text": "If it is raining, then the ground is wet. The ground is not wet. Therefore,"},
+    {"id": "reason_arithmetic", "type": "reasoning", "text": "Alice has 3 apples. Bob gives her 5 more apples, then she eats 2. Alice now has"},
+
+    {"id": "code_factorial", "type": "code", "text": "def factorial(n):\n    \"\"\"Return n! using recursion.\"\"\"\n    "},
+    {"id": "code_fizzbuzz", "type": "code", "text": "# Print FizzBuzz for numbers 1 to 15\nfor i in range(1, 16):\n    "},
+
+    {"id": "summary_photosynthesis", "type": "summary", "text": "Photosynthesis is the biological process by which"},
+    {"id": "summary_gravity", "type": "summary", "text": "Gravity is the fundamental force that"}
+  ]
+}
