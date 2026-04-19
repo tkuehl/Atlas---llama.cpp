@@ -713,3 +713,230 @@ judgment remains the final word — the side-by-side markdown from
 - r < 1.0 production compression. Returning to this once generation
   quality at r=1.0 is understood; no point chasing compression when
   the lossless-ish regime already loops.
+
+---
+
+## 2026-04-18 (evening) — quality curve sweep, scale-invariant floor, pivot to streaming runtime
+
+Today's work flipped a major assumption about the scheme. We now have a
+usable quality floor and a clear strategic direction.
+
+### The 0.5B target_ratio sweep
+
+Systematically varied `--target-ratio` on Qwen 2.5 0.5B, all with
+32 calibration samples, no refit. Used the new bench suite for
+automated scoring against the base model.
+
+| r | factored PPL | × baseline | greedy agreement | top-5 overlap | exact-match |
+|---|---|---|---|---|---|
+| 1.0 | 23.02 | 1.88× | **1.1%** | 11.4% | 3/5 |
+| 1.25 | 12.86 | 1.05× | 6.6% | 16.2% | 3/5 |
+| **1.5** | **12.19** | **0.998×** | **50.0%** | **57.9%** | 3/5 |
+| 1.75 | 12.21 | ~1.00× | 61.6% | 71.5% | 3/5 |
+| 2.0 | 12.21 | ~1.00× | 89.6% | 90.7% | 3/5 |
+
+**Two big observations:**
+
+1. **PPL flattens at r ≈ 1.5 but generation quality keeps climbing
+   through r = 2.0.** At r=1.5 the factored model's per-token
+   probability on held-out tokens matches the base, but its *argmax*
+   at a given position still differs from the base on half the
+   prompts. Between r=1.5 and r=2.0 PPL is flat (both match base to
+   three decimal places) while greedy agreement climbs from 50% to
+   90%. This is another concrete demonstration that **PPL is a
+   misleading proxy for generation quality** — it averages token-level
+   likelihood and is blind to shuffling in the tail of the top-k
+   distribution that autoregressive decoding relies on.
+
+2. **r = 1.0 is catastrophically bad** — 1.1% greedy agreement, loops
+   and word salad. It is by far the worst operating point tested —
+   worse than doing nothing (not factoring) AND worse than r=1.5
+   (which is more storage). r=1.0 is the byte-parity point of our
+   `rank_permatrix` formula; its clean number hides the fact that the
+   required truncation cuts eigenvectors the model actually uses.
+
+### The naming reality of `target_ratio`
+
+The `--target-ratio` parameter is literally a **storage multiplier
+relative to dense**, not a compression ratio. Because the factored
+form uses `r × (d_out + d_in)` bytes against dense's `d_out × d_in`,
+setting `rank = target_ratio × d_out·d_in / (d_out + d_in)` gives
+storage = `target_ratio × d_out·d_in`. So:
+
+- `--target-ratio 0.5` → 50% of dense bytes (50% *compression*)
+- `--target-ratio 1.0` → 100% of dense bytes (**no compression**)
+- `--target-ratio 1.5` → **150% of dense bytes (inflation)**
+- `--target-ratio 2.0` → 200% of dense bytes (2× dense)
+
+At r ≥ 1.0 we are no longer compressing — we're representing the same
+information in a factored form that's *larger* than the dense weights.
+Useful for the streaming runtime (see below), useless for the "shrink
+the model" pitch.
+
+### Scale invariance — 3B shows the same floor
+
+Re-ran the sweep point that mattered (r=1.5) on 3B:
+
+| metric | 0.5B r=1.5 | 3B r=1.5 |
+|---|---|---|
+| factored PPL | 12.19 | 7.666 |
+| × baseline | 0.998× | 1.001× |
+| greedy agreement | 50.0% | 45.8% |
+| top-5 overlap | 57.9% | 62.5% |
+
+**Same ~50% greedy agreement floor at r=1.5 across 6× scale
+difference.** The quality curve does not obviously benefit from
+model size. This suggests the required rank multiplier is a property
+of the *scheme* (windowed shared basis + per-matrix for o_proj /
+down_proj) rather than the *model*. Whatever bottlenecks the spectrum
+tail at 0.5B bottlenecks it equally at 3B.
+
+Qualitatively, both 0.5B and 3B at r=1.5 produce coherent text.
+Typical 3B r=1.5 behaviors:
+- `fact_math`: generates the exact same 80-token arithmetic walkthrough
+  as base ("17 + 23 = 40"), token-for-token.
+- `code_factorial`: near-identical Python implementation to base, with
+  one function name diverging ~60 tokens in.
+- `fact_cap_germany`: matches base for 6 tokens ("Berlin. The capital
+  of France is Paris..."), then both continue listing capitals validly
+  (different countries, both correct).
+- `comp_fox`: diverges from base but produces a valid word-counting
+  Python function — different but semantically reasonable.
+
+No loops, no word salad, no factual errors — the failure modes of
+r=1.0 are gone.
+
+### Hypothesis: why the tail eigenvectors matter
+
+The r=1.0 → r=1.5 jump shouldn't change PPL much (it doesn't) but
+does fix generation coherence. The mechanistic read:
+
+- Factored form `W ≈ U · V` at rank r loses the smallest (d - r)
+  singular directions of W (under whatever whitening we apply).
+- At r = d_out·d_in / (d_out + d_in) (i.e. target_ratio=1.0), roughly
+  half the original rank is preserved.
+- **Top eigenvectors** capture the dominant per-token probability mass
+  — keeping them is sufficient for PPL-competitive predictions. This
+  is what the spectrum-weighted SVD prioritizes.
+- **Tail eigenvectors** capture subtle circuits that act as a small
+  perturbation on the main distribution: induction heads, bigram
+  suppression ("don't repeat what you just said"), copy heads, etc.
+  These circuits fire rarely and contribute little to token likelihood
+  in aggregate (hence PPL is tolerant) but they *trigger on specific
+  patterns* during generation — exactly where loops and self-reference
+  happen. Truncating the tail breaks these, and the model goes into
+  repetition because the "don't repeat" signal is gone.
+- At r ≥ 1.5, we're preserving enough of the tail that these circuits
+  survive. At r = 2.0, we reach full rank (for the permatrix roles)
+  and reconstruction is essentially exact.
+
+This predicts that anti-repetition behavior and any "subtle pattern
+matching" capability will be the first thing compression kills, and
+that is precisely what we observe.
+
+### r=1.0 sum-of-σ² rank allocation regresses for the same reason
+
+The per-matrix water-fill allocator (2026-04-17 entry) moves rank
+from down_proj/o_proj to shared gate/up. Under sum-of-σ² at rank k,
+the criterion rewards matrices whose σ_k² is larger — which tends to
+be shared roles because W_stack = cat(W·S_in) has σ²(W_stack) ≈
+n·σ²(W) at similar layers. But **the tail of σ² is what carries the
+anti-repetition circuits,** and sum-of-σ² minimization explicitly
+dismisses the tail. So the allocator trades exactly the wrong thing.
+Confirms from a different angle that quality ≠ reconstruction error
+as the SVD sees it.
+
+### Refit regression at r=1.0, in light of this
+
+The 2026-04-18 refit experiment regressed PPL 12.26 → 21.07 on 3B.
+With the rank-truncation framing: refit tries to re-optimize `V_i`
+given a fixed `B` under balanced weighting, but at r=1.0 the fixed
+rank-r basis `B` already excludes critical tail directions. Refit
+then forces `V_i` to approximate the full weight as well as possible
+through this insufficient basis, amplifying the errors. Refit at
+r < 1.5 is like tightening a bad approximation — makes it more
+efficient at being wrong.
+
+Predicts: refit at r ≥ 1.5 should be neutral or beneficial, not
+catastrophic. Worth testing if we return to it.
+
+### Strategic pivot: streaming runtime is the actual value prop
+
+At r=1.5 we have:
+- **Generation quality usable** (coherent text, ~50% greedy agreement)
+- **PPL lossless** (within 0.002× baseline)
+- **1.5× dense storage** — NOT compression, but a *structured decomposition*
+
+The original "shrink the model" framing was wrong, but a better framing
+is already in the DESIGN.md / Phase 3.4 plan: **memory-hierarchy
+exploitation**. At r=1.5:
+
+- `B` (shared basis): `d_out × r` per window, ~few GB per role on 7B,
+  **resident in fast memory (VRAM)**.
+- `V_i` (per-layer coefficients): `r × d_in` per layer, individually
+  small enough to stream from CPU RAM or NVMe **on demand per token**.
+
+Total bytes grow vs dense, but the **working set during inference**
+shrinks. A 7B model at r=1.5 could run on a 12 GB GPU by keeping
+bases resident and streaming coefficients — something a dense 15 GB
+model can't do at all on that hardware.
+
+**This changes the victory condition.** We stop chasing "factored form
+smaller than dense" and start chasing "factored form runs a model
+bigger than VRAM would otherwise allow." r=1.5 is usable for that
+thesis *today*.
+
+### Hypothesis for larger-model (7B+) behavior
+
+We haven't tested 7B at r=1.5 yet (scheduled next). Prediction based
+on the scale invariance seen so far:
+
+- **PPL**: will be lossless at r=1.5, tracking the trend
+- **Greedy agreement**: will sit around 45-55% — same floor
+- **Qualitative**: coherent generation; loops absent at this ratio
+
+If this prediction holds, 7B r=1.5 becomes the target for the first
+streaming-runtime benchmark. If the curve *does* shift favorably with
+scale (e.g., 7B is clean at r=1.2 or r=1.0), we get actual compression
+as a bonus on top of streaming.
+
+### What's shipping / what's deferred
+
+**Shipped in this direction (runtime hardening, now complete enough
+for the streaming runtime to start):**
+
+- Mathematically-correct factoring pipeline across 0.5B / 3B / 7B
+- Streaming calibration (activation-cache + incremental drain)
+- Streaming factor output (per-layer .pt files + inline materialize)
+- Memory caps (CPU / disk / VRAM percentage)
+- GPU-resident shared accumulators on 3B-scale models
+- Cholesky-skip for rank-deficient wide-d gramians
+- Benchmark suite that measures speed, resources, and quality
+
+**Deferred indefinitely (quality fixes that don't help at our regime):**
+
+- Per-matrix water-fill rank allocation (sum-of-σ² wrong proxy)
+- Refit at r < 1.5 (regresses under the tail-truncation framing)
+- Calibration sample count beyond 32 (tested 128, no generation
+  improvement — confirms noise isn't the bottleneck)
+
+**Quality experiments now downgraded (r=1.5 removed the urgency):**
+
+- Refit with fp32 calibration (only re-test if we revisit r<1.5)
+- Partial refit (down_proj only)
+- ggt diagnostics
+
+### Next action
+
+1. **Run 7B at r=1.5** through factor + bench. Validate the scaling
+   prediction. ~30-40 min.
+2. **If 7B r=1.5 is usable, this becomes the first-ever candidate for
+   actual streaming-runtime testing.** The llama.cpp-side C++ work in
+   `src/llama-model-loader.*` (already partially written per earlier
+   commits) can target this artifact.
+3. **Map the DESIGN.md §3 streaming plan against a concrete 7B r=1.5
+   artifact** — identify what's missing on the runtime side vs what's
+   ready.
+
+The compression-as-primary thesis is dead. The streaming-runtime
+thesis is alive, and today it got its first viable input.
