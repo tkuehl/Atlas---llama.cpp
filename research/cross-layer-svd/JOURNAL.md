@@ -1528,3 +1528,121 @@ collapses to "use llama.cpp mainline + spec decoding."
 
 Files produced: [cross_matrix_svd_test.py](cross_matrix_svd_test.py),
 [shared_basis_test_7b.pkl](shared_basis_test_7b.pkl).
+
+---
+
+## 2026-04-19 — Depth-smoothness hypothesis: also DEAD
+
+Follow-up to the cross-matrix test, asking the "calculus" question:
+are adjacent-layer weight matrices `W_i, W_{i+1}` related smoothly
+(i.e., low-magnitude / low-rank differences) such that a neural-ODE
+/ continuous-depth parameterization could compress the layer stack?
+
+For each role, computed magnitude `||D_i||/||W_i||` and hidden-space
+gramian of the 27 adjacent-layer differences (`depth_smoothness_test.py`).
+
+### Result
+
+| role | ‖D‖/‖W‖ | energy ratio | per-mat ER | diff ER | ratio |
+|---|---|---|---|---|---|
+| k_proj | 1.41 | 1.91 | 268 | 1484 | **5.5×** |
+| v_proj | 1.42 | 1.91 | 410 | 2091 | 5.1× |
+| q_proj | 1.41 | 1.92 | 866 | 2792 | 3.2× |
+| o_proj | 1.42 | 1.93 | 1088 | 2694 | 2.5× |
+| gate_proj | 1.41 | 1.92 | 1750 | 3212 | 1.8× |
+| down_proj | 1.42 | 1.94 | 2445 | 3297 | 1.3× |
+| up_proj | 1.42 | 1.94 | 2550 | 3408 | 1.3× |
+
+### Interpretation
+
+**‖D‖/‖W‖ ≈ 1.414 = √2 for every role.** The signature of `W_{i+1}`
+and `W_i` being *uncorrelated random matrices of similar norm*:
+
+`‖W_{i+1} − W_i‖² = ‖W_{i+1}‖² + ‖W_i‖² − 2⟨W_{i+1}, W_i⟩`
+
+Independence ⇒ cross-term ≈ 0 ⇒ ratio = √2. Observed exactly.
+
+**Diff effective rank is LARGER than per-matrix ER.** Differences
+span more directions than the matrices themselves, not fewer. Depth-
+continuous parameterization would need differences compact; they're
+the opposite.
+
+### Reconciling with the prior cross-matrix test
+
+The cross-matrix test found k_proj highly shared (28 matrices stack
+to ER=1580 vs single ER=1333, i.e., ~85% shared subspace). This
+depth test says differences span 5.5× the single-matrix rank — looks
+like a contradiction but isn't.
+
+Resolution: all 28 k_proj matrices live in (roughly) the same
+overlapping ~1500-dim hidden-space subspace, but **within that
+subspace they move independently between layers**. The "cone" of
+attention-relevant directions is shared; the specific orientations
+inside it are drawn independently. Each layer's k_proj is a
+different sample from a shared distribution, not a smooth step along
+a common trajectory.
+
+### Implications
+
+- **Neural-ODE / continuous-depth parameterization is dead** for
+  post-training compression on this model family. No training-free
+  way to exploit "smooth depth evolution" because there is none.
+- **Layer merging / looped transformer** also dead — reusing layer
+  weights would catastrophically change the sampled point within the
+  shared subspace.
+- **Mixture-of-Depths / early-exit** would need retraining to work.
+- **Distillation** (training a smaller student) is the only known
+  path to trade this structure for compression.
+
+Files: [depth_smoothness_test.py](depth_smoothness_test.py),
+[depth_smoothness_7b.pkl](depth_smoothness_7b.pkl).
+
+---
+
+## Research-track synthesis (end of 2026-04-19)
+
+Four consecutive experiments, all negative for post-training
+compression beyond llama.cpp mainline K-quants:
+
+| # | hypothesis | gate | result |
+|---|---|---|---|
+| 1 | Cloudflare on-chip producer/consumer kernel port | helps batch=1 | MMVQ already optimal; only helps batch≥2 |
+| 2 | CALDERA Q+rank beats pure K-quants at matched bpw | Σ-rel-err win | K-quants win at every tier |
+| 3 | Cross-matrix shared hidden-space structure | top-1024 ≥90% of stacked energy | 38% (matrices anti-aligned) |
+| 4 | Depth smoothness / cross-layer weight evolution | ‖D‖/‖W‖ < 0.5, diff ER ≪ matrix ER | √2, diff ER > matrix ER |
+
+Pattern: each experiment attacked a different "where is there
+structure to exploit?" question. Four answers, all "nowhere that
+training hasn't already arranged to be exploited." The through-line
+is that **trained transformer weights are dense, anti-aligned, and
+layer-independent — the quant format that works on one matrix at a
+time with local super-block scales is essentially the right
+structural fit.** K-quants are not a weak target; they're close to
+the post-training compression ceiling given these structural
+properties.
+
+### What remains productive (none of it is post-training weight
+compression)
+
+1. **Speculative decoding.** Amortize big-model forward over k
+   drafted tokens. 2–5× effective tok/s. Requires no custom code —
+   `llama-cli --draft-model`. Already in CALDERA pivot plan as Stage 4.
+2. **KV cache compression.** Weights are fixed but KV cache grows
+   with context; at long context it's often bigger than weights.
+   This research track hasn't touched KV cache at all. Separate axis
+   from everything above.
+3. **Retraining-allowed compression.** Distillation, QAT, pruning+
+   distillation. Out of scope for the post-training-only constraint
+   that defined this research track.
+4. **Accept Q4_K_M + partial offload + spec decode as the answer.**
+   Pragmatic. ~30-40 tok/s on 7B in VRAM, ~5-10 tok/s on 30 GB
+   models with spec decode, bounded by PCIe physics not software.
+
+### Recommendation
+
+Archive the post-training-weight-compression research track. The
+negative results are collectively strong enough to conclude that
+K-quants + spec decoding is the near-optimum operating point for a
+5070-class consumer card. If the goal is "run bigger models
+interactively," either buy more VRAM (5090) or loosen the post-
+training constraint (distillation).
