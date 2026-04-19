@@ -22,6 +22,7 @@ pipeline integration lives in basis_sharing.py (next step).
 from __future__ import annotations
 
 import argparse
+import ctypes
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +33,7 @@ import torch
 # gguf-py lives alongside this research dir at repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "gguf-py"))
-from gguf.constants import GGMLQuantizationType  # noqa: E402
+from gguf.constants import GGMLQuantizationType, GGML_QUANT_SIZES  # noqa: E402
 from gguf import quants as gguf_quants  # noqa: E402
 
 from basis_sharing import _stable_svd, sqrt_and_inv  # noqa: E402
@@ -40,27 +41,115 @@ from basis_sharing import _stable_svd, sqrt_and_inv  # noqa: E402
 
 _QTYPE_BY_NAME = {
     "Q4_0": GGMLQuantizationType.Q4_0,
+    "Q4_1": GGMLQuantizationType.Q4_1,
     "Q4_K": GGMLQuantizationType.Q4_K,
     "Q3_K": GGMLQuantizationType.Q3_K,
+    "Q2_K": GGMLQuantizationType.Q2_K,
+    "Q5_K": GGMLQuantizationType.Q5_K,
+    "Q6_K": GGMLQuantizationType.Q6_K,
+    "Q5_0": GGMLQuantizationType.Q5_0,
     "Q8_0": GGMLQuantizationType.Q8_0,
 }
 
+# qtypes with a working Python quantizer in gguf-py (skip the C fallback).
+_PY_QUANT_OK = {"Q4_0", "Q4_1", "Q5_0", "Q8_0"}
 
-# ---------- quant round-trip ----------
+
+# ---------- ctypes wrapper for ggml_quantize_chunk ----------
+#
+# The K-family quantizers aren't implemented in pure Python (gguf-py only
+# ships Q*_0/Q*_1 and Q8_0). Rather than reimplement them or drive the
+# full `llama-quantize` CLI (which insists on LLaMA-model metadata),
+# we call `ggml_quantize_chunk` directly from the built ggml-base.dll —
+# same C kernel that powers llama.cpp's production quantization.
+
+_GGML_DLL_CANDIDATES = [
+    _REPO_ROOT / "build-cuda" / "bin" / "ggml-base.dll",
+]
+
+
+def _load_ggml_lib() -> ctypes.CDLL:
+    """Locate and load ggml-base.dll. Cached on the function attribute."""
+    if getattr(_load_ggml_lib, "_lib", None) is not None:
+        return _load_ggml_lib._lib
+    for path in _GGML_DLL_CANDIDATES:
+        if path.exists():
+            # Add the directory to the DLL search path so dependent libraries
+            # (e.g. ggml-cpu.dll, ggml-cuda.dll) resolve.
+            import os
+            os.add_dll_directory(str(path.parent))
+            lib = ctypes.CDLL(str(path))
+            # size_t ggml_quantize_chunk(
+            #     enum ggml_type, const float*, void*,
+            #     int64_t start, int64_t nrows, int64_t n_per_row,
+            #     const float* imatrix);
+            lib.ggml_quantize_chunk.argtypes = [
+                ctypes.c_int, ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.POINTER(ctypes.c_float),
+            ]
+            lib.ggml_quantize_chunk.restype = ctypes.c_size_t
+            _load_ggml_lib._lib = lib
+            return lib
+    raise RuntimeError(
+        "ggml-base.dll not found in any of: "
+        + ", ".join(str(p) for p in _GGML_DLL_CANDIDATES)
+        + ". Build the fork via build-cuda-compile.bat first.")
+
+
+def _quantize_via_ggml(W_np: np.ndarray, qtype: GGMLQuantizationType) -> bytes:
+    """Quantize a 2-D F32 array via `ggml_quantize_chunk`. Returns packed
+    blob bytes ready for gguf_quants.dequantize. No imatrix (pure RTN)."""
+    assert W_np.ndim == 2, "expected 2-D weight matrix"
+    assert W_np.dtype == np.float32
+    nrows, n_per_row = W_np.shape
+    block_size, bytes_per_block = GGML_QUANT_SIZES[qtype]
+    if n_per_row % block_size != 0:
+        raise ValueError(
+            f"n_per_row={n_per_row} is not a multiple of the block size "
+            f"{block_size} for {qtype.name}.")
+    bytes_per_row = (n_per_row // block_size) * bytes_per_block
+    out = np.empty(nrows * bytes_per_row, dtype=np.uint8)
+
+    lib = _load_ggml_lib()
+    src_ptr = W_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    dst_ptr = out.ctypes.data_as(ctypes.c_void_p)
+    written = lib.ggml_quantize_chunk(
+        int(qtype.value), src_ptr, dst_ptr,
+        0, int(nrows), int(n_per_row), None,
+    )
+    if written != nrows * bytes_per_row:
+        raise RuntimeError(
+            f"ggml_quantize_chunk wrote {written} bytes; expected "
+            f"{nrows * bytes_per_row} for {qtype.name}.")
+    return out
+
 
 def _quantize_roundtrip(W: torch.Tensor, qtype: GGMLQuantizationType):
-    """Run a weight through gguf-py quantize+dequantize. Returns (Q_bytes, W_hat)
-    where Q_bytes is the packed quantized blob (uint8 ndarray, GGUF-ready) and
-    W_hat is the reconstructed fp32 tensor on W's original device.
+    """Run a weight through quantize+dequantize. Returns (Q_bytes, W_hat)
+    where Q_bytes is the packed quantized blob and W_hat is the reconstructed
+    fp32 tensor on W's original device.
 
-    The last dim of W must be a multiple of the quant block size (always the
-    case for transformer matrices: hidden, intermediate are both 256-aligned
-    for Q*_K, 32-aligned for Q*_0).
+    Fast path (Q4_0, Q4_1, Q5_0, Q8_0): pure gguf-py Python.
+    Fallback (K-quants and anything else): ctypes -> ggml_quantize_chunk.
     """
     dev = W.device
     W_np = W.detach().to(torch.float32).cpu().numpy()
-    Q_bytes = gguf_quants.quantize(W_np, qtype)
-    W_hat_np = gguf_quants.dequantize(Q_bytes, qtype)
+    # Ensure C-contiguous f32 for ctypes.
+    if not W_np.flags["C_CONTIGUOUS"]:
+        W_np = np.ascontiguousarray(W_np)
+
+    if qtype.name in _PY_QUANT_OK:
+        Q_bytes = gguf_quants.quantize(W_np, qtype)
+    else:
+        Q_bytes = _quantize_via_ggml(W_np, qtype)
+
+    W_hat_np = gguf_quants.dequantize(
+        np.frombuffer(Q_bytes, dtype=np.uint8)
+        if isinstance(Q_bytes, (bytes, bytearray))
+        else Q_bytes,
+        qtype,
+    ).reshape(W_np.shape)
     W_hat = torch.from_numpy(W_hat_np.astype(np.float32, copy=False)).to(dev)
     return Q_bytes, W_hat
 

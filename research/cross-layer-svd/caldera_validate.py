@@ -26,6 +26,8 @@ from pathlib import Path
 
 import torch
 
+from gguf.constants import GGML_QUANT_SIZES  # noqa: E402
+
 from basis_sharing import sqrt_and_inv  # noqa: E402
 from caldera import (  # noqa: E402
     _QTYPE_BY_NAME,
@@ -34,16 +36,17 @@ from caldera import (  # noqa: E402
     caldera_decompose,
 )
 
-# Bits per stored weight for GGUF quant formats (block overhead included)
-_QTYPE_BPW = {
-    "Q4_0": 4.5,   # 4-bit codes + fp16 scale per 32-weight block
-    "Q8_0": 8.5,   # 8-bit codes + fp16 scale per 32-weight block
-}
+
+def qtype_bpw(qtype_name: str) -> float:
+    """bits-per-weight for a GGUF qtype, computed from its block size table."""
+    qt = _QTYPE_BY_NAME[qtype_name]
+    block_size, bytes_per_block = GGML_QUANT_SIZES[qt]
+    return bytes_per_block * 8.0 / block_size
 
 
 def effective_bpw(qtype_name: str, rank: int, d_out: int, d_in: int) -> float:
     """bpw of quantized W plus fp16 L·R overhead per weight."""
-    base = _QTYPE_BPW[qtype_name]
+    base = qtype_bpw(qtype_name)
     lr_bits = 2 * rank * (d_out + d_in) * 16 / (d_out * d_in)
     return base + lr_bits
 
@@ -51,8 +54,8 @@ def effective_bpw(qtype_name: str, rank: int, d_out: int, d_in: int) -> float:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--snapshot", default="balanced_snapshot.pkl")
-    p.add_argument("--ranks", default="32,64,128,256")
-    p.add_argument("--qtypes", default="Q4_0,Q8_0")
+    p.add_argument("--ranks", default="32,64,128,256,512")
+    p.add_argument("--qtypes", default="Q2_K,Q3_K,Q4_K,Q5_K,Q8_0")
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default=None)
@@ -87,7 +90,7 @@ def main():
     for qt in qtypes:
         q = _QTYPE_BY_NAME[qt]
         err = _baseline_quant(W, Sigma, q)
-        bpw = _QTYPE_BPW[qt]
+        bpw = qtype_bpw(qt)
         print(f"{qt:<8} {err:>8.4f} {bpw:>6.2f}")
         result["rows"].append({"method": "pure_quant", "qtype": qt,
                                "rank": None, "err": err, "bpw": bpw})

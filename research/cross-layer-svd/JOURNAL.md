@@ -1316,3 +1316,111 @@ have real work.
 - Evaluate on more than one role: gate_proj, down_proj, o_proj are
   the three roles with different activation spectra (permatrix roles
   vs shared roles in the old factored nomenclature).
+
+---
+
+## 2026-04-19 — CALDERA Stage 2: K-quant sweep and an honest finding
+
+**TL;DR:** Stage 2 infra is built and working (ctypes into `ggml-base.dll`'s
+`ggml_quantize_chunk`, all K-quants accessible). Ran the full sweep on
+7B `mlp.gate_proj` L12. Result: **pure K-quants beat CALDERA at matched
+bpw across every tier.** CALDERA's per-qtype improvement ratio is
+remarkably stable (~21% at r=32, ~55% at r=512), but it's not enough to
+close the gap to pure Q(N+1)_K at the same bit budget. Stage 2 findings
+reshape the value-prop question for CALDERA.
+
+### Infra built this stage
+
+- **`llama-quantize` build target added** to the fork build
+  (`build-cuda-quantize.bat`). Works end-to-end but required full
+  LLaMA architecture metadata on the input GGUF — not useful for our
+  single-tensor flow.
+- **Pivoted to ctypes → `ggml_quantize_chunk`** against the built
+  `build-cuda/bin/ggml-base.dll`. Same C kernel that powers llama.cpp's
+  production quantization path; no GGUF metadata gymnastics, no
+  subprocess spawn overhead, works for every GGML quant type.
+- **`_quantize_roundtrip` updated** to route non-Python qtypes through
+  the ctypes path. Drop-in replacement; all existing validation still
+  works. Verified round-trip correctness on Q2_K / Q3_K / Q4_K / Q5_K
+  / Q6_K / Q8_0 with expected bpw (2.62 / 3.44 / 4.50 / 5.50 / 6.56 /
+  8.50).
+- **`caldera_validate.py` updated**: K-quants in default qtypes; ranks
+  extended through r=512; bpw computed from `GGML_QUANT_SIZES` rather
+  than hardcoded.
+
+### Result on 7B `mlp.gate_proj` L12
+
+Improvement-ratio consistency across qtypes at matched rank is striking:
+
+| qtype | pure err | r=32 | r=64 | r=128 | r=256 | r=512 |
+|---|---|---|---|---|---|---|
+| Q2_K (2.62 bpw) | 0.1881 | −20.6% | −25.7% | −32.9% | −42.3% | −54.7% |
+| Q3_K (3.44 bpw) | 0.0959 | −20.6% | −26.0% | −33.2% | −42.8% | −55.4% |
+| Q4_K (4.50 bpw) | 0.0456 | −20.8% | −26.0% | −33.0% | −42.2% | −54.4% |
+| Q5_K (5.50 bpw) | 0.0231 | −20.6% | −25.8% | −32.7% | −41.9% | −54.1% |
+| Q8_0 (8.50 bpw) | 0.0035 | −20.7% | −26.1% | −33.3% | −42.9% | −55.4% |
+
+CALDERA adds a rank-dependent multiplicative factor (~0.79×, 0.74×,
+0.67×, 0.58×, 0.45× for r=32, 64, 128, 256, 512) that's independent of
+the quant tier. The LR correction "removes roughly half of whatever
+quant error it's starting from" given enough rank.
+
+### The matched-bpw comparison is where it gets honest
+
+| bpw target | best pure quant | err | best CALDERA | err |
+|---|---|---|---|---|
+| ~2.6 | Q2_K | 0.188 | — | — |
+| ~3.4 | **Q3_K** | **0.096** | Q2_K r=64 | 0.139 |
+| ~4.5 | **Q4_K** | **0.046** | Q3_K r=64 | 0.071 |
+| ~5.5 | **Q5_K** | **0.023** | Q4_K r=64 | 0.034 |
+| ~8.5 | **Q8_0** | **0.0035** | Q5_K r=256 | 0.0134 |
+
+At *every* bpw tier, "spend the bit budget on a higher-tier K-quant"
+beats "spend it on L·R correction on top of a lower-tier K-quant" on
+Σ-weighted rel-err. Pure K-quants are very well tuned — they already
+capture a lot of what CALDERA's per-matrix LR is trying to add, via
+their super-block + hierarchical-scale structure.
+
+### Why earlier Stage 1 results looked so much better
+
+Stage 1 compared CALDERA against **Q4_0** (32-weight block, single
+fp16 scale) — a much weaker quantizer than Q4_K. CALDERA's 21–68%
+improvement over Q4_0 doesn't translate to a win against Q4_K because
+Q4_K itself is already ~55% better than Q4_0 at the same bpw.
+
+### What this doesn't yet rule out
+
+1. **Full-model PPL and greedy agreement.** Σ-weighted rel-err on one
+   matrix is a proxy. The ordering might invert on downstream
+   generation quality if CALDERA's activation-weighted correction
+   lands on eigendirections that matter disproportionately for
+   autoregressive decode. K-quants optimize element-wise / block-
+   local error, not Σ-weighted. Worth one end-to-end test.
+2. **Importance-matrix quantization.** The K-quants we compared
+   against here are RTN (round-to-nearest) without imatrix. Production
+   GGUFs typically use imatrix to bias the quantization toward
+   activation-important channels. imatrix-K-quants would likely
+   *widen* the gap against CALDERA.
+3. **Cross-matrix dictionary sharing.** Orthogonal — a global
+   codebook shared across all 252 linears (the
+   `project_unweight_research.md` thesis) is a fundamentally different
+   attack and still untested.
+
+### Updated position on CALDERA
+
+CALDERA's value-prop of "rank correction on top of low-bit quant" is
+not winning the matched-bpw game against K-quants. Three plausible
+next moves, in priority order:
+
+1. **End-to-end PPL + greedy-agreement test** on a single sweep point
+   (CALDERA Q3_K r=128 on full Qwen 2.5 7B) vs pure Q4_K and pure
+   Q3_K. Cost: 1 day to build, 1 hr to run. If CALDERA wins on PPL
+   at matched bpw — even when losing Σ-rel-err — the value-prop holds
+   on a different axis.
+2. **Pivot primary track to the cross-matrix codebook research bet**
+   (`project_unweight_research.md`). CALDERA is a reasonable
+   per-matrix refinement but isn't a novelty moonshot; the global
+   codebook angle is.
+3. **Archive CALDERA and run plain Q4_K_M + spec decode** for the
+   interactive-tok/s problem. Pragmatic. Nothing novel to write about
+   but gets the best fast path on the 5070 today.
