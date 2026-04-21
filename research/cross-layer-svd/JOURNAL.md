@@ -2710,6 +2710,101 @@ baseline (0.39× captured) to score QAT's contribution against.
 
 ---
 
+## 2026-04-21 — Eval on the saved checkpoint: the PPL win was mostly illusory
+
+Re-ran the full-model QAT (run 2) with checkpointing enabled, got
+bit-identical trajectory to run 1 (PPL 54.8 final). Then ran
+`littlebit_eval.py` against the saved 1.52 GB checkpoint. Three
+findings, each substantially revising what yesterday's entry
+claimed. Full writeup in
+[littlebit_math.md §15](littlebit_math.md#15-post-eval-revision-2026-04-21-the-ppl-win-was-mostly-illusory).
+
+**1. Full-test PPL is much worse than training-eval PPL.** The
+training used a 25k-token cap for speed. Full wikitext-2 test is
+250k tokens. Teacher barely moves (16.4 → 17.3). Student jumps 52%
+(54.8 → 83.3). At PPL 83, the archived FP-SVD floor of 86 is beaten
+by only 3% — within measurement noise. The "36% win over the FP-SVD
+floor" was mostly an eval-set-size artifact.
+
+**2. Per-layer hidden-state rel-err is 1.05 (mean), 1.43 (worst)**
+across all 24 decoder layers. Capturing only 3.6% of teacher's
+hidden-state energy. The §13 single-matrix prediction (per-layer
+rel-err ~0.3 with activation-weighted training) did NOT compose
+through the full model under KL-only loss. The student developed
+a completely different internal representation; KL only
+constrained *outputs*, so hidden states were free to drift.
+
+**3. Autoregressive generation is completely degenerate.** Sample:
+
+```
+prompt:  "The capital of France is"
+teacher: " Paris. It is the largest city in Europe..."
+student: " a 1000 m race, 1000 m. 1000 m 100 m 100 m..."
+
+prompt:  "Once upon a time,"
+teacher: " there was a little girl named Lily..."
+student: " $ 100,0. 100000000000000000000000..."
+
+prompt:  "Q: What's 7 times 8?\nA:"
+teacher: " 56"
+student: " 1000000000000000..."
+```
+
+Every prompt collapses into digit-repetition within 5 tokens. The
+trained model is **not usable as a language model** despite its
+respectable-looking PPL.
+
+**Why PPL looks OK but generation is broken.** PPL measures one-step
+conditional probability with real-text prefix. Generation feeds
+the student its own drifted outputs back as prefix; errors compound
+via exposure bias. Combined with §15.2's diverged hidden states,
+autoregressive dynamics collapse into degenerate attractors within
+2-3 tokens.
+
+**Revised conclusion.** Qwen 2.5 0.5B under KL-only LittleBit QAT
+matches the archived FP-SVD floor in PPL but is functionally broken
+as a generative LM. Clean empirical demonstration that **PPL is not
+sufficient as a quality proxy for sub-1-BPW compressed LMs**. Strong
+indication that the paper's intermediate-MSE loss (λ=10) is
+load-bearing, not optional — it would force the hidden-state
+alignment our recipe left unconstrained.
+
+**Priority updates to `littlebit_enhancements.md`:**
+- Intermediate-MSE promoted from #2 ("accuracy upside") to #1
+  (correctness prerequisite, not optional).
+- Next training run must include `--inter-mse-weight 10` from step 1.
+
+**Next action.** Re-run with intermediate-MSE enabled. Same
+hyperparameters otherwise. If generation becomes coherent and PPL
+stays in the 50-80 range, the MSE term is confirmed load-bearing.
+If PPL stays around 54 but generation also stays broken, the
+failure mode is deeper than just the loss function.
+
+What's NOT revised:
+- Paper's math (Prop. 1, Dual-SVID mechanics) remains verified
+- §12 structural constants (discard ~0.61, sep ~0.63 scale-invariant)
+  unchanged
+- The compression format itself at r=512 still has the capacity we
+  measured in §13 on single matrices — the composition failure is
+  about training dynamics, not format capacity
+- Infrastructure (checkpointing, init-cache, eval harness) works
+  correctly — it's what let us discover this failure
+
+Shipped:
+  - `littlebit_qat_model_run2.json` — bit-identical reproduction of
+    run 1's trajectory
+  - `littlebit_qat_checkpoint_r512.pt` — 1.52 GB, gitignored, the
+    first real artifact of the training line
+  - `littlebit_qat_init_qwen05b_r512.pt` — Dual-SVID init cache,
+    gitignored, saves 5 min per future rerun
+  - `littlebit_eval_r512.json` — full evaluation output including
+    generation samples showing the degeneracy
+  - `littlebit_math.md §15` — post-eval revision with per-layer
+    drift numbers, generation samples, revised conclusions
+  - `JOURNAL.md` (this entry)
+
+---
+
 ## 2026-04-21 — Single-matrix QAT: format works under activation-weighted loss, not Frobenius
 
 Ran three local QAT experiments on Qwen 0.5B gate_proj L12 at r=512

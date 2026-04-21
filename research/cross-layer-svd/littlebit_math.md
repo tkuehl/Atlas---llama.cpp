@@ -982,10 +982,172 @@ Scaling path stays fully local. At each step the PPL-vs-floor
 margin is a direct measurement of whether the paper's approach
 generalizes down to consumer-scale models on consumer hardware.
 
-### 14.7 One-sentence summary
+### 14.7 One-sentence summary (PRE-EVAL — revised below)
 
 **On Qwen 2.5 0.5B, 36 minutes of KL-only QAT on a laptop GPU
 drives the LittleBit-wrapped model's wikitext-2 PPL from 391,596
 (Dual-SVID init) to 54.8 — a 36% improvement over our archived
 post-training FP-SVD floor at matched rank, and enough to validate
 pushing the reproduction up the scale ladder toward 7B locally.**
+
+---
+
+## 15. Post-eval revision (2026-04-21): the PPL win was mostly illusory
+
+After saving a checkpoint and running the full evaluator
+([`littlebit_eval.py`](littlebit_eval.py)) against the actual model,
+three pieces of evidence *combined* say the §14 claim overstated the
+result:
+
+### 15.1 Full-test PPL is much worse than training-eval PPL
+
+| Eval | Tokens | Teacher | Student | Gap |
+|---|---:|---:|---:|---:|
+| Training-time (capped) | 25,000 | 16.4 | 54.8 | 3.3× |
+| Full test (250,000 tok cap) | 250,000 | 17.3 | 83.3 | 4.8× |
+
+Teacher barely moves (16.4 → 17.3, 5.5% up). **Student jumps 52%**
+(54.8 → 83.3). The training-eval was sampling an easier subset —
+probably the first 25k tokens, where the student's distribution
+happens to cover best.
+
+At the real PPL 83.3, the archived FP-SVD floor of 86 is beaten
+by only 3% — well within measurement noise. **The "36% win" was
+mostly an eval-set-size artifact.**
+
+### 15.2 Per-layer hidden-state rel-err is catastrophic
+
+Ran `littlebit_eval.py`'s activation-drift check across all 24
+decoder layers on 4096 calibration tokens:
+
+- Mean per-layer rel-err: **1.05**
+- Worst layer: **1.43**
+- Mean captured: **0.036** (i.e., 3.6% of teacher's hidden-state energy)
+
+A value of 1.0 means the student's hidden state has the *same
+Frobenius norm as the teacher's, but points in a completely
+different direction*. 1.43 means the difference vector is larger
+than the teacher's hidden state itself.
+
+**The §13 single-matrix prediction (per-layer rel-err 0.31) did
+NOT compose** through the full model. Locally, activation-weighted
+QAT recovered 91% of per-layer activation energy; at model scale
+with compounding across 24 layers, we retained only 3.6%.
+
+Interpretation: KL distillation only constrains *output* logits at
+each position. The student was free to develop a completely
+different internal representation as long as the final `lm_head`
+maps its hidden state back to teacher-like logits — which it
+evidently did.
+
+### 15.3 Autoregressive generation is completely degenerate
+
+The student fails immediately on every prompt. From
+`littlebit_eval_r512.json`:
+
+| Prompt | Teacher output | Student output |
+|---|---|---|
+| `"The capital of France is"` | " Paris. It is the largest city in Europe..." | " a 1000 m race, 1000 m. 1000 m 100 m..." |
+| `"Once upon a time,"` | " there was a little girl named Lily..." | " $ 100,0. 100000000000000000000000..." |
+| `"def fibonacci(n):"` | correct Python definition | " 1000000000000000000000000..." |
+| `"Q: What's 7 times 8?\nA:"` | " 56" | " 10000000000000000000000..." |
+
+Every prompt collapses into digit-repetition within ~5 tokens.
+**The trained model is not usable as a language model** despite
+the respectable PPL number.
+
+### 15.4 Why PPL looks OK but generation is broken
+
+PPL measures `p(next_token | teacher-given prefix)` — one-step
+conditional, with the prefix always being real text from the test
+corpus. As long as the student's *marginal* next-token distribution
+matches roughly at each real-text prefix, PPL stays reasonable.
+
+Generation is different: the student conditions on its *own*
+previous outputs. Once it emits a slightly off-distribution token
+at step t, the prefix at step t+1 is no longer "real text"; it's
+"real text + student's drift". Errors compound autoregressively.
+Within 2-3 steps the student is conditioning on something it's
+never seen during distillation training, and collapses into
+degenerate attractors (runs of high-frequency tokens like "0").
+
+This is the classic **exposure bias** problem in distilled LMs,
+plus the LittleBit-specific issue that the student's hidden-state
+geometry is so dissimilar to the teacher's (§15.2) that small
+logit errors compound much faster than they would in a normally-
+trained model.
+
+### 15.5 Revised conclusion
+
+The prior §14 summary is superseded.  The honest version:
+
+> Qwen 2.5 0.5B under KL-only LittleBit QAT at r=512 for 8000 steps
+> produces a model that matches the archived FP-SVD floor in PPL
+> (83 vs 86) but is functionally broken as a generative LM.
+> Internal hidden states diverge catastrophically from teacher
+> (rel-err 1.05), and autoregressive generation collapses into
+> degenerate token loops within 5 steps regardless of prompt.
+
+Three implications:
+
+1. **PPL is an insufficient metric for compressed-model quality.**
+   The paper's reported PPL numbers may also obscure degenerate
+   generation behavior — we'd need to test their checkpoints
+   directly to know (and they haven't released any).
+2. **Intermediate-MSE (paper's λ=10) is almost certainly
+   essential**, not optional. It forces hidden-state alignment,
+   which preserves autoregressive coherence in ways KL alone
+   cannot. The next iteration must include it.
+3. **Zero-shot task accuracy is a much more reliable quality
+   signal**. Paper reports 47% mean accuracy at 0.55 BPW on 7
+   benchmarks — which shows real quality degradation honestly.
+   Our student would likely score near-random (~25-35%) on the
+   same benchmarks.
+
+### 15.6 What to do next
+
+The clean path forward:
+
+1. **Re-run with `--inter-mse-weight 10`** (paper's recipe). Same
+   hyperparameters otherwise. If this produces coherent generation
+   at comparable PPL, the intermediate-MSE is confirmed as the
+   load-bearing piece. Takes ~50 min (a bit more than KL-only since
+   stored hidden states add compute).
+2. **Extend eval to a zero-shot task** (PIQA is smallest). If the
+   intermediate-MSE run scores meaningfully above random on PIQA,
+   we have a functional compressed model, not just a good-PPL
+   mirage.
+3. **Only after (1) and (2) succeed**: scale up to 1.5B / 3B / 7B.
+   Running the scaling ladder on a broken training recipe wastes
+   compute.
+
+The enhancement catalog in
+[`littlebit_enhancements.md`](littlebit_enhancements.md) already
+ranks intermediate-MSE as #2. Promoting it to #1 (load-bearing
+for correctness, not just accuracy).
+
+### 15.7 Confirmation of what is *still* established
+
+Not everything needs retraction:
+
+- **Math is still correct.** Prop. 1 exact, Dual-SVID mechanics
+  work, bit budget scales as documented.
+- **Compression itself works.** At r=512 the storage-level
+  representation is what we claimed (~0.7 BPW equivalent for
+  Qwen 0.5B).
+- **Dual-SVID is a bad init.** §12 findings unchanged — discard
+  fraction ~0.61 regardless of rank, scale, or shape.
+- **KL-only QAT does move PPL.** From 391k (broken) to 83 (almost
+  par with FP-SVD floor). Real, just not the whole story.
+- **The pipeline infrastructure (checkpointing, init-cache,
+  eval script) is solid** — it's how we discovered this failure.
+  That's value.
+
+### 15.8 One-sentence revised summary
+
+**Our KL-only LittleBit QAT on Qwen 2.5 0.5B produces a model whose
+PPL is comparable to post-training FP-SVD but whose autoregressive
+generation is broken — a clean empirical demonstration that PPL is
+not sufficient as a quality proxy for sub-1-BPW compressed LMs, and
+a strong indication that the paper's intermediate-MSE loss is
+load-bearing, not optional.**

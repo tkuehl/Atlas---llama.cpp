@@ -1,0 +1,177 @@
+{
+  "checkpoint": "littlebit_qat_checkpoint_r512.pt",
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "rank": 512,
+    "tau": 100.0,
+    "steps": 8000,
+    "seq_len": 512,
+    "wrapped_layers": 168
+  },
+  "training_summary": {
+    "teacher_ppl": 16.392793375785796,
+    "init_ppl": 391596.3963838121,
+    "final_ppl": 54.80856753213711,
+    "best_ppl": 54.80856753213711,
+    "best_step": 8000
+  },
+  "wikitext2_full": {
+    "teacher_ppl": 17.299124320438946,
+    "student_ppl": 83.30389268051216,
+    "seq_len": 512,
+    "max_tokens": 250000
+  },
+  "activation_drift": {
+    "per_layer": [
+      {
+        "layer": 0,
+        "rel_err": 1.4334490299224854,
+        "captured": 0.0
+      },
+      {
+        "layer": 1,
+        "rel_err": 1.4025014638900757,
+        "captured": 0.0
+      },
+      {
+        "layer": 2,
+        "rel_err": 1.056120753288269,
+        "captured": 0.0
+      },
+      {
+        "layer": 3,
+        "rel_err": 1.0170607566833496,
+        "captured": 0.0
+      },
+      {
+        "layer": 4,
+        "rel_err": 1.0211607217788696,
+        "captured": 0.0
+      },
+      {
+        "layer": 5,
+        "rel_err": 1.0250855684280396,
+        "captured": 0.0
+      },
+      {
+        "layer": 6,
+        "rel_err": 1.0279810428619385,
+        "captured": 0.0
+      },
+      {
+        "layer": 7,
+        "rel_err": 1.032535433769226,
+        "captured": 0.0
+      },
+      {
+        "layer": 8,
+        "rel_err": 1.0383620262145996,
+        "captured": 0.0
+      },
+      {
+        "layer": 9,
+        "rel_err": 1.0456610918045044,
+        "captured": 0.0
+      },
+      {
+        "layer": 10,
+        "rel_err": 1.0509181022644043,
+        "captured": 0.0
+      },
+      {
+        "layer": 11,
+        "rel_err": 1.0663670301437378,
+        "captured": 0.0
+      },
+      {
+        "layer": 12,
+        "rel_err": 1.0707099437713623,
+        "captured": 0.0
+      },
+      {
+        "layer": 13,
+        "rel_err": 1.0776320695877075,
+        "captured": 0.0
+      },
+      {
+        "layer": 14,
+        "rel_err": 1.0797439813613892,
+        "captured": 0.0
+      },
+      {
+        "layer": 15,
+        "rel_err": 1.077785849571228,
+        "captured": 0.0
+      },
+      {
+        "layer": 16,
+        "rel_err": 1.0672547817230225,
+        "captured": 0.0
+      },
+      {
+        "layer": 17,
+        "rel_err": 1.0482473373413086,
+        "captured": 0.0
+      },
+      {
+        "layer": 18,
+        "rel_err": 1.045639157295227,
+        "captured": 0.0
+      },
+      {
+        "layer": 19,
+        "rel_err": 1.033565878868103,
+        "captured": 0.0
+      },
+      {
+        "layer": 20,
+        "rel_err": 0.9802568554878235,
+        "captured": 0.03909649726912434
+      },
+      {
+        "layer": 21,
+        "rel_err": 0.7657563090324402,
+        "captured": 0.41361727517701397
+      },
+      {
+        "layer": 22,
+        "rel_err": 0.767667829990387,
+        "captured": 0.41068610279785034
+      },
+      {
+        "layer": 23,
+        "rel_err": 1.0228877067565918,
+        "captured": 0.0
+      }
+    ],
+    "mean_rel_err": 1.052264613409837,
+    "mean_captured": 0.03597499480183286
+  },
+  "generation_samples": [
+    {
+      "prompt": "The capital of France is",
+      "student": " a 1000 m race, 1000 m. 1000 m 100 m 100 m 100 m 100 m 100 m 100 m 1000 m 1",
+      "teacher": " Paris. It is the largest city in Europe and the second largest in the world. It is also the capital of France, the second largest country in Europe, and the third largest country in the world. It is the seat of the French government, the French parliament, and the French Supreme Court."
+    },
+    {
+      "prompt": "To compress neural network weights to sub-1 bit per weight,",
+      "student": " 10000000000000000000000000000000000000000000000000000000000",
+      "teacher": " the network should be trained on a dataset with a resolution of 1024x1024 pixels. The network is trained on a dataset with a resolution of 1024x1024 pixels, and the weights are compressed to sub-1 bit per weight."
+    },
+    {
+      "prompt": "Once upon a time,",
+      "student": " $ 100,0. 100000000000000000000000000000000000000000000000000",
+      "teacher": " there was a little girl named Lily. She loved to play with her toys. One day, she found a box of colorful blocks. She wanted to build a tower with her blocks. She started with a single block and added more blocks to make bigger towers. \n\nLily noticed that when she added"
+    },
+    {
+      "prompt": "def fibonacci(n):\n    if n <= 1:\n        return n\n    ",
+      "student": " 10000000000000000000000000000000000000000000000000000000000",
+      "teacher": " else:\n        return fibonacci(n-1) + fibonacci(n-2)\nn = int(input(\"Enter the number of terms: \"))\nprint(fibonacci(n))"
+    },
+    {
+      "prompt": "Q: What's 7 times 8?\nA:",
+      "student": " 10000000000000000000000000000000000000000000000000000000000",
+      "teacher": " 56"
+    }
+  ]
+}
