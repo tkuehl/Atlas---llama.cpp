@@ -337,7 +337,216 @@ If we pull this off locally:
 Worth pursuing as a longer-term architecture whether or not the
 short-term 7B work goes cloud vs local.
 
-## 11. Execution gating
+## 11. NVMe tier — extending to 70B+ on consumer hardware
+
+Previous sections assumed student state lives in **system RAM**.
+That caps us at workstation-class hardware (150 GB RAM for 30B,
+350 GB for 70B — the latter is out of consumer range).
+
+Adding a third tier — **NVMe SSD as cold storage** — removes the
+RAM cap.
+
+### 11.1 Memory hierarchy
+
+```
+  GPU VRAM  (16 GB):  active layer + activations + I/O buffers
+     ↕  PCIe Gen4 x16, ~32 GB/s
+  System RAM (32-64 GB):  hot-layer cache + grads + Adam state
+     ↕  M.2 NVMe Gen4-5, ~7-14 GB/s
+  NVMe SSD  (2-4 TB):  full student params (cold)
+```
+
+### 11.2 Bandwidth math
+
+Per-layer transfer times for 30B (~750 MB bf16 per layer at d=5120)
+and 70B (~1.75 GB bf16 per layer at d=8192):
+
+| Storage | 30B layer | 70B layer |
+|---|---:|---:|
+| RAM (DDR5) | 10 ms | 25 ms |
+| NVMe Gen4 | 100 ms | 250 ms |
+| NVMe Gen5 | 50 ms | 125 ms |
+
+NVMe is 7-10× slower than RAM but *can be hidden* if prefetching
+layer N+1 during layer N's compute.  Effective wall-clock penalty:
+~0-20% depending on whether compute dominates I/O.
+
+### 11.3 Wall-clock estimates for prefetched NVMe tier
+
+| Model | RAM-only architecture | NVMe-backed architecture |
+|---|---:|---:|
+| 7B | ~30 hours | ~35 hours |
+| 30B | ~100-200 hours | ~130-250 hours |
+| **70B** | **infeasible (350 GB RAM)** | **~330-500 hours (~14-21 days)** |
+
+At 70B scale, per-layer compute dominates I/O enough that NVMe is
+only marginally slower than hypothetical-if-you-had-the-RAM.
+
+### 11.4 System RAM requirements drop dramatically
+
+With NVMe backing the cold store, RAM just needs to hold 2-3 hot
+layers plus the teacher cache page + optimizer workspace:
+
+| Model | RAM (tier-only) | RAM (NVMe-tiered, 2-layer hot cache) |
+|---|---:|---:|
+| 7B | 35 GB | ~8 GB |
+| 30B | 150 GB | ~24 GB |
+| 70B | 350 GB | ~40-64 GB |
+
+**Consumer hardware (64 GB RAM + 2 TB NVMe + 16 GB GPU) becomes
+viable for 70B** under this architecture.
+
+### 11.5 Critical caveat: SSD write wear
+
+Naive NVMe-offload burns drive life fast:
+- Adam state updated every step: read + write per step
+- For 30B with 16 GB Adam state × 8000 steps: **~128 TB of writes
+  per training run**
+
+Consumer 2 TB NVMe is rated 600-1200 TBW.  **One 30B training run
+consumes 10-20% of drive life.**  Unacceptable for iteration.
+
+Three mitigations, in order of preference:
+
+**Option A: Write-through-param-only architecture** (recommended)
+- NVMe: student params (cold, bf16, written once at checkpoint,
+  otherwise read-only during training)
+- RAM: gradients, 8-bit Adam state, 2-layer hot cache
+- Writes to NVMe happen only at checkpoint boundaries (e.g. every
+  500 steps).  Adam state never touches NVMe.
+- Total writes per 30B run: ~30 GB × 16 checkpoints = ~0.5 TB.
+  Well under drive wear budget.
+
+**Option B: Enterprise SSD**
+- 10-30 PBW rated (vs 0.6-1.2 PB consumer)
+- $500-1500 for 2 TB
+- Lasts years of training
+
+**Option C: RAM-disk / tmpfs for hot state**
+- Allocate ~16-32 GB of RAM as tmpfs
+- Adam state lives on tmpfs (backed by RAM, persists through
+  process restart if machine doesn't reboot)
+- NVMe holds params only
+
+Option A is cleanest and fits our architecture naturally.
+
+### 11.6 Adopted architecture for 30B-70B local
+
+```
+NVMe (read-mostly):
+  student_params.safetensors  [140 GB for 70B]
+  teacher_cache/
+    logits_topk/              [15 GB]
+    hidden_layers_3/          [1.5 TB for 50M token corpus at 30B]
+
+RAM (working memory):
+  hot_layers[2-3]             [~5 GB at 70B]
+  gradients                   [~140 GB at 70B — needs 128 GB+ DDR5]
+  adam_state_8bit             [~35 GB at 70B]
+  prefetch_buffer_next_layer  [~2 GB]
+
+GPU VRAM:
+  current_layer_compute       [~4-8 GB]
+  activations                 [~3 GB]
+  loss workspace              [~1 GB]
+  teacher_cache_page          [~500 MB]
+```
+
+At 70B: requires 128 GB+ RAM because gradients must be in RAM
+(can't offload grads to NVMe and still do backward efficiently).
+If we went further and offloaded grads to NVMe too (with Gen5 and
+careful write batching), 64 GB RAM becomes enough — but wall clock
+approaches 3-4 weeks per run.
+
+### 11.7 Implementation sketch
+
+Add a `NVMeLayerStore` class to the student:
+
+```python
+class NVMeLayerStore:
+    def __init__(self, model_path, num_layers, device):
+        self.path = model_path  # directory of layer_N.safetensors
+        self.device = device
+        self.hot_cache = OrderedDict()  # layer_idx → GPU tensor
+        self.prefetch_stream = torch.cuda.Stream()
+
+    def get(self, layer_idx):
+        if layer_idx in self.hot_cache:
+            return self.hot_cache[layer_idx]
+        tensor = safetensors.torch.load_file(
+            f"{self.path}/layer_{layer_idx}.safetensors",
+            device=self.device,
+        )
+        self.hot_cache[layer_idx] = tensor
+        # Evict if over capacity
+        while len(self.hot_cache) > 3:
+            self.hot_cache.popitem(last=False)
+        return tensor
+
+    def prefetch(self, layer_idx):
+        # Async load on prefetch stream
+        with torch.cuda.stream(self.prefetch_stream):
+            _ = self.get(layer_idx)
+
+    def commit_layer_params(self, layer_idx, updated_params):
+        # Write-through to NVMe (at checkpoint only; for within-
+        # step, keep in hot cache)
+        safetensors.torch.save_file(
+            updated_params,
+            f"{self.path}/layer_{layer_idx}.safetensors",
+        )
+```
+
+~200 lines. Plugged into the training loop, replaces
+`student_layers[i].to(device)` calls.
+
+### 11.8 DeepSpeed ZeRO-Infinity alternative
+
+Microsoft DeepSpeed's `zero_infinity` config does all of this
+automatically:
+
+```python
+{
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {"device": "nvme", "nvme_path": "/mnt/nvme"},
+    "offload_param": {"device": "nvme", "nvme_path": "/mnt/nvme"},
+  },
+  "aio": {"block_size": 1048576, "queue_depth": 8, "thread_count": 4},
+}
+```
+
+Tradeoffs vs rolling our own:
+- Pro: production-tested, handles pipelining automatically
+- Pro: handles write-wear via aio block-size tuning
+- Con: Linux-primary (Windows support is partial via WSL2)
+- Con: adds DeepSpeed dependency and config complexity
+- Con: Our custom LittleBit modules need to be registered with
+  DeepSpeed's parameter registry
+
+For a first attempt, **DeepSpeed ZeRO-Infinity is the faster path**.
+If we hit compatibility issues with our custom `SmoothSignEfficient`
+autograd, we fall back to the hand-rolled `NVMeLayerStore`.
+
+### 11.9 Full hardware picture for 70B local
+
+| Component | Min for 70B |
+|---|---|
+| GPU | 16 GB (RTX 4080/5080 laptop works) |
+| RAM | 128 GB DDR5 |
+| NVMe | 2 TB Gen4 or Gen5 (enterprise preferred) |
+| CPU | 8+ cores, matters less than RAM |
+| Disk | additional 2-4 TB for teacher cache |
+
+Total build: **~$3000-4000 one-time** for a dedicated workstation.
+
+vs cloud 70B at $1500 per run: **break-even at 2-3 runs**, which
+includes teacher extraction reruns.  If we plan to train and
+ablate 70B more than once, local workstation is the right spend.
+
+---
+
+## 12. Execution gating
 
 **Don't start this work until**:
 1. Phase B finishes and we have a trusted 0.5B baseline
