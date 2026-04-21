@@ -1,0 +1,177 @@
+{
+  "checkpoint": "littlebit_qat_checkpoint_r512_mse.pt",
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "rank": 512,
+    "tau": 100.0,
+    "steps": 8000,
+    "seq_len": 512,
+    "wrapped_layers": 168
+  },
+  "training_summary": {
+    "teacher_ppl": 16.392793375785796,
+    "init_ppl": 391596.3963838121,
+    "final_ppl": 92.8578139559602,
+    "best_ppl": 92.8578139559602,
+    "best_step": 8000
+  },
+  "wikitext2_full": {
+    "teacher_ppl": 17.299124320438946,
+    "student_ppl": 133.7241488212507,
+    "seq_len": 512,
+    "max_tokens": 250000
+  },
+  "activation_drift": {
+    "per_layer": [
+      {
+        "layer": 0,
+        "rel_err": 0.9387495517730713,
+        "captured": 0.11874927904585775
+      },
+      {
+        "layer": 1,
+        "rel_err": 0.7788442373275757,
+        "captured": 0.39340165398162696
+      },
+      {
+        "layer": 2,
+        "rel_err": 0.350638747215271,
+        "captured": 0.8770524689513053
+      },
+      {
+        "layer": 3,
+        "rel_err": 0.3322974741458893,
+        "captured": 0.889578388676262
+      },
+      {
+        "layer": 4,
+        "rel_err": 0.3351859152317047,
+        "captured": 0.8876504022302845
+      },
+      {
+        "layer": 5,
+        "rel_err": 0.3352740406990051,
+        "captured": 0.8875913176333619
+      },
+      {
+        "layer": 6,
+        "rel_err": 0.33681920170783997,
+        "captured": 0.8865528253608934
+      },
+      {
+        "layer": 7,
+        "rel_err": 0.33783695101737976,
+        "captured": 0.8858661945272805
+      },
+      {
+        "layer": 8,
+        "rel_err": 0.3391096591949463,
+        "captured": 0.8850046390406874
+      },
+      {
+        "layer": 9,
+        "rel_err": 0.33931586146354675,
+        "captured": 0.8848647461592511
+      },
+      {
+        "layer": 10,
+        "rel_err": 0.34065085649490356,
+        "captured": 0.8839569939692886
+      },
+      {
+        "layer": 11,
+        "rel_err": 0.34052735567092896,
+        "captured": 0.8840411200397646
+      },
+      {
+        "layer": 12,
+        "rel_err": 0.3415461778640747,
+        "captured": 0.8833462083864418
+      },
+      {
+        "layer": 13,
+        "rel_err": 0.34291785955429077,
+        "captured": 0.8824073415987037
+      },
+      {
+        "layer": 14,
+        "rel_err": 0.3461790382862091,
+        "captured": 0.8801600734512354
+      },
+      {
+        "layer": 15,
+        "rel_err": 0.3493654429912567,
+        "captured": 0.877943787243523
+      },
+      {
+        "layer": 16,
+        "rel_err": 0.3617664575576782,
+        "captured": 0.8691250301861686
+      },
+      {
+        "layer": 17,
+        "rel_err": 0.3683132529258728,
+        "captured": 0.864345347719162
+      },
+      {
+        "layer": 18,
+        "rel_err": 0.37819352746009827,
+        "captured": 0.8569696557872879
+      },
+      {
+        "layer": 19,
+        "rel_err": 0.3925876021385193,
+        "captured": 0.8458749746471277
+      },
+      {
+        "layer": 20,
+        "rel_err": 0.4124335050582886,
+        "captured": 0.8298986039053347
+      },
+      {
+        "layer": 21,
+        "rel_err": 0.4945535361766815,
+        "captured": 0.7554167998551398
+      },
+      {
+        "layer": 22,
+        "rel_err": 0.5076633095741272,
+        "captured": 0.7422779641122439
+      },
+      {
+        "layer": 23,
+        "rel_err": 0.6208932399749756,
+        "captured": 0.6144915845533774
+      }
+    ],
+    "mean_rel_err": 0.41756928339600563,
+    "mean_captured": 0.8027736417109005
+  },
+  "generation_samples": [
+    {
+      "prompt": "The capital of France is",
+      "student": " a capital of the country. The British Parliament is a parliamentary council of the Parliament of Ireland and the Parliament of Ireland and the Parliament of Ireland and the Parliament of Ireland . The Parliament is the seat of the Parliament of Ireland and the seat of the Parliament of Ireland and the seat of the Parliament of Ireland",
+      "teacher": " Paris. It is the largest city in Europe and the second largest in the world. It is also the capital of France, the second largest country in Europe, and the third largest country in the world. It is the seat of the French government, the French parliament, and the French Supreme Court."
+    },
+    {
+      "prompt": "To compress neural network weights to sub-1 bit per weight,",
+      "student": " 1. 1. 1000. 1999. 1999,1999. 1999. 1999. 1999. 1999 1999 19",
+      "teacher": " the network should be trained on a dataset with a resolution of 1024x1024 pixels. The network is trained on a dataset with a resolution of 1024x1024 pixels, and the weights are compressed to sub-1 bit per weight."
+    },
+    {
+      "prompt": "Once upon a time,",
+      "student": " the 2000 season, the season was a season of 1999. 2010, 2009 , and the season ended in 2009 . The season ended in 2007 , and the season ended in 2",
+      "teacher": " there was a little girl named Lily. She loved to play with her toys. One day, she found a box of colorful blocks. She wanted to build a tower with her blocks. She started with a single block and added more blocks to make bigger towers. \n\nLily noticed that when she added"
+    },
+    {
+      "prompt": "def fibonacci(n):\n    if n <= 1:\n        return n\n    ",
+      "student": " 10. 1000. 1999. 1999. 1999. 1999. 1999. 1999. 1999. 1999 19",
+      "teacher": " else:\n        return fibonacci(n-1) + fibonacci(n-2)\nn = int(input(\"Enter the number of terms: \"))\nprint(fibonacci(n))"
+    },
+    {
+      "prompt": "Q: What's 7 times 8?\nA:",
+      "student": " 100. 1000. 1999. 1999. 1999. 1999. 1999. 1999. 1999. 1999.1",
+      "teacher": " 56"
+    }
+  ]
+}

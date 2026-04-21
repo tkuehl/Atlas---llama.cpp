@@ -2973,4 +2973,105 @@ Shipped this entry:
   table, paper-baseline comparison, what's validated / what's
   next.
 
+---
+
+## 2026-04-21 — Run 3 (paper's MSE recipe): hidden states align, generation still partially broken
+
+After the §15 eval found KL-only QAT produces degenerate generation,
+fetched Samsung's `utils/kd_utils.py` to align our loss formulation
+exactly. Fixed two issues: `--inter-mse-weight` default 0 → 10.0
+(paper's `l2l_loss_scale`), and the L_inter formula was averaging
+per-layer MSE instead of summing (paper does sum, scaled by 10).
+
+Reran on Qwen 2.5 0.5B, same `seq=512 batch=1` as Run 2 otherwise.
+Used the init cache from Run 2 — Dual-SVID wrap skipped (0.9s vs
+5 min).
+
+**Headline comparison:**
+
+| Metric | Run 2 (KL) | Run 3 (KL + 10·MSE) | Change |
+|---|---:|---:|---|
+| Training-eval PPL (25k tok) | 54.8 | 92.9 | Worse |
+| Full-test PPL (250k tok) | 83.3 | 133.7 | Worse |
+| Per-layer mean rel-err | 1.05 | 0.42 | **2.5× better** |
+| Worst-layer rel-err | 1.43 | 0.94 | Better |
+| Mean hidden-state energy captured | 3.6% | **80%** | **22× better** |
+
+**MSE does exactly what theory predicts.** 22× improvement in hidden-
+state alignment, per-layer rel-err 0.42 matches §13's single-matrix
+activation-weighted prediction (~0.3). KL alone didn't constrain
+internal geometry; MSE does.
+
+**Generation shifts from digit-spam to word-level loops:**
+
+| Prompt | Run 2 | Run 3 |
+|---|---|---|
+| "The capital of France is" | " a 1000 m race, 1000 m..." | " a capital of the country. The British Parliament is a parliamentary council of the Parliament of Ireland and the Parliament of Ireland..." |
+| "Once upon a time," | " $ 100,0. 10000000..." | " the 2000 season, the season was a season of 1999. 2010, 2009..." |
+| "Q: 7 × 8?" | " 10000000..." | " 100. 1000. 1999. 1999..." |
+
+Run 3 produces English words and basic grammar. Still collapses
+into repetition within ~10 tokens, but a very different failure
+mode — it's now plausible-looking text that's semantically wrong,
+vs Run 2's pure digit spam.
+
+**Honest comparison vs paper:**
+
+| Reference | BPW | PPL | Ratio to FP16 |
+|---|---:|---:|---:|
+| Paper OPT-1.3B @ 0.1 BPW | 0.1 | 53.76 | 3.68× |
+| Paper OPT-1.3B @ 0.55 BPW | 0.55 | 23.35 | 1.60× |
+| Paper Llama2-7B @ 0.55 BPW | 0.55 | 10.47 | 1.85× |
+| Ours Run 2 (KL only, 0.5B) | ~0.7 | 83.3 | 4.81× |
+| Ours Run 3 (KL+MSE, 0.5B) | ~0.7 | 133.7 | 7.73× |
+
+We're at a **higher BPW than paper's tested operating points** but
+consistently underperform paper's ratios. That gap is real —
+honest reading: our recipe is 100–250× short on training tokens
+vs the paper.
+
+**Interpretation.** The paper's method is mechanistically validated
+(MSE aligns hidden states as designed). But our recipe has four
+compute-constrained deviations:
+
+| Dimension | Paper | Ours | Gap |
+|---|---|---|---|
+| Training tokens total | ~500M-1B | ~4M | **100-250×** |
+| Seq length | 2048 | 512 | 4× |
+| Batch size | 4 | 1 | 4× |
+| Data | WikiText + C4 | WikiText only | No C4 |
+
+The mechanism works; the compute budget doesn't. Closing the
+compute gap is the only honest path before scale-up.
+
+**Decision: stay on 0.5B, close paper-recipe gap first.** Before
+cloud spend, need to first prove our method reproduces paper's
+direction on a model we can actually train. That requires
+memory optimizations to enable seq=1024 + batch=2 + more steps.
+
+**Phase A queued (memory optimizations, ~1-2h coding):**
+  - `bnb.AdamW8bit` — 8-bit Adam state
+  - `gradient_checkpointing_enable()` on student
+  - SmoothSign memory diet — save bf16 surrogate not fp32 input
+  - `--weight-decay 0.01` default
+  - C4 streaming alongside wikitext
+
+Phase B (~7h wall): seq=1024, batch=2, 30k steps on wikitext + C4.
+Phase C (~20h overnight): full paper-faithful at 120k steps if B
+holds.
+
+If Phase C produces coherent generation with PPL ratio near paper's
+3-4× at matched BPW, we've validated paper's approach applies to
+Qwen 0.5B. That justifies cloud spend on 7B. If Phase C still
+produces broken generation, we've shown paper's numbers either
+don't extend to sub-1B or don't translate to usable LMs — also
+a real finding.
+
+**Artifacts:**
+  - `littlebit_qat_model_run3_mse.json` — training trajectory
+  - `littlebit_eval_r512_mse.json` — full eval with generation samples
+  - Run 3 checkpoint `littlebit_qat_checkpoint_r512_mse.pt` (1.52 GB,
+    gitignored) preserved alongside Run 2's for any future
+    ablation work
+
 
