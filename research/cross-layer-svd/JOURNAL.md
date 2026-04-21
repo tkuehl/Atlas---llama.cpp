@@ -1646,3 +1646,74 @@ K-quants + spec decoding is the near-optimum operating point for a
 5070-class consumer card. If the goal is "run bigger models
 interactively," either buy more VRAM (5090) or loosen the post-
 training constraint (distillation).
+
+---
+
+## 2026-04-21 — Paper survey: sub-1-bit and low-bit quantization
+
+Follow-up to the 2026-04-19 synthesis, which named "retraining-allowed
+compression" as the one remaining productive direction. Surveyed four
+recent papers that all relax the post-training-only constraint in
+different ways. Full notes with links, numbers, and llama.cpp-mapping
+commentary live in
+[docs/research/quantization-papers-2025.md](../../docs/research/quantization-papers-2025.md).
+
+### Papers covered
+
+1. **BitNet b1.58 2B4T** (Microsoft, arXiv 2504.12285). Native 1.58-bit
+   (ternary `{-1, 0, +1}`) LLM trained from scratch on 4T tokens. 2B
+   params, matches FP peers of similar size at ~1/10 memory. Trained-
+   in, not post-training. Weights and inference kernels already open.
+2. **LittleBit** (Samsung, NeurIPS 2025, arXiv 2506.13771). Factorizes
+   `W ≈ U·V^T` at low rank, then binarizes the factors. Claims 0.1 BPW
+   on Llama2-13B (~0.9 GB weights), beating STBLLM at 0.55 BPW. Uses
+   Dual-SVID init + QAT + multi-scale (row/col/rank) compensation.
+3. **BTC-LLM** (arXiv 2506.12040). Dense sub-1-bit via learnable
+   invertible rotation + binary codebook (no sparsity masks). 3.1%
+   zero-shot drop at 0.8 bits on LLaMA-2-13B, 1.6× FP16 speedup.
+4. **D²Quant** (arXiv 2602.02546). 2–3 bit weight-only PTQ with
+   Dual-Scale Quantizer on FFN down-projection + mean-shift LayerNorm
+   correction. Only one of the four that's pure PTQ and could
+   retrofit onto existing block formats.
+
+### Why this is a reopening, not a restart
+
+This track was archived on 2026-04-19 because every post-training
+approach either tied or lost to K-quants. Three of the four papers
+above (BitNet, LittleBit, BTC-LLM) require training — QAT, fine-
+tuning, or from-scratch — which is exactly the constraint the archive
+entry said we'd need to relax.
+
+LittleBit is the one that sits most directly on the factored-inference
+lineage from the first half of this journal: same `W ≈ U·V^T`
+skeleton we ran rank sweeps on in April, but with `U` and `V`
+binarized and QAT used to recover quality. The archived per-matrix
+SVD results (best case: PPL 86 at rank 512 on Qwen 2.5 0.5B, baseline
+9.4) are the right floor to compare any LittleBit reproduction
+against.
+
+### Open research questions this survey raises
+
+- If QAT is on the table, does LittleBit's factored-binary scheme
+  beat our archived per-matrix SVD at matched storage? The closest
+  apples-to-apples point: LittleBit at ~0.5 BPW vs our rank-512
+  per-matrix SVD (~1.14 BPW-equivalent for Qwen 0.5B d=896).
+- Does BitNet b1.58 2B4T at 2B params outperform Qwen 2.5 0.5B +
+  K-quants on the interactive-tok/s problem on a 5070? Cheap
+  benchmark — weights and kernels already exist.
+- Would any of these schemes benefit from the `imatrix`-style
+  activation weighting that we kept finding was the right metric
+  (weighted rel-err predicts PPL; raw Frobenius doesn't)?
+
+### Status
+
+Survey only. No experiments run yet. Next concrete action is either:
+(a) one-afternoon benchmark of BitNet b1.58 2B4T against our Qwen
+baselines to anchor the "is retraining worth it?" question, or
+(b) math walkthrough of LittleBit's Dual-SVID + multi-scale
+compensation on a toy matrix, as the prereq to any reproduction
+attempt.
+
+No commitment yet on which to run first. The archive recommendation
+from 2026-04-19 still stands until one of these papers actually
+beats our baselines end-to-end on a model we care about.
