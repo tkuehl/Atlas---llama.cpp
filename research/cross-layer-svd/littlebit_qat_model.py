@@ -261,15 +261,11 @@ def wikitext_ppl(model, tokenizer, split: str = "test",
     return math.exp(nll_sum / max(1, count))
 
 
-def iter_train_samples(tokenizer, seq_len: int, batch_size: int,
-                       seed: int = 0, c4_samples: int = 0):
-    """Yield (batch_size, seq_len) tensors from wikitext-2 train (and
-    optionally C4), looping forever.
+def prepare_train_stream(tokenizer, c4_samples: int = 0) -> torch.Tensor:
+    """Build the combined wikitext-2 + optional C4 token stream.
 
-    Both corpora are concatenated into one long token stream; random
-    windows of seq_len are sampled uniformly.  Paper's setup is
-    wikitext + 'selected partitions of C4'; passing `c4_samples > 0`
-    approximates that by streaming that many C4 train samples in.
+    Split out from iter_batches() so the caller owns the random
+    generator (enables checkpoint-resume).
     """
     from datasets import load_dataset
     print("  preparing train token stream...", flush=True)
@@ -298,18 +294,40 @@ def iter_train_samples(tokenizer, seq_len: int, batch_size: int,
               flush=True)
 
     n = tokens.shape[0]
+    print(f"  train stream: {n:,} tokens",
+          flush=True)
+    return tokens
+
+
+def iter_batches(tokens: torch.Tensor, generator: torch.Generator,
+                 seq_len: int, batch_size: int):
+    """Yield (batch_size, seq_len) tensors forever.
+
+    Uses `generator` for randint — generator state is owned by the
+    caller so it can be saved to a checkpoint and restored.
+    """
+    n = tokens.shape[0]
+    while True:
+        batch = []
+        for _ in range(batch_size):
+            start = int(torch.randint(0, n - seq_len - 1, (1,),
+                                      generator=generator).item())
+            batch.append(tokens[start:start + seq_len])
+        yield torch.stack(batch, dim=0)
+
+
+def iter_train_samples(tokenizer, seq_len: int, batch_size: int,
+                       seed: int = 0, c4_samples: int = 0):
+    """Backwards-compatible wrapper.  Callers that want checkpoint-
+    resume should use prepare_train_stream + iter_batches directly."""
+    tokens = prepare_train_stream(tokenizer, c4_samples=c4_samples)
+    n = tokens.shape[0]
     print(f"  train stream: {n:,} tokens, {n // seq_len:,} "
           f"non-overlapping {seq_len}-token windows",
           flush=True)
     g = torch.Generator()
     g.manual_seed(seed)
-    while True:
-        batch = []
-        for _ in range(batch_size):
-            start = int(torch.randint(0, n - seq_len - 1, (1,),
-                                      generator=g).item())
-            batch.append(tokens[start:start + seq_len])
-        yield torch.stack(batch, dim=0)
+    yield from iter_batches(tokens, g, seq_len, batch_size)
 
 
 def main():
@@ -362,6 +380,24 @@ def main():
                    help="Cache Dual-SVID-initialized student here. If the "
                         "file exists, skip the wrap and load instead "
                         "(saves ~5 min on re-runs).")
+    p.add_argument("--ckpt-every", type=int, default=0,
+                   help="Save rolling training checkpoint every N opt-steps. "
+                        "0 disables (only end-of-training save).  Set to "
+                        "--eval-every or 2*eval-every for pause/resume.")
+    p.add_argument("--rolling-ckpt",
+                   default="littlebit_qat_rolling.pt",
+                   help="Path for rolling periodic checkpoint (overwritten "
+                        "each save).  Includes model + optimizer + RNG.")
+    p.add_argument("--best-ckpt",
+                   default="littlebit_qat_best.pt",
+                   help="Path for best-PPL checkpoint.  Empty string "
+                        "disables; otherwise updated whenever eval PPL "
+                        "improves.")
+    p.add_argument("--resume", default="",
+                   help="Resume training from this checkpoint path.  "
+                        "Restores model + optimizer + step + RNG so the "
+                        "run continues bit-identically to an uninterrupted "
+                        "run.  Empty disables.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -517,18 +553,82 @@ def main():
         return args.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
     kl = nn.KLDivLoss(reduction="batchmean", log_target=False)
-    it = iter_train_samples(tokenizer, args.seq_len, args.batch_size,
-                            c4_samples=args.c4_samples)
+    # Sampler with externally-owned generator, for checkpoint-resume.
+    train_tokens = prepare_train_stream(tokenizer,
+                                        c4_samples=args.c4_samples)
+    sampler_gen = torch.Generator()
+    sampler_gen.manual_seed(0)
+    print(f"  train stream: {train_tokens.shape[0]:,} tokens, "
+          f"{train_tokens.shape[0] // args.seq_len:,} "
+          f"non-overlapping {args.seq_len}-token windows",
+          flush=True)
+    it = iter_batches(train_tokens, sampler_gen,
+                      args.seq_len, args.batch_size)
 
     accum = max(1, args.grad_accum_steps)
     effective_batch = args.batch_size * accum
+
+    # Resume-from-checkpoint support: if --resume points to a valid
+    # rolling checkpoint, restore model / optimizer / RNG / step /
+    # history and skip ahead to the saved step.
+    start_step = 1
+    best_ppl = float("inf")
+    best_step_from_ckpt: int | None = None
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"--resume {resume_path} does not exist"
+            )
+        print(f"resuming from {resume_path}...", flush=True)
+        ckpt = torch.load(resume_path, map_location="cpu",
+                          weights_only=False)
+        student.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["opt"])
+        torch.set_rng_state(ckpt["rng_torch"])
+        if torch.cuda.is_available() and ckpt.get("rng_cuda") is not None:
+            torch.cuda.set_rng_state_all(ckpt["rng_cuda"])
+        sampler_gen.set_state(ckpt["rng_sampler"])
+        start_step = int(ckpt["step"]) + 1
+        history = ckpt.get("history", history)
+        best_ppl = float(ckpt.get("best_ppl", float("inf")))
+        best_step_from_ckpt = ckpt.get("best_step")
+        print(f"  resumed at step {start_step - 1}; "
+              f"continuing to {args.steps} "
+              f"(best_ppl so far: {best_ppl:.3f})", flush=True)
+
     print(f"training: {args.steps} opt-steps, lr={args.lr}, "
           f"batch={args.batch_size} × accum={accum} "
           f"= effective {effective_batch}, seq_len={args.seq_len}")
     _gpu_mem("pre-train-loop")
+
+    def save_rolling(step_now: int, history_snapshot: list) -> None:
+        """Single-file rolling checkpoint, overwrites each save."""
+        tmp = Path(f"{args.rolling_ckpt}.tmp")
+        final = Path(args.rolling_ckpt)
+        payload = {
+            "step": step_now,
+            "model": student.state_dict(),
+            "opt": opt.state_dict(),
+            "rng_torch": torch.get_rng_state(),
+            "rng_cuda": (torch.cuda.get_rng_state_all()
+                          if torch.cuda.is_available() else None),
+            "rng_sampler": sampler_gen.get_state(),
+            "args": vars(args),
+            "history": history_snapshot,
+            "best_ppl": best_ppl,
+            "best_step": best_step_from_ckpt,
+            "wrapped_layers": wrapped,
+        }
+        torch.save(payload, tmp)
+        # Atomic-ish rename — on Windows this fails if `final` is
+        # open.  os.replace handles the overwrite cleanly.
+        import os
+        os.replace(tmp, final)
+
     loss_recent = []
     t0 = time.time()
-    for step in range(1, args.steps + 1):
+    for step in range(start_step, args.steps + 1):
         for g in opt.param_groups:
             g["lr"] = lr_at(step - 1)
 
@@ -597,6 +697,25 @@ def main():
             })
             print(f"    PPL={ppl:.3f}  (teacher={teacher_ppl:.3f}, "
                   f"init={init_ppl:.3f})  eval took {time.time()-te:.0f}s")
+            # Track best PPL checkpoint (for early-stop recovery)
+            if ppl < best_ppl:
+                best_ppl = ppl
+                best_step_from_ckpt = step
+                if args.best_ckpt:
+                    try:
+                        torch.save(
+                            {"step": step, "ppl": ppl,
+                             "model": student.state_dict(),
+                             "config": {
+                                 "model": args.model, "rank": args.rank,
+                                 "tau": args.tau, "steps": args.steps,
+                                 "seq_len": args.seq_len,
+                                 "wrapped_layers": wrapped,
+                             }},
+                            args.best_ckpt,
+                        )
+                    except Exception as e:
+                        print(f"    warn: best-ckpt save failed: {e}")
             # Kill on runaway PPL
             if step >= args.warmup_steps and ppl > max(200.0, init_ppl * 1.5):
                 print("    kill criterion: PPL runaway, stopping")
@@ -604,6 +723,15 @@ def main():
                 break
 
             student.train()
+
+        # Rolling periodic checkpoint (overwrite-in-place).  Fires
+        # independently of eval, so pausing is possible between evals.
+        if args.ckpt_every > 0 and step % args.ckpt_every == 0:
+            try:
+                save_rolling(step, history)
+            except Exception as e:
+                print(f"    warn: rolling ckpt save failed at step "
+                      f"{step}: {e}", flush=True)
 
     best = min(history[1:], key=lambda h: h.get("ppl", float("inf")),
                default=history[0])
