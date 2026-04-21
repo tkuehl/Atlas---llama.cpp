@@ -184,6 +184,59 @@ The single biggest leverage piece:
 **Validation**: Phase B 10h → 6h, teacher eliminated from training
 VRAM. Unlocks 7B and 30B architecturally.
 
+### Sprint 3.5 — "Speculation acceptance benchmark" (30 min)
+
+Before committing to quality combinations or scale, run the single
+cheapest deployment-signal experiment we can: measure how well the
+Phase B checkpoint works as a draft model for its own teacher via
+speculative decoding.
+
+**Why this matters**: a "broken" LittleBit student is still useful
+as a speculation draft. Speculation guarantees correctness via
+teacher verification — the student's job is just to propose
+high-probability continuations. Our Run 3 student produced
+grammatically-English-but-topically-wrong output. That's
+literally a high-acceptance draft: the student sometimes guesses
+tokens the teacher agrees with, saving teacher forward passes.
+
+**Setup**:
+- Teacher: Qwen 2.5 0.5B bf16 (base model, unmodified)
+- Draft: LittleBit-wrapped student from Phase B or Run 3 checkpoint
+- Harness: existing `research/cross-layer-svd/bench/spec_bench.py`
+- Command (after minor glue code):
+  `python spec_bench.py --teacher Qwen/Qwen2.5-0.5B
+   --draft-checkpoint littlebit_qat_checkpoint_r512_phaseB.pt
+   --fixture public_prompt_fixture.json`
+
+**Decision gates**:
+- **≥ 60% acceptance** → deployment path validated. LittleBit
+  produces a genuinely useful draft even at 0.5B. Cloud spend
+  on 7B becomes triple-value (paper reproduction + new scale data
+  point + draft model for Atlas deployment).
+- **40-60% acceptance** → marginal but usable. Quality ablations
+  from Sprint 4 worth pursuing specifically to push acceptance
+  toward 70%.
+- **< 40% acceptance** → student too divergent from teacher even
+  at position-wise KL match. Reconsider whether compression quality
+  is salvageable before scale spend.
+
+**What it doesn't measure**: actual speedup. Our LittleBit forward
+runs in PyTorch eager mode — no fused binary GEMM kernel. Draft is
+NOT faster than teacher at same parameter count without the
+kernel. We get acceptance rate, not wall-clock speedup.
+
+**Prerequisite for real speedup**: fused binary matmul kernel.
+Paper claims 11.6× speedup with their kernel; we'd need to either
+build one in Triton or wait for upstream `llama.cpp` to add a
+factored-binary tensor type. Either way, a research project in its
+own right — scope for Sprint 7+ if the acceptance numbers justify
+it.
+
+**Output if successful**: a concrete deployment story for Atlas:
+LittleBit-compressed model as draft + full-precision model as
+teacher. Our two research tracks (compression + speculation) finally
+meet.
+
 ### Sprint 4 — "Quality combinations" (1-2 weeks, in parallel with user)
 
 Now that ablations are cheap (~2h each instead of 8-10h), run the
@@ -281,11 +334,14 @@ as a novel contribution.
 | 5 | 1-2 weeks | - | - | 7B locally trained |
 | 6 | 2+ weeks | - | - | 30B locally trained |
 
-**Sprints 1-3 are the critical path.** They together:
+**Sprints 1-3.5 are the critical path.** They together:
 - Cut wall time by ~75%
 - Free ~10 GB of memory at 7B scale
 - Enable 7B local training
 - Build reusable teacher cache infrastructure
+- **Validate deployment story via speculation acceptance benchmark
+  (Sprint 3.5, 30 min) — without this, Sprints 4-6 are pure
+  research with no path to Atlas deployment**
 
 Everything after Sprint 3 uses this platform for experiments.
 
