@@ -2501,3 +2501,63 @@ attempt.
 No commitment yet on which to run first. The archive recommendation
 from 2026-04-19 still stands until one of these papers actually
 beats our baselines end-to-end on a model we care about.
+
+---
+
+## 2026-04-21 — LittleBit math walkthrough
+
+Executed path (b) from the prior entry: reconstructed LittleBit's
+core math from the arXiv HTML and documented findings. Full
+writeup in **[littlebit_math.md](littlebit_math.md)**.
+
+Key points from the walkthrough:
+
+- **Compression math is exact.** BPW `≈ 2r/d` dominates at `r ≪ d`;
+  the paper's headline "0.1 BPW" is `r = 256` on `d = 5120`
+  (Llama2-13B). The trick is that `r` decouples parameter count
+  from weight count, so sub-1-BPW is trivially reachable once
+  factors are used at all — the 1-bit precision on the factors
+  then contributes an additional 16× vs FP16-SVD at the same `r`.
+- **Proposition 1 (efficient forward) is a clean algebraic
+  identity.** `Y = ((((X⊙g)·V_sign)⊙ℓ)·U_sign^T)⊙h` replaces one
+  FP16 GEMM with two binary matmuls plus three broadcasts, no
+  materialization of `Ŵ`. Derivation holds rigorously; this is
+  not an approximation.
+- **Dual-SVID initialization is heuristic, not derived.** Paper
+  asserts (a) `|U'|` is rank-1 separable as `h · ℓ_uᵀ` and (b) the
+  rank axis combines as `ℓ_0 = ℓ_u ⊙ ℓ_v`. Neither is proved;
+  both are plausible design choices. The multiplicative
+  separability assumption is directly measurable on our existing
+  7B calibration dumps — cheapest single sanity check that
+  informs whether Dual-SVID will actually warm-start QAT or just
+  produce a bad starting point that QAT has to climb out of.
+- **QAT uses SmoothSign backward** with `d/dx tanh(100x)`, not
+  standard STE. Temperature `100` is a hyperparameter the paper
+  doesn't ablate.
+- **The batch=1 decode speedup claim is unanswered.** Paper
+  reports up to 11.6× kernel speedup but admits "inference at
+  small batch sizes is often dominated by memory access." Our
+  2026-04-19 Cloudflare-pattern investigation already established
+  batch=1 is memory-bandwidth-bound on MMVQ; whether a
+  factored-binary kernel holds its speedup at batch=1 on a
+  consumer card is the decisive unknown for this fork.
+- **Not upstream-deployable today.** No llama.cpp tensor type for
+  factored-binary storage exists; LittleBit is research-only under
+  our speculation-track invariant until upstream ships (or we land
+  a loader extension). Same status tier as EAGLE / Medusa in
+  `speculative_decoding.md`.
+
+Findings relating to the archived SVD track: LittleBit is the one
+paper of the 2026-04-21 survey that sits directly on our `W ≈ U·Vᵀ`
+lineage. It targets a different operating point (sub-1-BPW, QAT
+allowed) than our archived floor (FP16 factors, post-training only,
+PPL 86 at r=512 on Qwen 0.5B). Whether QAT at binary factors
+beats our FP16 post-training floor at matched storage is a directly
+measurable question — not a theoretical one.
+
+Next action queued (from §10.1 of the math doc): one afternoon of
+single-matrix numerical sanity on a 7B calibration dump. Verifies
+Prop. 1 on a toy case, measures Dual-SVID initial-point quality
+before any QAT commitment, and sweeps the rank-1 separability
+assumption. Much cheaper than the full reproduction and narrows the
+question about whether the method's warm-start is doing real work.
