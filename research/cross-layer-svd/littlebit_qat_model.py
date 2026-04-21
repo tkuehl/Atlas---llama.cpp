@@ -124,6 +124,33 @@ class LittleBitLinearHF(nn.Module):
         return y
 
 
+def wrap_model_littlebit_shapes(model: nn.Module, r: int,
+                                tau: float = 100.0,
+                                skip: tuple[str, ...] = ("lm_head",)) -> int:
+    """Replace nn.Linear with empty LittleBitLinearHF modules (no init).
+
+    Used by the init-cache fast path: we need the module structure to
+    match for load_state_dict, but skip the expensive Dual-SVID SVDs
+    because the cached state_dict has the initialized parameters.
+    """
+    count = 0
+    for name, module in model.named_modules():
+        for child_name, child in list(module.named_children()):
+            if not isinstance(child, nn.Linear):
+                continue
+            full = f"{name}.{child_name}" if name else child_name
+            if any(s in full for s in skip):
+                continue
+            d_out = child.out_features
+            d_in = child.in_features
+            r_eff = min(r, d_out, d_in)
+            new = LittleBitLinearHF(d_in=d_in, d_out=d_out, r=r_eff,
+                                    bias=child.bias is not None, tau=tau)
+            setattr(module, child_name, new)
+            count += 1
+    return count
+
+
 def wrap_model_littlebit(model: nn.Module, r: int,
                          tau: float = 100.0,
                          skip: tuple[str, ...] = ("lm_head",),
@@ -245,6 +272,12 @@ def main():
     p.add_argument("--inter-mse-weight", type=float, default=0.0,
                    help="Weight for intermediate hidden-state MSE; 0 disables")
     p.add_argument("--out", default="littlebit_qat_model.json")
+    p.add_argument("--checkpoint", default="littlebit_qat_checkpoint.pt",
+                   help="End-of-training state_dict path (always saved)")
+    p.add_argument("--init-cache", default="littlebit_qat_init_cache.pt",
+                   help="Cache Dual-SVID-initialized student here. If the "
+                        "file exists, skip the wrap and load instead "
+                        "(saves ~5 min on re-runs).")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -274,15 +307,38 @@ def main():
     # Student: separate copy, then wrap, then move to device.
     # (Wrap creates new CPU tensors via np.linalg.svd; must .to(device)
     # the whole model after wrapping.)
+    init_cache_path = Path(args.init_cache)
     print(f"loading student copy and wrapping at r={args.rank}...")
     t0 = time.time()
     student = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.float32,
     )
-    wrapped = wrap_model_littlebit(student, r=args.rank, tau=args.tau)
+    if init_cache_path.exists():
+        # Fast path: skip Dual-SVID SVDs, load cached init instead.
+        print(f"  init-cache hit: {init_cache_path} "
+              f"(skipping Dual-SVID wrap)",
+              flush=True)
+        # We still need to wrap to put LittleBitLinearHF modules in
+        # place; then load their learned parameters from cache.
+        wrapped = wrap_model_littlebit_shapes(student, r=args.rank,
+                                              tau=args.tau)
+        state = torch.load(init_cache_path, map_location="cpu",
+                           weights_only=True)
+        student.load_state_dict(state)
+        print(f"  loaded cached init in {time.time() - t0:.1f}s "
+              f"({wrapped} layers)", flush=True)
+    else:
+        wrapped = wrap_model_littlebit(student, r=args.rank, tau=args.tau)
+        print(f"  wrapped {wrapped} Linear layers  "
+              f"({time.time() - t0:.1f}s)")
+        # Cache for future runs.  Save on CPU so the file is portable.
+        try:
+            torch.save(student.state_dict(), init_cache_path)
+            print(f"  cached Dual-SVID init to {init_cache_path}",
+                  flush=True)
+        except Exception as e:
+            print(f"  warning: init cache save failed: {e}", flush=True)
     student.to(device)
-    print(f"  wrapped {wrapped} Linear layers  "
-          f"({time.time() - t0:.1f}s)")
 
     # Count student trainable params.
     trainable_params = sum(p.numel() for p in student.parameters()
@@ -418,6 +474,27 @@ def main():
     }
     Path(args.out).write_text(json.dumps(summary, indent=2))
     print(f"\nwrote {args.out}")
+
+    # Save end-of-training checkpoint so downstream eval / resume
+    # runs don't have to retrain.
+    try:
+        ckpt_path = Path(args.checkpoint)
+        torch.save({
+            "state_dict": student.state_dict(),
+            "config": {
+                "model": args.model, "rank": args.rank, "tau": args.tau,
+                "steps": args.steps, "seq_len": args.seq_len,
+                "wrapped_layers": wrapped,
+            },
+            "summary": {k: summary[k] for k in
+                        ("teacher_ppl", "init_ppl", "final_ppl",
+                         "best_ppl", "best_step")},
+        }, ckpt_path)
+        size_mb = ckpt_path.stat().st_size / (1024 * 1024)
+        print(f"checkpoint: {ckpt_path}  ({size_mb:.0f} MB)")
+    except Exception as e:
+        print(f"warning: checkpoint save failed: {e}")
+
     print(f"teacher {teacher_ppl:.3f}  init {init_ppl:.3f}  "
           f"best {best.get('ppl', float('inf')):.3f} "
           f"(step {best.get('step')})")
