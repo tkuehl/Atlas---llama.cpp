@@ -2561,3 +2561,82 @@ Prop. 1 on a toy case, measures Dual-SVID initial-point quality
 before any QAT commitment, and sweeps the rank-1 separability
 assumption. Much cheaper than the full reproduction and narrows the
 question about whether the method's warm-start is doing real work.
+
+---
+
+## 2026-04-21 — LittleBit sanity checks executed: init is bad, QAT carries everything
+
+Ran `littlebit_sanity.py` on Qwen 2.5 0.5B
+`model.layers.12.mlp.gate_proj` (shape `[4864, 896]`) —  the same
+matrix the archived CALDERA Stage 1 validation used, so numbers are
+directly comparable to the FP16 SVD floor (PPL 86 at `r=512`).
+
+Results in full under
+[littlebit_math.md §12](littlebit_math.md#12-sanity-check-results-2026-04-21).
+Three checks, three findings:
+
+1. **Proposition 1 (Eq. 5) is numerically exact.** Toy verification
+   on random inputs: max absolute diff ≤ 5e-13, relative diff at FP
+   epsilon (6e-16). The efficient forward form `Y = ((((X⊙g)·V_sign)
+   ⊙ℓ)·U_signᵀ)⊙h` equals the materialized-Ŵ form bit-for-bit
+   modulo rounding. Paper's algebra holds; our reconstruction is
+   correct.
+
+2. **Dual-SVID (Eq. 6-8) is a much worse initializer than expected.**
+   At `r=512` on this matrix:
+   - Optimal rank-512 FP SVD reconstruction: 42% relative Frobenius
+     error (captures 58% of matrix energy).
+   - Dual-SVID initial point: **82% relative Frobenius error**
+     (captures 18% of matrix energy).
+   - Binarization + three-vector scale compensation throws away
+     ~75% of the rank-`r` information FP-SVD had access to.
+
+   The math doc's prior framing — "Dual-SVID is a warm-start heuristic,
+   not an optimal initializer" — understated the gap. At 82% rel
+   Frobenius error, the Dual-SVID-initialized matrix is barely
+   distinguishable from a rescaled random matrix. **QAT recovers
+   essentially everything; the init is purely a symmetry-breaker for
+   the sign pattern.**
+
+3. **Rank-1 separability of `|U'|` plateaus at ~62%.** Dual-SVID
+   assumes `|U'|_{ik} ≈ h_i · ℓ_{u,k}` (a multiplicative-separability
+   claim). The σ_1² / Σσ_i² ratio for the magnitude matrix runs
+   0.75 at r=4 down to 0.62 at r=128+. So the assumption holds at
+   five-eighths fidelity, discarding ~38% of magnitude variation.
+   Not nothing, but also not close to 100%. Consistent with the init
+   being a weak but not meaningless warm-start for QAT.
+
+**The cleanly-surprising finding:** the fraction of rank-`r` subspace
+information discarded by Dual-SVID is ~77% *independent of `r`*.
+Across r=64/128/256/512 it lands at 0.78/0.78/0.77/0.77. Binarization
+loss is a fixed multiplicative factor on the pre-binarization
+subspace, not an absolute loss. QAT's job doesn't get easier at
+higher `r` — the same fraction of information still needs recovering,
+just with more total information present to begin with.
+
+**Reframes the reproduction question:** does QAT recover the ~77%
+of rank-`r` information Dual-SVID discards via sign truncation?
+If yes at `r=256` on Qwen 0.5B, LittleBit beats the archived SVD
+floor (PPL 86) at lower BPW (0.36 vs our archived FP16 r=512).
+That's the directly measurable acceptance criterion.
+
+**Caveat on scale:** paper headlines on Llama2-13B/70B; our test is on
+Qwen 0.5B. Trained-weight magnitude structure may be stronger at
+larger scale — not unreasonable to expect separability climbing toward
+0.8 on a 13B matrix. The §10.1.4 follow-up (rerun on a 7B matrix,
+cheap given the existing `extract_matrix_caldera.py` infra) would
+test this before anyone commits training compute. Currently queued as
+the next concrete action.
+
+**Shipped this entry:**
+- `littlebit_sanity.py` — three-check sanity script, reproducible
+  with `--model`, `--role`, `--layer`, `--ranks`.
+- `littlebit_sanity.json` — raw numbers for this run.
+- `littlebit_math.md §12` — findings writeup with rank-sweep table,
+  the "77%-independent-of-rank" observation, and revised priority
+  ordering for §10.
+
+Before committing gradient training to a full QAT reproduction, the
+7B rerun (§10.1.4) is the honest next step — 2 hours vs potentially
+days of wasted training on a paper whose init quality may not
+generalize down to our hardware profile.

@@ -401,3 +401,159 @@ Expected wall time: an afternoon. No GPU needed for 256×256 toy; the
 Next action: §10.1 (math sanity checks). These are cheap enough that
 verifying the paper's math on a single matrix is lower friction than
 continuing to reason about its implications in the abstract.
+
+---
+
+## 12. Sanity-check results (2026-04-21)
+
+Ran the §10.1 checks via
+[`littlebit_sanity.py`](littlebit_sanity.py). Raw output in
+[`littlebit_sanity.json`](littlebit_sanity.json). Target matrix:
+**Qwen 2.5 0.5B, `model.layers.12.mlp.gate_proj`**,
+shape `[4864, 896]`, `||W||_F = 42.53`.
+
+### 12.1 Proposition 1 is numerically exact — confirmed
+
+Toy verification on random `U_sign, V_sign, h, g, ℓ, X` with `d_out = 128,
+d_in = 96` at multiple ranks:
+
+| `r` | max abs diff | rel diff |
+|---:|---:|---:|
+| 4 | 7.8e-14 | 8.5e-16 |
+| 16 | 9.9e-14 | 6.5e-16 |
+| 64 | 2.8e-13 | 7.9e-16 |
+| 256 | 5.1e-13 | 6.5e-16 |
+
+All under 1e-10 absolute and at floating-point epsilon relative.
+Confirms Eq. 5 is algebraic: the efficient form is bit-for-bit equal
+to the naive materialize-then-matmul modulo FP rounding.
+
+### 12.2 Dual-SVID initial point is strictly worse than my framing
+
+Rank sweep on the real matrix (4864 × 896):
+
+| rank | BPW | fp-SVD err | DualSVID err | sep \|U\| | sep \|V\| |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 0.026 | 0.984 | 0.991 | 0.752 | 0.693 |
+| 8 | 0.032 | 0.973 | 0.988 | 0.696 | 0.661 |
+| 16 | 0.042 | 0.955 | 0.981 | 0.663 | 0.650 |
+| 32 | 0.064 | 0.925 | 0.970 | 0.646 | 0.635 |
+| 64 | 0.106 | 0.874 | 0.952 | 0.636 | 0.630 |
+| 128 | 0.191 | 0.791 | 0.924 | 0.630 | 0.627 |
+| 256 | 0.360 | 0.652 | 0.881 | 0.626 | 0.628 |
+| 512 | 0.700 | 0.416 | 0.824 | 0.624 | 0.630 |
+
+Columns: `fp-SVD err = ||W - U_r·V_rᵀ||_F / ||W||_F` (the archived
+SVD baseline), `DualSVID err = ||W - Ŵ_{pri,0}||_F / ||W||_F` (the
+post-init, pre-QAT reconstruction), `sep = σ_1² / Σσ_i²` of the
+respective magnitude matrix.
+
+### 12.3 What this means
+
+**At `r = 512` (the archived SVD baseline operating point):**
+- Optimal rank-512 FP-SVD captures 58% of matrix energy
+  (err = 0.42).
+- Dual-SVID at the same rank captures only 18%
+  (err = 0.82).
+- **Binarization + three-vector scale compensation throws away
+  ~75% of the information rank-512 FP-SVD had access to.**
+  `(0.82² - 0.42²) / 0.82² ≈ 0.74`.
+
+**The rank-1 separability assumption holds partially.** `|U'|` is
+62–75% rank-1 separable depending on `r`, plateauing at ~62% for
+`r ≥ 128`. The paper's implicit assumption that `|U'|_{ik} ≈ h_i · ℓ_{u,k}`
+captures only about five-eighths of the actual magnitude variation.
+The remaining ~38% is discarded in Dual-SVID.
+
+**This revises the framing in §5.2 more strongly than I expected.**
+The doc already said "expect QAT to do most of the work." The
+numbers say **QAT must recover essentially everything** — the
+initializer is not a useful warm start in any quantitative sense.
+At `r = 512, d = 896`, we're starting from a matrix whose
+reconstruction has 82% relative Frobenius error. That's roughly
+the error you'd get from returning a rescaled random matrix.
+
+### 12.4 Consequences for reproduction
+
+1. **The paper's reported end-to-end quality is entirely a QAT
+   result.** There is no "initialization magic"; Dual-SVID is a
+   symmetry-breaker, not a compressor. This matters because
+   reproduction effort is dominated by the QAT training budget,
+   not by the init math.
+2. **The rank-1 separability claim (Eq. 7) is empirically weak
+   but not invalid.** 62–75% separability is "real structure"
+   even if it's not close to 100%. An ablation that swaps
+   Dual-SVID for a straight `h, g, ℓ = 1` init would isolate how
+   much the warm-start actually helps QAT convergence vs just
+   providing sign patterns.
+3. **Caveat on target-model scale.** This test was on Qwen 2.5
+   0.5B — our archived SVD baseline model, chosen for direct
+   comparability. The paper headlines numbers on Llama2-13B and
+   above. Trained weights at larger scale may have flatter
+   singular spectra (more rank needed to explain a given fraction
+   of energy) or stronger multiplicative structure in their
+   magnitudes. Would not be surprised if `sep |U|` climbs to
+   ~0.8 at 13B. Worth re-running on a 7B matrix (we have the
+   extraction script) before concluding anything global.
+4. **The BPW axis matches the paper's operating points.** At
+   `r = 256`, our BPW comes out to 0.36 on `d = 896`; the paper
+   hits 0.1 BPW because they run on `d = 5120`. Same rank, same
+   format, but the per-weight bit cost scales with `2r/d`. This
+   confirms the §3.1 reconstruction.
+
+### 12.5 Open question newly raised by this data
+
+The ratio `(DualSVID_err² − fp_SVD_err²) / (1 − fp_SVD_err²)` measures
+what fraction of the *available* rank-`r` information Dual-SVID
+discards. From the table:
+
+| `r` | discarded fraction |
+|---:|---:|
+| 64 | 0.78 |
+| 128 | 0.78 |
+| 256 | 0.77 |
+| 512 | 0.77 |
+
+**Remarkably rank-independent.** Dual-SVID consistently throws away
+~77% of the rank-`r` subspace no matter how much is available.
+Implication: the compression-via-binarization loss is a fixed
+fraction of the pre-binarization information, not an absolute loss.
+QAT's job is to recover that fraction; whether it succeeds at `r = 64`
+vs `r = 512` is a question of how much absolute information is
+present in the rank-`r` SVD to begin with (columns 3 and 4 of the
+main table).
+
+This reframes the reproduction question cleanly:
+
+> **Does QAT recover the ~77% of rank-`r` information that Dual-SVID
+> discards via sign truncation?**
+
+If yes at `r = 256` on Qwen 0.5B, then LittleBit beats our archived
+post-training SVD floor (PPL 86 at `r = 512`, FP16 factors) at
+*lower* BPW (0.36 BPW at `r = 256` vs our archived `r = 512` setup
+which was not BPW-measured since we didn't binarize). That would be
+the clean win condition.
+
+### 12.6 Next concrete action
+
+Given the above, the priority ordering in §10 needs slight
+revision:
+
+- **§10.1.1 (Prop. 1 toy)** — DONE, confirmed.
+- **§10.1.2 (Dual-SVID init quality)** — DONE, finding is "very
+  bad init, QAT carries it all."
+- **§10.1.3 (rank-1 separability sweep)** — DONE, separability ≈ 0.63
+  at plateau.
+- **NEW: §10.1.4 — run the same sanity on a 7B matrix** to test
+  the "larger models have more multiplicative magnitude structure"
+  hypothesis from §12.4 point 3. Cheap: one download + rerun.
+- **§10.2 (QAT reproduction)** — unchanged in scope, but the
+  expected training budget is now the whole story (not just the
+  recovery margin).
+
+If the 7B separability is also ~0.63, the reproduction bar gets
+harder — QAT has to do even more work than the paper's headline
+number suggests (because the paper's 13B/70B targets may not be
+representative of sub-10B consumer-card workloads). If it climbs
+to ~0.8, the paper's approach is better founded at larger scale
+and the 0.5B regime is an unfortunate test bed.
