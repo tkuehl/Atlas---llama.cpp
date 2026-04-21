@@ -38,7 +38,41 @@ import numpy as np
 import torch
 from torch import nn
 
-from littlebit_qat_single import smooth_sign
+from littlebit_qat_single import smooth_sign as _smooth_sign_fp32
+
+
+class SmoothSignEfficient(torch.autograd.Function):
+    """Memory-efficient SmoothSign.
+
+    Forward: sign(x)  (same as paper).
+    Backward: grad_output * tau * (1 - tanh(tau*x)**2)
+
+    Key difference vs littlebit_qat_single.SmoothSign: saves the
+    precomputed surrogate gradient in bfloat16 instead of saving
+    the full-precision input x.  Halves the activation memory
+    stored for backward at the cost of one extra tanh in forward.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, tau: float):
+        with torch.no_grad():
+            tanh_tx = torch.tanh(tau * x)
+            surrogate = tau * (1.0 - tanh_tx * tanh_tx)
+            ctx.save_for_backward(surrogate.to(torch.bfloat16))
+        out = torch.where(x >= 0,
+                          torch.ones_like(x),
+                          -torch.ones_like(x))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (surrogate_bf16,) = ctx.saved_tensors
+        surrogate = surrogate_bf16.to(grad_output.dtype)
+        return grad_output * surrogate, None
+
+
+def smooth_sign(x: torch.Tensor, tau: float = 100.0) -> torch.Tensor:
+    return SmoothSignEfficient.apply(x, tau)
 
 
 class LittleBitLinearHF(nn.Module):
@@ -228,19 +262,41 @@ def wikitext_ppl(model, tokenizer, split: str = "test",
 
 
 def iter_train_samples(tokenizer, seq_len: int, batch_size: int,
-                       seed: int = 0):
-    """Yield (batch_size, seq_len) tensors from wikitext-2 train,
-    looping forever.
+                       seed: int = 0, c4_samples: int = 0):
+    """Yield (batch_size, seq_len) tensors from wikitext-2 train (and
+    optionally C4), looping forever.
 
-    Wikitext rows are short (max ~500 tokens with Qwen tokenizer), so
-    we concatenate the whole train split into one stream and slide
-    random windows.  Same pattern as wikitext_ppl() in this file.
+    Both corpora are concatenated into one long token stream; random
+    windows of seq_len are sampled uniformly.  Paper's setup is
+    wikitext + 'selected partitions of C4'; passing `c4_samples > 0`
+    approximates that by streaming that many C4 train samples in.
     """
     from datasets import load_dataset
     print("  preparing train token stream...", flush=True)
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
     text = "\n\n".join(row["text"] for row in ds)
     tokens = tokenizer(text, return_tensors="pt").input_ids[0]
+    n_wiki = tokens.shape[0]
+    print(f"  wikitext-2: {n_wiki:,} tokens", flush=True)
+
+    if c4_samples > 0:
+        print(f"  streaming {c4_samples} C4 samples...", flush=True)
+        t0 = time.time()
+        c4 = load_dataset("allenai/c4", "en", split="train",
+                          streaming=True)
+        c4_texts = []
+        for i, row in enumerate(c4):
+            if i >= c4_samples:
+                break
+            c4_texts.append(row["text"])
+        c4_stream = "\n\n".join(c4_texts)
+        c4_tokens = tokenizer(c4_stream, return_tensors="pt").input_ids[0]
+        n_c4 = c4_tokens.shape[0]
+        tokens = torch.cat([tokens, c4_tokens], dim=0)
+        print(f"  c4: {n_c4:,} tokens in {time.time() - t0:.0f}s; "
+              f"combined {tokens.shape[0]:,}",
+              flush=True)
+
     n = tokens.shape[0]
     print(f"  train stream: {n:,} tokens, {n // seq_len:,} "
           f"non-overlapping {seq_len}-token windows",
@@ -264,17 +320,42 @@ def main():
     p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Gradient accumulation steps.  Effective batch "
+                        "= batch_size * grad_accum_steps.  Use this to "
+                        "emulate paper's batch=4 on a tight memory budget.")
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-max-tokens", type=int, default=50_000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--warmup-steps", type=int, default=200)
+    p.add_argument("--weight-decay", type=float, default=0.01,
+                   help="AdamW weight decay.  Paper-default-adjacent; 0 disables.")
+    p.add_argument("--optimizer", default="adamw8bit",
+                   choices=("adamw", "adamw8bit"),
+                   help="Student optimizer.  adamw8bit uses bitsandbytes "
+                        "(saves ~9 GB Adam state at 7B); adamw is torch default.")
+    p.add_argument("--grad-checkpoint", action="store_true", default=True,
+                   help="Enable gradient checkpointing on the student "
+                        "(trades ~30%% per-step compute for activation memory). "
+                        "Use --no-grad-checkpoint to disable.")
+    p.add_argument("--no-grad-checkpoint", dest="grad_checkpoint",
+                   action="store_false")
+    p.add_argument("--c4-samples", type=int, default=0,
+                   help="Number of C4 samples to mix into the train stream. "
+                        "0 disables C4.  Paper uses 'selected partitions "
+                        "from C4'; ~2000 adds ~600k tokens of diversity.")
     p.add_argument("--inter-mse-weight", type=float, default=10.0,
                    help="Weight for intermediate hidden-state MSE. "
                         "Paper's value is 10.0; set 0 to disable. "
                         "Loss contribution is l2l_weight * sum_{i in layers[1:]} "
                         "MSE(student_h_i, teacher_h_i).")
     p.add_argument("--out", default="littlebit_qat_model.json")
+    p.add_argument("--gpu-mem-fraction", type=float, default=0.80,
+                   help="Cap PyTorch GPU memory at this fraction of total "
+                        "(e.g. 0.80 = 12.8 GB on 16 GB).  Allocations past "
+                        "this raise CUDA OOM, which is recoverable, instead "
+                        "of risking system-level OOM / driver hang.")
     p.add_argument("--checkpoint", default="littlebit_qat_checkpoint.pt",
                    help="End-of-training state_dict path (always saved)")
     p.add_argument("--init-cache", default="littlebit_qat_init_cache.pt",
@@ -285,6 +366,23 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
+
+    # Cap GPU memory so allocations past the cap OOM cleanly rather
+    # than taking the whole system down with a driver hang.
+    if device.type == "cuda" and 0 < args.gpu_mem_fraction < 1.0:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_fraction)
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        cap_gb = total_gb * args.gpu_mem_fraction
+        print(f"gpu memory cap: {args.gpu_mem_fraction * 100:.0f}% "
+              f"of {total_gb:.1f} GB = {cap_gb:.1f} GB", flush=True)
+
+    def _gpu_mem(label: str) -> None:
+        if device.type != "cuda":
+            return
+        used_gb = torch.cuda.memory_allocated() / 1e9
+        reserved_gb = torch.cuda.memory_reserved() / 1e9
+        print(f"  [mem:{label}] allocated={used_gb:.2f} GB "
+              f"reserved={reserved_gb:.2f} GB", flush=True)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -297,6 +395,7 @@ def main():
     for p_ in teacher.parameters():
         p_.requires_grad_(False)
     print("teacher loaded.")
+    _gpu_mem("after teacher")
 
     # Baseline PPL (teacher)
     print("evaluating teacher PPL...")
@@ -343,10 +442,28 @@ def main():
             print(f"  warning: init cache save failed: {e}", flush=True)
     student.to(device)
 
+    # Gradient checkpointing: trades ~30% per-step compute for
+    # activation memory.  Required for seq=1024 at batch>=2 on
+    # 16 GB GPU.  Safe to keep on even at smaller configs.
+    if args.grad_checkpoint:
+        try:
+            student.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            # HF training mode requires input grads for checkpointing
+            # to work with teacher forcing.  Only enable if the model
+            # supports the helper.
+            if hasattr(student, "enable_input_require_grads"):
+                student.enable_input_require_grads()
+            print("gradient checkpointing: enabled on student")
+        except Exception as e:
+            print(f"gradient_checkpointing_enable failed ({e}); continuing")
+
     # Count student trainable params.
     trainable_params = sum(p.numel() for p in student.parameters()
                            if p.requires_grad)
     print(f"  student trainable params: {trainable_params:,}")
+    _gpu_mem("after student")
 
     # Initial (post-init, pre-QAT) PPL
     print("evaluating student PPL post-init (pre-QAT)...")
@@ -373,10 +490,23 @@ def main():
         }, indent=2))
         return
 
-    opt = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=args.lr,
-    )
+    params = [p for p in student.parameters() if p.requires_grad]
+    if args.optimizer == "adamw8bit":
+        try:
+            import bitsandbytes as bnb
+            opt = bnb.optim.AdamW8bit(params, lr=args.lr,
+                                      weight_decay=args.weight_decay)
+            print(f"optimizer: bnb.AdamW8bit  "
+                  f"(weight_decay={args.weight_decay})")
+        except Exception as e:
+            print(f"bitsandbytes unavailable ({e}); falling back to torch AdamW")
+            opt = torch.optim.AdamW(params, lr=args.lr,
+                                    weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.AdamW(params, lr=args.lr,
+                                weight_decay=args.weight_decay)
+        print(f"optimizer: torch.AdamW  "
+              f"(weight_decay={args.weight_decay})")
 
     # Simple cosine LR with warmup
     def lr_at(step):
@@ -387,55 +517,68 @@ def main():
         return args.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
     kl = nn.KLDivLoss(reduction="batchmean", log_target=False)
-    it = iter_train_samples(tokenizer, args.seq_len, args.batch_size)
+    it = iter_train_samples(tokenizer, args.seq_len, args.batch_size,
+                            c4_samples=args.c4_samples)
 
-    print(f"training: {args.steps} steps, lr={args.lr}, "
-          f"batch={args.batch_size}, seq_len={args.seq_len}")
+    accum = max(1, args.grad_accum_steps)
+    effective_batch = args.batch_size * accum
+    print(f"training: {args.steps} opt-steps, lr={args.lr}, "
+          f"batch={args.batch_size} × accum={accum} "
+          f"= effective {effective_batch}, seq_len={args.seq_len}")
+    _gpu_mem("pre-train-loop")
     loss_recent = []
     t0 = time.time()
     for step in range(1, args.steps + 1):
         for g in opt.param_groups:
             g["lr"] = lr_at(step - 1)
 
-        batch = next(it).to(device)
-        # Teacher forward (no grad)
-        with torch.no_grad():
-            t_out = teacher(batch, output_hidden_states=bool(args.inter_mse_weight))
-            t_logits = t_out.logits.float()
-            t_hidden = t_out.hidden_states if args.inter_mse_weight else None
-
-        # Student forward
-        s_out = student(batch, output_hidden_states=bool(args.inter_mse_weight))
-        s_logits = s_out.logits.float()
-
-        # KL(student || teacher) with log-softmax on student, softmax on teacher
-        l_kl = kl(
-            torch.nn.functional.log_softmax(s_logits, dim=-1).view(-1, s_logits.size(-1)),
-            torch.nn.functional.softmax(t_logits, dim=-1).view(-1, t_logits.size(-1)),
-        )
-        loss = l_kl
-
-        if args.inter_mse_weight:
-            # Paper's L2L: sum of per-layer MSE across decoder layers,
-            # skipping the embedding output (hidden_states[0]).  No
-            # averaging — matches SamsungLabs/LittleBit utils/kd_utils.py.
-            s_hidden = s_out.hidden_states[1:]
-            t_hidden_list = t_hidden[1:]
-            l_inter = 0.0
-            for sh, th in zip(s_hidden, t_hidden_list):
-                l_inter = l_inter + torch.nn.functional.mse_loss(
-                    sh.float(), th.float()
-                )
-            loss = loss + args.inter_mse_weight * l_inter
-
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        step_loss = 0.0
+        for micro in range(accum):
+            batch = next(it).to(device)
+            # Teacher forward (no grad, bf16 logits/hidden)
+            with torch.no_grad():
+                t_out = teacher(batch, output_hidden_states=bool(args.inter_mse_weight))
+                t_logits = t_out.logits
+                t_hidden = t_out.hidden_states if args.inter_mse_weight else None
+
+            # Student forward
+            s_out = student(batch, output_hidden_states=bool(args.inter_mse_weight))
+            s_logits = s_out.logits
+
+            log_p_s = torch.nn.functional.log_softmax(s_logits, dim=-1)
+            with torch.no_grad():
+                p_t = torch.nn.functional.softmax(t_logits, dim=-1).to(log_p_s.dtype)
+            l_kl = kl(
+                log_p_s.view(-1, log_p_s.size(-1)),
+                p_t.view(-1, p_t.size(-1)),
+            )
+            del log_p_s, p_t, s_logits, t_logits
+            loss = l_kl
+
+            if args.inter_mse_weight:
+                s_hidden = s_out.hidden_states[1:]
+                t_hidden_list = t_hidden[1:]
+                l_inter = 0.0
+                for sh, th in zip(s_hidden, t_hidden_list):
+                    l_inter = l_inter + torch.nn.functional.mse_loss(
+                        sh, th.to(sh.dtype)
+                    )
+                loss = loss + args.inter_mse_weight * l_inter
+
+            # Average micro-step losses so the effective gradient
+            # matches a single batch=effective_batch forward.
+            (loss / accum).backward()
+            step_loss += loss.item()
+            del loss
+
         torch.nn.utils.clip_grad_norm_(
             [p for p in student.parameters() if p.requires_grad], 1.0
         )
         opt.step()
-
-        loss_recent.append(loss.item())
+        loss_recent.append(step_loss / accum)
+        if step == 1:
+            _gpu_mem("after step 1 (peak)")
         if step % args.log_every == 0:
             recent = float(np.mean(loss_recent[-args.log_every:]))
             print(f"  step {step:5d}  lr={lr_at(step-1):.2e}  "
