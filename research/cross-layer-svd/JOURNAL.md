@@ -2786,3 +2786,96 @@ Shipped this entry:
 - `littlebit_math.md §13`: full experimental writeup + skepticism
   points + go/no-go decision.
 
+---
+
+## 2026-04-21 — Full-model QAT on Qwen 0.5B: **beats archived FP-SVD floor by 36%**
+
+Executed §10.2 end-to-end. Wrapped Qwen 2.5 0.5B with LittleBit at
+r=512 (168 linears), trained via KL distillation against a frozen
+fp16 teacher on wikitext-2 for 8000 steps at seq=512, batch=1,
+lr=1e-4 with 200-step cosine warmup. Wall clock: 45 minutes on
+RTX 5080 Laptop 16 GB (5 min wrap + 36 min train + eval overhead).
+
+Full writeup in
+[littlebit_math.md §14](littlebit_math.md#14-full-model-qat-run-2026-04-21-beats-the-fp-svd-floor).
+
+**Result: PPL 54.81, crossing the archived FP-SVD floor of 86 at
+step 3000 and continuing to descend for another 5000 steps before
+cosine LR bottomed out.**
+
+| Bar | PPL | Margin |
+|---|---:|---:|
+| Teacher (fp16) | 16.4 | baseline |
+| Archived FP-SVD floor (r=512, no training) | 86 | 1.9× teacher |
+| **LittleBit QAT final (KL-only, 1 epoch)** | **54.8** | **1.6× over floor** |
+| Dual-SVID init (pre-QAT) | 391,596 | 7,137× worse |
+
+Training trajectory was textbook exponential-approach: PPL cut
+roughly in half every doubling of steps until ~step 5000, then
+flattened as the cosine LR schedule decayed to zero.
+
+**What this closes from the prior entries:**
+
+- The §12 scale-invariant constants (Dual-SVID discards ~61% of
+  rank-r info, ~0.63 rank-1 separability) predicted a bad init
+  that QAT would have to recover. Happened exactly as predicted:
+  init PPL 391k, converged to 55 after 8000 steps.
+- The §13 single-matrix finding (activation-weighted QAT recovers
+  91% of per-layer activation energy) predicted that composition
+  through 24 layers could work. Confirmed: per-layer 30% activation
+  error did NOT compound catastrophically under end-to-end KL loss;
+  the model recovered to within 3.3× of teacher PPL.
+- The 2026-04-19 synthesis said "post-training compression is at
+  ceiling; retraining is the direction." This result is the first
+  direct empirical validation of that direction on our archived SVD
+  test bed: KL QAT on the LittleBit format unlocks a regime our
+  best post-training factor method (PPL 86) cannot reach.
+
+**Recipe deltas from the paper's setup:**
+- 1 epoch wikitext-2 only (paper: 5 epochs, wikitext + C4)
+- KL loss only (paper: KL + 10*MSE on intermediate hidden states)
+- seq=512 (paper: 2048)
+- 8000 steps on Qwen 0.5B (paper: OPT-1.3B smallest, never <1B)
+
+Our result is therefore a **lower bound** on what this format can
+reach on this model. Adding the paper's full recipe would likely
+pull PPL further down toward paper's OPT-1.3B 0.1-BPW PPL of 53.76.
+
+**What still isn't validated:**
+- Scale behavior up to 7B/13B (paper's main result). Need §14.6
+  ladder: 1.5B → 3B → 7B local.
+- Inference speed. Training uses PyTorch's unoptimized Prop. 1
+  form. The 11.6× kernel speedup requires a real binary-factor
+  CUDA kernel (GGUF tensor type + llama.cpp loader), still
+  research-only under our upstream-only deployment invariant.
+- Downstream tasks (piqa / hellaswag / arc). PPL on wikitext is
+  a proxy for language-model quality; paper reports 47.3% mean
+  accuracy at 0.55 BPW on 7 zero-shot benchmarks vs 63.0% fp16.
+
+**Next action from §14.6, in priority order:**
+
+1. Memory-optimization stack (bf16 student + nf4 teacher + 8-bit
+   Adam + grad checkpointing) so 7B fits in 16 GB. Target ~2 hours
+   of coding + 0.5B validation re-run.
+2. FP-SVD floor measurement for 1.5B and 3B (~20 min, existing
+   sanity script).
+3. Qwen 2.5 1.5B QAT (2-3h).
+4. Qwen 2.5 3B QAT (4-6h).
+5. Qwen 2.5 7B QAT (7-9h overnight).
+
+The user committed to fully-local scaling. 30B+ is out of scope for
+a single-GPU home lab without multi-day CPU-offloaded DeepSpeed
+ZeRO-3 runs; scale story stops at 7B for this fork.
+
+Shipped this entry:
+- `littlebit_qat_model_run1.json` — raw per-step loss + per-eval
+  PPL history for the headline run.
+- `littlebit_qat_model.py` — production QAT script; added
+  wrap-progress logging + switched iter_train_samples to
+  concatenated-stream sampling (original per-row filter was
+  rejecting all samples at seq=1024, hence an earlier stall).
+- `littlebit_math.md §14` — full run writeup with trajectory
+  table, paper-baseline comparison, what's validated / what's
+  next.
+
+

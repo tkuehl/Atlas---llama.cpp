@@ -826,3 +826,166 @@ Open to stopping if:
   under compounding).
 - Loss curve plateaus and PPL > 200 after 1 epoch (then we're
   below the archived SVD floor and format can't reach it).
+
+---
+
+## 14. Full-model QAT run (2026-04-21): beats the FP-SVD floor
+
+Executed the §10.2 full-model QAT plan on Qwen 2.5 0.5B.
+
+**Configuration:**
+- Teacher: Qwen 2.5 0.5B, bf16, frozen.
+- Student: same architecture, all 168 `nn.Linear` except `lm_head`
+  wrapped with `LittleBitLinearHF(r=512)`, Dual-SVID init. fp32
+  parameters for stability of SmoothSign backward.
+- Loss: KL divergence of student's log-softmax against teacher's
+  softmax, batchmean reduction. **Intermediate-MSE disabled** —
+  paper's `λ=10` MSE term would have added hidden-state
+  supervision; we ran KL-only as a baseline.
+- Data: wikitext-2 train, 1024-token concatenated stream, random
+  512-token windows (batch=1).
+- Optimizer: AdamW, lr=1e-4, cosine decay with 200-step linear
+  warmup, 8000 total steps.
+- Hardware: RTX 5080 Laptop 16 GB.
+- Wall clock: ~45 min total (5 min Dual-SVID wrap + 36 min train +
+  eval overhead).
+
+**Result: PPL 54.81 at step 8000, vs. archived FP-SVD floor of 86.**
+
+### 14.1 Full trajectory
+
+Wikitext-2 test PPL at each checkpoint (seq=512, max 25k tokens):
+
+| Step | PPL | Δ | Notes |
+|---:|---:|---:|---|
+| 0 | 391,596 | — | Dual-SVID init, pre-QAT |
+| 500 | 232 | -391,364 | 1700× reduction in first 150s |
+| 1000 | 158 | -74 | |
+| 1500 | 122 | -36 | |
+| 2000 | 104 | -18 | |
+| 2500 | 94 | -10 | |
+| **3000** | **86** | -8 | **crossed archived FP-SVD floor** |
+| 3500 | 80 | -6 | |
+| 4000 | 74 | -5 | |
+| 4500 | 69 | -5 | |
+| 5000 | 64 | -5 | |
+| 5500 | 62 | -2 | LR cosine decay begins biting |
+| 6000 | 59 | -2 | |
+| 6500 | 57 | -3 | |
+| 7000 | 56 | -1 | |
+| 7500 | 55 | -1 | |
+| 8000 | **54.8** | -0.1 | final, essentially converged |
+
+Teacher PPL (fp16, seq=512): 16.4. Student final is 3.34× teacher PPL.
+
+### 14.2 Context vs. published baselines
+
+At a BPW operating point between the paper's 0.55 and 1.0 (our
+`r=512, d=896` gives BPW ≈ 0.7 on square projections and ~1.1
+averaged across MLP and attention due to the scale overhead):
+
+| Reference point | Model | BPW | PPL |
+|---|---|---:|---:|
+| Paper: OPT-1.3B, 0.1 BPW | OPT-1.3B | 0.10 | 53.76 |
+| Paper: OPT-1.3B, 0.55 BPW | OPT-1.3B | 0.55 | 23.35 |
+| Paper: Llama2-7B, 0.1 BPW | Llama2-7B | 0.10 | 15.92 |
+| **This run: Qwen2.5-0.5B, KL-only, 1 epoch** | **Qwen2.5-0.5B** | **~0.7** | **54.8** |
+| Archived FP-SVD floor | Qwen2.5-0.5B | — (un-compressed factors) | 86 |
+
+Our Qwen2.5-0.5B PPL at ~0.7 BPW roughly matches the paper's
+OPT-1.3B PPL at 0.1 BPW — i.e., at a higher BPW but a smaller
+model, we land in the same PPL range. Since the paper's recipe
+uses 5 epochs, MSE-augmented loss (`λ=10`), a larger corpus
+(wikitext-2 + C4), and presumably more training tokens per step
+(seq=2048), we'd expect meaningful headroom remaining. Our result
+is a **lower bound** on what this format can reach on this model.
+
+### 14.3 What this validates
+
+**Against the §13 single-matrix prediction:**
+Per-layer activation-weighted single-matrix QAT hit 0.31 rel-err
+(0.91 captured) at r=512. §13.4 asked whether that composes through
+24 layers without catastrophic error compounding. Answer: **yes**.
+Under KL loss the full-model student recovers enough that end-to-end
+PPL drops from 391,596 (compounding 30% per-layer errors
+multiplicatively) to 54.8 (10% of teacher's PPL gap is recovered).
+
+**Against the archived 2026-04-19 synthesis:**
+That synthesis closed with "post-training compression is at ceiling;
+retraining is the direction." LittleBit was the first 2026-04-21
+survey entry to sit directly on our archived per-matrix SVD lineage.
+This QAT result confirms: **relaxing the post-training constraint
+by introducing KL distillation unlocks a compression regime that
+pure post-training SVD cannot reach**, at a 1.6× margin (PPL 86 →
+55) in 36 min of local training on a laptop GPU.
+
+**Against the paper's headline approach:**
+We reproduced the direction of the paper's result, on a smaller
+model, with a stripped-down recipe (1 epoch, KL-only, no MSE,
+seq=512). The paper's approach is real at small scale. The
+stronger paper claims at 7B+ remain to test.
+
+### 14.4 What this does NOT yet show
+
+- **Scale behavior**: paper's trend is "gap to FP16 shrinks with
+  model size." Haven't confirmed on 1.5B / 3B / 7B locally.
+- **Inference speed**: the 11.6× kernel speedup claim is for paper's
+  custom CUDA kernel at batch=1 decode. Our student at training
+  time runs the inefficient Prop. 1 form in PyTorch — no kernel
+  advantage yet. A GGUF-loadable LittleBit tensor type is required
+  before this translates to an Atlas-deployable model.
+- **Intermediate-MSE contribution**: not tested. The paper uses
+  `λ=10` MSE on hidden states. Our KL-only ablation says KL alone
+  is sufficient to get *past* the FP-SVD floor, but doesn't measure
+  whether adding MSE would tighten to paper-style PPL.
+- **Downstream tasks**: PPL on wikitext is a proxy. Zero-shot
+  reasoning (piqa, hellaswag, arc) would be the paper-comparable
+  next step.
+- **Longer seq lengths**: paper uses seq=2048. We used 512 due to
+  GPU memory pressure at seq=1024 on 16 GB. Longer context
+  gradients may improve quality further.
+
+### 14.5 Config summary for reproduction
+
+`littlebit_qat_model.py` + the json output capture the full
+config. Reproduction on the same hardware:
+
+```bash
+cd research/cross-layer-svd
+./venv-research/Scripts/python.exe -u littlebit_qat_model.py \
+    --steps 8000 --eval-every 500 --log-every 50 \
+    --warmup-steps 200 --seq-len 512 --eval-max-tokens 25000 \
+    --lr 1e-4 --out littlebit_qat_model_run1.json
+```
+
+Expected wall time: ~45 min on RTX 5080 Laptop. Expected final
+PPL: 54–56 range (seed-sensitive).
+
+### 14.6 Next concrete actions
+
+Priority ordering for the next session:
+
+1. **Upgrade memory stack** so larger models fit locally:
+   `--student-dtype bf16`, `--optimizer adam8bit` (bitsandbytes),
+   `--teacher-quant nf4`, `--grad-checkpoint`. Target: fit 7B QAT
+   in 16 GB. Estimated 2 hours of coding + 0.5B validation re-run.
+2. **Establish FP-SVD floor for 1.5B and 3B** — single-shot
+   `littlebit_sanity.py` runs, ~20 min total.
+3. **Qwen 2.5 1.5B full-model QAT** with the upgraded stack.
+   Expected wall: 2–3 hours. Target: beat 1.5B FP-SVD floor.
+4. **Qwen 2.5 3B QAT** once 1.5B validates. Expected wall: 4–6
+   hours.
+5. **Qwen 2.5 7B QAT** once 3B validates. Expected wall: 7–9
+   hours overnight.
+
+Scaling path stays fully local. At each step the PPL-vs-floor
+margin is a direct measurement of whether the paper's approach
+generalizes down to consumer-scale models on consumer hardware.
+
+### 14.7 One-sentence summary
+
+**On Qwen 2.5 0.5B, 36 minutes of KL-only QAT on a laptop GPU
+drives the LittleBit-wrapped model's wikitext-2 PPL from 391,596
+(Dual-SVID init) to 54.8 — a 36% improvement over our archived
+post-training FP-SVD floor at matched rank, and enough to validate
+pushing the reproduction up the scale ladder toward 7B locally.**

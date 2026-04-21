@@ -126,12 +126,15 @@ class LittleBitLinearHF(nn.Module):
 
 def wrap_model_littlebit(model: nn.Module, r: int,
                          tau: float = 100.0,
-                         skip: tuple[str, ...] = ("lm_head",)) -> int:
+                         skip: tuple[str, ...] = ("lm_head",),
+                         log_every: int = 10) -> int:
     """Recursively replace nn.Linear with LittleBitLinearHF in-place.
 
     Returns the number of layers wrapped.
     """
-    wrapped = 0
+    # Collect all (parent, child_name, full_name) to wrap first, so we
+    # can track progress accurately.
+    targets = []
     for name, module in model.named_modules():
         for child_name, child in list(module.named_children()):
             if not isinstance(child, nn.Linear):
@@ -139,10 +142,24 @@ def wrap_model_littlebit(model: nn.Module, r: int,
             full = f"{name}.{child_name}" if name else child_name
             if any(s in full for s in skip):
                 continue
-            new = LittleBitLinearHF.from_linear(child, r=r, tau=tau)
-            setattr(module, child_name, new)
-            wrapped += 1
-    return wrapped
+            targets.append((module, child_name, full, child))
+    print(f"  wrapping {len(targets)} Linear layers...", flush=True)
+
+    t0 = time.time()
+    for i, (parent, child_name, full, child) in enumerate(targets, start=1):
+        t_i = time.time()
+        new = LittleBitLinearHF.from_linear(child, r=r, tau=tau)
+        setattr(parent, child_name, new)
+        if i % log_every == 0 or i == len(targets):
+            per = (time.time() - t0) / i
+            remain = per * (len(targets) - i)
+            print(f"    {i:3d}/{len(targets)}  "
+                  f"last={full} [{child.out_features}x{child.in_features}] "
+                  f"{time.time() - t_i:.1f}s  "
+                  f"total={time.time() - t0:.0f}s  "
+                  f"eta={remain:.0f}s",
+                  flush=True)
+    return len(targets)
 
 
 @torch.no_grad()
@@ -184,30 +201,32 @@ def wikitext_ppl(model, tokenizer, split: str = "test",
 
 
 def iter_train_samples(tokenizer, seq_len: int, batch_size: int,
-                       min_chars: int = 400):
+                       seed: int = 0):
     """Yield (batch_size, seq_len) tensors from wikitext-2 train,
-    looping forever."""
+    looping forever.
+
+    Wikitext rows are short (max ~500 tokens with Qwen tokenizer), so
+    we concatenate the whole train split into one stream and slide
+    random windows.  Same pattern as wikitext_ppl() in this file.
+    """
     from datasets import load_dataset
+    print("  preparing train token stream...", flush=True)
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    buf = []
+    text = "\n\n".join(row["text"] for row in ds)
+    tokens = tokenizer(text, return_tensors="pt").input_ids[0]
+    n = tokens.shape[0]
+    print(f"  train stream: {n:,} tokens, {n // seq_len:,} "
+          f"non-overlapping {seq_len}-token windows",
+          flush=True)
+    g = torch.Generator()
+    g.manual_seed(seed)
     while True:
-        for row in ds:
-            t = row["text"].strip()
-            if len(t) < min_chars:
-                continue
-            ids = tokenizer(t, return_tensors="pt",
-                            truncation=True, max_length=seq_len)
-            arr = ids.input_ids[0]
-            if arr.shape[0] < 8:
-                continue
-            # Pad or trim to seq_len
-            if arr.shape[0] < seq_len:
-                continue  # only keep samples that fill the window
-            arr = arr[:seq_len]
-            buf.append(arr)
-            if len(buf) == batch_size:
-                yield torch.stack(buf, dim=0)
-                buf = []
+        batch = []
+        for _ in range(batch_size):
+            start = int(torch.randint(0, n - seq_len - 1, (1,),
+                                      generator=g).item())
+            batch.append(tokens[start:start + seq_len])
+        yield torch.stack(batch, dim=0)
 
 
 def main():
