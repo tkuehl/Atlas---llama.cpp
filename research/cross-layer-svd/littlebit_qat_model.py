@@ -269,8 +269,11 @@ def main():
     p.add_argument("--eval-max-tokens", type=int, default=50_000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--warmup-steps", type=int, default=200)
-    p.add_argument("--inter-mse-weight", type=float, default=0.0,
-                   help="Weight for intermediate hidden-state MSE; 0 disables")
+    p.add_argument("--inter-mse-weight", type=float, default=10.0,
+                   help="Weight for intermediate hidden-state MSE. "
+                        "Paper's value is 10.0; set 0 to disable. "
+                        "Loss contribution is l2l_weight * sum_{i in layers[1:]} "
+                        "MSE(student_h_i, teacher_h_i).")
     p.add_argument("--out", default="littlebit_qat_model.json")
     p.add_argument("--checkpoint", default="littlebit_qat_checkpoint.pt",
                    help="End-of-training state_dict path (always saved)")
@@ -413,13 +416,16 @@ def main():
         loss = l_kl
 
         if args.inter_mse_weight:
-            s_hidden = s_out.hidden_states
+            # Paper's L2L: sum of per-layer MSE across decoder layers,
+            # skipping the embedding output (hidden_states[0]).  No
+            # averaging — matches SamsungLabs/LittleBit utils/kd_utils.py.
+            s_hidden = s_out.hidden_states[1:]
+            t_hidden_list = t_hidden[1:]
             l_inter = 0.0
-            for sh, th in zip(s_hidden, t_hidden):
+            for sh, th in zip(s_hidden, t_hidden_list):
                 l_inter = l_inter + torch.nn.functional.mse_loss(
                     sh.float(), th.float()
                 )
-            l_inter = l_inter / max(1, len(s_hidden))
             loss = loss + args.inter_mse_weight * l_inter
 
         opt.zero_grad(set_to_none=True)
