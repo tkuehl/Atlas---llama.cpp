@@ -2707,3 +2707,82 @@ training compute because: (a) the paper's math is verified;
 (b) the quality story is entirely QAT, which we know is what needs
 measuring; (c) three matrix samples give us a predictable pre-QAT
 baseline (0.39× captured) to score QAT's contribution against.
+
+---
+
+## 2026-04-21 — Single-matrix QAT: format works under activation-weighted loss, not Frobenius
+
+Ran three local QAT experiments on Qwen 0.5B gate_proj L12 at r=512
+before committing full-model training compute. Full writeup in
+[littlebit_math.md §13](littlebit_math.md#13-single-matrix-qat-experiments-2026-04-21).
+
+**Plain Frobenius QAT caps at rel err ~0.75.** Three configurations
+tested (lr=1e-2 full, lr=1e-2 scales-only, lr=1e-3 full 5k steps).
+All converge to the same ~0.75 ceiling regardless of LR.
+Scales-only recovers essentially nothing (+0.001 rel err):
+Dual-SVID already places h, g, ℓ at their Frobenius optimum given
+the fixed signs. Sign flipping buys ~9% relative improvement and
+plateaus hard. **If this had been the final answer, it would have
+killed the reproduction.**
+
+**Activation-weighted QAT tells a completely different story.**
+Same hyperparameters, loss changed to `||X·W.T − X·Ŵ.T||_F²` using
+XTX collected over 32 wikitext samples:
+
+| Metric | Init | Best after 5k steps | Δ |
+|---|---:|---:|---:|
+| Activation rel-err | 0.8824 | **0.3072** | **+0.5752** |
+| Frobenius rel-err | 0.8243 | 0.8323 | -0.008 |
+
+**The format has the capacity after all; Dual-SVID just uses the
+wrong objective.** Activation energy captured rises from 22% (Dual-
+SVID init) to **91%** after activation-weighted QAT. Frobenius
+error simultaneously gets *worse* — training is trading Frobenius-
+optimal directions (which don't matter for X·W.T) for
+activation-relevant ones.
+
+**Single cleanest statement:** LittleBit at r=512 can represent the
+activation-relevant subspace of W to >90% energy fidelity. It
+cannot represent W itself. QAT works by sacrificing Frobenius-
+optimal directions that don't matter for X·W.T and concentrating
+capacity on directions that do. This is the same principle behind
+CALDERA, GPTQ, AWQ — activation-weighted calibration. LittleBit
+inherits it implicitly through its training objective.
+
+**Reframes the reproduction question one more time.** The right
+form is no longer "can QAT close the 61% discard fraction" (wrong
+denominator) or "can QAT beat FP-SVD in Frobenius" (wrong metric)
+but:
+
+> **Does full-model QAT with KL + intermediate-MSE losses achieve
+> ~90% activation-energy capture per layer, closely enough that
+> end-to-end PPL after compounding through all 24 layers of
+> Qwen 0.5B stays near the FP16 baseline and below the archived
+> FP-SVD floor?**
+
+Per-layer activation error is ~0.31 locally; compounded through 24
+layers, worst-case is catastrophic but best-case (errors cancel
+through downstream gradient) preserves PPL within a few points.
+Can't predict without running.
+
+**Go for §10.2 full-model QAT.** Cost: 4-8 GPU-hours on RTX 5080
+Laptop. Kill criteria defined:
+- Per-layer activation capture stuck below 0.5× after 500 steps
+  (format breaks under compounding)
+- PPL > 200 after 1 epoch (below the archived FP-SVD floor)
+
+Shipped this entry:
+- `littlebit_qat_single.py`: plain Frobenius single-matrix QAT.
+- `littlebit_qat_activation.py`: activation-weighted single-matrix
+  QAT with XTX collection + caching.
+- Result JSONs:
+  - `littlebit_qat_single_r512.json` (plain Frob, lr=1e-2)
+  - `littlebit_qat_single_r512_lr1e-3.json` (plain Frob, lr=1e-3)
+  - `littlebit_qat_single_r512_scalesonly.json` (plain Frob,
+    signs frozen)
+  - `littlebit_qat_activation_r512.json` (activation-weighted)
+  - `qwen05b_gate12_xtx.pkl` (local calibration cache, gitignored;
+    regenerates in ~30s from the activation script's `--cache` path)
+- `littlebit_math.md §13`: full experimental writeup + skepticism
+  points + go/no-go decision.
+

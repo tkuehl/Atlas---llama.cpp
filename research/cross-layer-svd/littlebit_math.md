@@ -666,3 +666,163 @@ that binarization+scale-init systematically discards.**
 - Most importantly: does QAT actually recover the 61%? That's the
   reproduction bet, and the answer governs whether LittleBit is
   ever better than our archived FP-SVD floor at matched storage.
+
+---
+
+## 13. Single-matrix QAT experiments (2026-04-21)
+
+Three local QAT experiments on the same target matrix (Qwen 0.5B
+gate_proj L12, r=512), each testing a specific hypothesis about
+where LittleBit's reported quality recovery actually comes from.
+
+Scripts:
+- [`littlebit_qat_single.py`](littlebit_qat_single.py) — plain
+  Frobenius objective, optional `--freeze-signs`.
+- [`littlebit_qat_activation.py`](littlebit_qat_activation.py) —
+  activation-weighted objective `||X·W.T − X·Ŵ.T||_F²`, using XTX
+  collected over 32 wikitext samples.
+
+### 13.1 Plain Frobenius QAT — caps at ~0.75 rel err
+
+| Config | Init rel-err | Best rel-err | Improvement |
+|---|---:|---:|---:|
+| `lr=1e-2` full | 0.824 | 0.750 (step 1000, diverges after) | +0.074 |
+| `lr=1e-2` scales-only (signs frozen) | 0.824 | 0.824 (step 400) | **+0.001** |
+| `lr=1e-3` full, 5000 steps | 0.824 | 0.752 (step 4550, stable plateau) | +0.072 |
+
+**Findings:**
+
+1. **Scales alone recover essentially nothing** (+0.001 rel err).
+   Dual-SVID already places `h, g, ℓ` at their Frobenius-optimum
+   given the fixed sign pattern. Continued scale training is futile.
+2. **Sign flipping caps at ~0.75 rel err.** Both `lr=1e-2` (unstable
+   after 1000 steps) and `lr=1e-3` (stable but plateaued) converge
+   to the same `0.75 ± 0.01` ceiling. Robust to LR choice.
+3. **Plain-Frobenius QAT gains are small: ~9% relative.** From
+   0.39× captured (Dual-SVID) to 0.44× captured (trained). Still
+   far below FP-SVD's 0.83× captured at rank 512.
+
+**Implication if we stopped here:** LittleBit's format is capacity-
+limited at r=512 and full-model QAT will not recover anything
+meaningful. This would have killed the reproduction idea.
+
+### 13.2 Activation-weighted QAT — 57-point improvement
+
+Loss `||X·W.T − X·Ŵ.T||_F²` computed from XTX (d_in × d_in Gramian,
+32 wikitext samples × 2048 tokens). Same hyperparameters as the
+Frobenius run: `lr=1e-3`, 5000 steps, `tau=100`.
+
+| Metric | Init | Best | Δ |
+|---|---:|---:|---:|
+| Activation rel-err `\|\|X·D.T\|\|_F / \|\|X·W.T\|\|_F` | 0.8824 | **0.3072** | **+0.5752** |
+| Frobenius rel-err `\|\|D\|\|_F / \|\|W\|\|_F` | 0.8243 | 0.8323 | −0.008 |
+
+**The two metrics diverge.** Frobenius error goes *up* slightly
+during training. Activation error drops from 88% to 31%. Translated
+to energy-captured in each domain:
+
+| Domain | FP-SVD @ r=512 | Dual-SVID init | Trained | Trained vs FP-SVD |
+|---|---:|---:|---:|---:|
+| Matrix Frobenius | 0.827 | 0.321 | 0.307 | 0.37× |
+| Activation energy | — | 0.222 | **0.906** | **comparable or better** |
+
+**Single cleanest observation across all these experiments:**
+
+> **The LittleBit format at r=512 CAN represent the activation-
+> relevant subspace of `W` to >90% energy fidelity. It CANNOT
+> represent `W` itself. QAT succeeds by sacrificing Frobenius-
+> optimal directions that don't matter for `X·W.T`, and
+> concentrating representational capacity on directions that do.**
+
+This reframes §12.8's consolidated findings: the ~0.61 Dual-SVID
+discard fraction is only relevant under a Frobenius objective.
+Under an activation-weighted objective, the rank-`r` subspace
+that *matters* is ~90% recoverable.
+
+### 13.3 Why Dual-SVID is bad in Frobenius but a usable warm-start in activation space
+
+Dual-SVID initializes by fitting `W` in Frobenius norm (via the
+SVD + rank-1 magnitude split). That's the wrong objective — `W` has
+"noise" directions in its singular spectrum that don't contribute
+to `X·W.T` but do contribute to `||W||_F`. Binarization preserves
+signs but loses magnitude variation; the lost information is
+Frobenius-weighted, not activation-weighted.
+
+Once activation-weighted gradient flows through the sign operator
+via SmoothSign, the scale vectors redistribute magnitude toward
+input-relevant directions. The signs also flip for columns whose
+inner products with input covariance are too small to matter. The
+result is a `Ŵ` that's *further* from `W` in Frobenius but much
+closer in the `X·W.T` image.
+
+This is the same principle CALDERA and GPTQ / AWQ exploit —
+activation-weighted calibration. LittleBit inherits it implicitly
+through its training objective.
+
+### 13.4 Implications for full-model QAT reproduction (§10.2)
+
+Previous analysis said "QAT must recover the 61% discard fraction."
+The right question is:
+
+> **Does full-model QAT with KL + intermediate-MSE losses achieve
+> ~90% activation-energy capture on every layer, compounded through
+> 24 layers of Qwen 0.5B, closely enough that end-to-end perplexity
+> stays near FP16?**
+
+Each layer produces ~30% activation-rel error locally. Through 24
+layers, worst-case compounding would be catastrophic; best-case
+(errors cancel via downstream gradient) could preserve PPL within
+a few points. We can't predict without running.
+
+But we can now **commit training compute responsibly**:
+- Dual-SVID init is a poor but sign-breaking starting point.
+- The format has ~90% activation-space capacity at r=512 per layer.
+- Full-model QAT is the only way to measure end-to-end compounding.
+- The archived PPL-86 floor at r=512 (FP16 factors) is the bar.
+
+Reproduction now looks like:
+1. Wrap every `nn.Linear` in Qwen 0.5B with `LittleBitLinear`
+   (init via Dual-SVID from teacher).
+2. Freeze embeddings + LM head (standard QAT convention).
+3. Train with `L_out` (KL) + `10·L_inter` (MSE through hidden
+   states) on wikitext for ~1-2 epochs.
+4. Evaluate PPL on wikitext test.
+
+Cost estimate: 4-8 hours on RTX 5080 Laptop for the 0.5B case,
+with checkpointing so we can recover mid-run if the PPL signal
+plateaus high.
+
+### 13.5 Remaining skepticism
+
+- **SmoothSign with tau=100 is narrow.** Only U_fp / V_fp entries
+  within ~0.02/tau = 0.0002 of zero receive non-negligible
+  gradient. That's 1-10% of entries per step. Full-model QAT over
+  many more steps may get more entries into the flip window, or
+  may not. An ablation over tau (say {10, 100, 1000}) would be
+  easy to add in the full-model trainer.
+- **Local activation-rel 0.31 is not "good" in absolute terms.**
+  It means each layer perturbs its own output by 31% magnitude.
+  Whether full-model KL QAT can make adjacent layers compensate
+  for each other is untested.
+- **Qwen 0.5B is small for QAT.** Paper's results are 13B+. Small
+  models may have less redundancy to trade away — every direction
+  in W could matter more per-parameter. A 7B repro would be
+  costly but more comparable to paper.
+- **"Captures 90% activation energy" != "0 PPL increase".** PPL is
+  exponential in cross-entropy, which is sensitive to small
+  logit perturbations at rare tokens. 90% activation capture per
+  layer is not a sufficiency guarantee.
+
+### 13.6 Go/no-go for full-model QAT
+
+**GO.** The activation-weighted result flips the prior conclusion
+from "format is the ceiling" to "format has the capacity, needs
+the right objective." Running full-model QAT on Qwen 0.5B is now
+the directly-informative next step. Expected cost: 4-8 GPU-hours.
+
+Open to stopping if:
+- Full-model KL+MSE fails to break 0.5× activation capture per
+  layer in the first 500 steps (then format really is limited
+  under compounding).
+- Loss curve plateaus and PPL > 200 after 1 epoch (then we're
+  below the archived SVD floor and format can't reach it).
