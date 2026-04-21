@@ -1,0 +1,160 @@
+{
+  "description": "25 public-sourced prompts, 5 per slice, for characterizing llama.cpp speculative decoding behavior. Temperature=0 greedy decode assumed by bench harness.",
+  "version": 1,
+  "prompts": [
+    {
+      "id": "struct_01",
+      "slice": "structured_output",
+      "max_tokens": 250,
+      "prompt": "Generate a JSON object describing a user profile with exactly these fields: id (integer), name (string), email (string), age (integer), is_admin (boolean). Return only the JSON object, no commentary."
+    },
+    {
+      "id": "struct_02",
+      "slice": "structured_output",
+      "max_tokens": 250,
+      "prompt": "Create a JSON configuration for a web server with fields: port (integer), host (string), max_connections (integer), timeout_seconds (integer), enable_https (boolean). Return only the JSON."
+    },
+    {
+      "id": "struct_03",
+      "slice": "structured_output",
+      "max_tokens": 300,
+      "prompt": "Write a JSON array of 3 product entries. Each entry must have fields: id (integer), name (string), price (number), in_stock (boolean), category (string). Return only the JSON array."
+    },
+    {
+      "id": "struct_04",
+      "slice": "structured_output",
+      "max_tokens": 200,
+      "prompt": "Write a single SQL CREATE TABLE statement for a 'users' table with these columns: id (primary key integer), username (varchar 50, not null, unique), email (varchar 255, not null), created_at (timestamp, default now). Return only the SQL."
+    },
+    {
+      "id": "struct_05",
+      "slice": "structured_output",
+      "max_tokens": 250,
+      "prompt": "Generate a JSON object representing a logging-service configuration with fields: level (string, one of DEBUG/INFO/WARN/ERROR), handlers (array of strings), format (string), filename (string). Return only the JSON."
+    },
+
+    {
+      "id": "code_01",
+      "slice": "code",
+      "max_tokens": 250,
+      "prompt": "Write a Python function factorial(n) that returns the factorial of a non-negative integer n. Include a short docstring. Return only the function code."
+    },
+    {
+      "id": "code_02",
+      "slice": "code",
+      "max_tokens": 250,
+      "prompt": "Write a C function with signature `void reverse(char *s)` that reverses a null-terminated string in place. Include a standard C header comment. Return only the function."
+    },
+    {
+      "id": "code_03",
+      "slice": "code",
+      "max_tokens": 250,
+      "prompt": "Write a Python function is_prime(n) that returns True if n is a prime number and False otherwise. Handle n < 2 correctly. Return only the function code."
+    },
+    {
+      "id": "code_04",
+      "slice": "code",
+      "max_tokens": 200,
+      "prompt": "Write a Go function Sum(nums []int) int that returns the sum of the integers in the slice. Return only the function code."
+    },
+    {
+      "id": "code_05",
+      "slice": "code",
+      "max_tokens": 250,
+      "prompt": "Write a Python function fibonacci(n) that returns the n-th Fibonacci number (0-indexed, so fibonacci(0) == 0). Use iteration, not recursion. Return only the function code."
+    },
+
+    {
+      "id": "fact_01",
+      "slice": "factual_qa",
+      "max_tokens": 80,
+      "prompt": "What is the capital city of Australia? Answer in one short sentence."
+    },
+    {
+      "id": "fact_02",
+      "slice": "factual_qa",
+      "max_tokens": 80,
+      "prompt": "Who wrote the novel 1984? Answer in one short sentence."
+    },
+    {
+      "id": "fact_03",
+      "slice": "factual_qa",
+      "max_tokens": 60,
+      "prompt": "What is the chemical symbol for gold?"
+    },
+    {
+      "id": "fact_04",
+      "slice": "factual_qa",
+      "max_tokens": 80,
+      "prompt": "In what year did humans first land on the Moon? Answer in one short sentence."
+    },
+    {
+      "id": "fact_05",
+      "slice": "factual_qa",
+      "max_tokens": 80,
+      "prompt": "What is the largest ocean on Earth? Answer in one short sentence."
+    },
+
+    {
+      "id": "reason_01",
+      "slice": "reasoning",
+      "max_tokens": 400,
+      "prompt": "A store has 120 apples. It sells 30 in the morning and 45 in the afternoon. How many apples remain at the end of the day? Show your reasoning step by step, then give the final answer."
+    },
+    {
+      "id": "reason_02",
+      "slice": "reasoning",
+      "max_tokens": 500,
+      "prompt": "A train leaves station A at 9:00 AM traveling 60 miles per hour toward station B. Another train leaves station B at 10:00 AM traveling 80 miles per hour toward A. Stations A and B are 280 miles apart. At what time do the two trains meet? Show your reasoning step by step."
+    },
+    {
+      "id": "reason_03",
+      "slice": "reasoning",
+      "max_tokens": 300,
+      "prompt": "A recipe for 6 cookies calls for 2 cups of flour. How many cups of flour do you need to make 15 cookies? Show your reasoning step by step."
+    },
+    {
+      "id": "reason_04",
+      "slice": "reasoning",
+      "max_tokens": 400,
+      "prompt": "A rectangular garden is 12 meters long and 8 meters wide. If fencing costs $5 per meter, how much does it cost to fence the entire perimeter of the garden? Show your reasoning step by step."
+    },
+    {
+      "id": "reason_05",
+      "slice": "reasoning",
+      "max_tokens": 300,
+      "prompt": "A child saves $3 every week. How much money will they have saved after 16 weeks? Show your reasoning step by step."
+    },
+
+    {
+      "id": "conv_01",
+      "slice": "conversational",
+      "max_tokens": 300,
+      "prompt": "What's your favorite kind of weather, and why?"
+    },
+    {
+      "id": "conv_02",
+      "slice": "conversational",
+      "max_tokens": 350,
+      "prompt": "Tell me about an interesting hobby that someone new to it might enjoy picking up. Describe why it's interesting and how a beginner might get started."
+    },
+    {
+      "id": "conv_03",
+      "slice": "conversational",
+      "max_tokens": 350,
+      "prompt": "What advice would you give to someone starting a new job next Monday? Give three or four pieces of advice."
+    },
+    {
+      "id": "conv_04",
+      "slice": "conversational",
+      "max_tokens": 300,
+      "prompt": "Describe what a perfect weekend might look like. Be specific about the activities and the feel of the day."
+    },
+    {
+      "id": "conv_05",
+      "slice": "conversational",
+      "max_tokens": 300,
+      "prompt": "What do you think makes a good long-term friendship? Share your thoughts."
+    }
+  ]
+}

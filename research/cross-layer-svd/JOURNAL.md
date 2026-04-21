@@ -1649,6 +1649,790 @@ training constraint (distillation).
 
 ---
 
+## 2026-04-20 — Reframing as a pluggable model-prep pipeline
+
+Every optimization direction explored so far — CALDERA (in flight),
+windowed Basis Sharing + balanced truncation (deprecated 2026-04-19),
+standard `llama-quantize` quants, the queued cross-matrix codebook bet
+— has been a bespoke script path. Unifying them under one interface:
+**HF model → ordered swappable stages → GGUF → bench**.
+
+Each stage declares `requires` / `produces` / `calibration` /
+`params`; the runner composes a pipeline by checking the graph is
+consistent, runs calibration once, and emits a GGUF plus a bench
+report scored against mainline `llama-quantize` Q4_K_M on the same
+base model.
+
+Full design, stage inventory, sample pipelines, acceptance criteria,
+and open questions in
+**[model_prep_pipeline.md](model_prep_pipeline.md)**.
+
+The immediate value is that calibration gramians (the most expensive
+thing we compute) get computed once per model and reused across every
+stage config — the cross-run gramian caching backlog item from the
+2026-04-18 late entry collapses into "a first-class feature of the
+runner." The longer-term value is that future research bets (the
+cross-matrix codebook track, anything else we pick up) have a known
+landing spot and a known bar to clear to become defaults, rather than
+living as one-off scripts.
+
+Pipeline runner itself isn't written yet. First two target pipelines:
+`baseline-q4` and `caldera-q4`, both on Qwen 2.5 3B, to prove the
+runner against a known artifact before we chase 7B / 8B.
+
+---
+
+## 2026-04-20 — Easy-config baseline on the Atlas llama-server
+
+Before investing in new research, audited what llama.cpp flags
+the production Atlas deployment (`Atlas/docker-compose.yml`, service
+`llama-chat`) was actually using. The goal was to establish an
+honest "features-already-shipped" baseline so the research pipeline's
+acceptance bar compares against *well-configured* llama.cpp, not
+stock defaults.
+
+### Audit findings
+
+The Atlas llama-chat service runs the upstream
+`ghcr.io/ggml-org/llama.cpp:server-cuda` image. Prior config:
+
+- `--flash-attn on` — **already enabled** ✓
+- `-ngl 999` (full GPU offload) — already enabled ✓
+- `-c 8192`, `--jinja` — already set ✓
+- Quantized KV cache — **missing**
+- Cross-request prefix cache — **missing**
+
+Also noted a doc drift: `Atlas/CLAUDE.md` says the chat model is
+`Qwen3-8B-Q4_K_M.gguf`, but docker-compose.yml actually serves
+`gemma-4-e4b-it-Q8_0.gguf` with `mmproj-gemma-4-e4b-it-bf16.gguf`
+(vision). The llama-models-init service still downloads Qwen3-8B as
+the default GGUF, but the live command line points at the Gemma
+build. Leaving the doc drift alone for now; the point for this
+journal is that the current chat target is Gemma-4-e4b + vision.
+
+### Config changes applied (`Atlas/docker-compose.yml`)
+
+Added three flags to llama-chat:
+
+```yaml
+- "-ctk"
+- "q8_0"
+- "-ctv"
+- "q8_0"
+- "--cache-reuse"
+- "256"
+```
+
+Rationale:
+
+- **`-ctk q8_0 -ctv q8_0`** — quantizes the KV cache to Q8_0. Near-
+  lossless quality, halves KV-cache memory. Prerequisite (`--flash-attn
+  on`) was already satisfied. Effective win: at the same 8192-token
+  context we free ~half the KV VRAM, which translates to either
+  headroom for bigger context later, or headroom for a resident draft
+  model (see speculative-decoding plans below) alongside Gemma-4-e4b
+  + mmproj.
+- **`--cache-reuse 256`** — enables cross-request KV reuse via prefix
+  matching and KV shifting. 256 is the min-chunk size (matches
+  llama.cpp's built-in server / FIM presets). Expected win is a big
+  TTFT drop on Atlas's repetitive-system-prompt workload: every
+  pipeline node (decide / respond / reconcile / graph_attention / ...)
+  prepends the same mindsets + tool-list preamble. Under the prior
+  config each request re-prefilled that preamble from scratch; now
+  the common prefix gets shifted into place.
+
+Atlas Nova.Api side: **no code change required**. The llama.cpp
+OpenAI-compat endpoint defaults `cache_prompt` to `true`
+(`tools/server/server-task.h:52`), so every request the existing
+`LlamaCppClient` already makes benefits from the server-side cache
+automatically.
+
+Not applied:
+
+- **`--slot-save-path`** (persistent prefix cache across restarts) —
+  requires client-side slot-ID bookkeeping that Atlas doesn't do
+  today. Would need a `LlamaCppClient` change to send `id_slot`
+  hints. Deferred.
+- **`--spec-type ngram-*`** (n-gram speculative decoding without a
+  draft model) — a bonus easy-win I initially missed. Upstream
+  llama-server exposes several n-gram speculation modes
+  (`ngram-cache`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`,
+  `ngram-mod`) via `arg.cpp:3504-3555`. Zero extra VRAM, no
+  training, works on any model. Not applied in this pass because
+  acceptance rate is very workload-dependent and we don't yet have
+  a bench suite pointed at the live Atlas server; it goes on the
+  "next" list so we measure before enabling.
+- **Speculative-decoding draft model (`-md`, `--draft-max`)** — the
+  real multi-× decode speedup lever, but picking the right draft is
+  a research question. See next section.
+
+### Deploy
+
+The changes are in-tree; applying to the running Atlas stack needs:
+
+```bash
+docker compose down
+docker compose up -d
+```
+
+Nothing permanent to verify pre-restart — the flags are all optional,
+non-destructive (no KV cache on disk to migrate), and backed out by
+reverting the YAML.
+
+### Expected payoff
+
+Rough numbers (order-of-magnitude, pre-bench):
+
+| Lever | Effect |
+|---|---|
+| Q8_0 KV cache | ~50% KV memory freed at 8K ctx. Quality: indistinguishable from fp16 KV on Gemma-2 family in upstream benches; will validate on our prompts when the bench suite is wired here. |
+| `--cache-reuse 256` | TTFT on repeat-preamble requests drops from "prefill all ~1K tokens of mindset + tool block" to "prefill only the delta". Estimated 4-10× TTFT improvement on pipeline nodes that reuse system context. |
+
+Actual measurements will come from the next bench-suite run against a
+stable load; not worth pre-speculating past that.
+
+---
+
+## 2026-04-20 — Next research direction: speculative decoding, upstream-only deployment
+
+### Deployment constraint (pinned)
+
+**Atlas serves from upstream llama.cpp** — the
+`ghcr.io/ggml-org/llama.cpp:server-cuda` image — not from this
+research fork. Anything we want deployed must either (a) be a
+standalone GGUF that upstream already knows how to load, or (b) use
+features that upstream ships. This rules out schemes that require
+bespoke loader code or new tensor layouts on the serving side, even
+when they'd be straightforward in our fork.
+
+Upstream's already-shipped speculative support (per
+`common/arg.cpp` in upstream):
+
+- `-md <path>` / `--model-draft` — standalone draft model.
+- `--draft-min N`, `--draft-max N` — draft length bounds.
+- `--draft-p-min`, `--draft-p-split` — acceptance thresholds.
+- `-devd`, `-ngld` — draft device placement / GPU layers.
+- `--spec-replace TARGET DRAFT` — translates strings between draft
+  and target, letting you pair models with different tokenizers
+  (lossy; useful as an escape hatch when a same-family draft
+  doesn't exist).
+- `--spec-type` (no draft model needed): `ngram-cache`,
+  `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`.
+
+This is a generous feature surface. The research question isn't
+"can upstream do speculation" — it can — but "what draft artifact
+gets the best acceptance rate on our workload with the target we're
+actually running."
+
+### Viable draft-building paths under the upstream constraint
+
+| Path | Deployable on upstream? | Home-lab cost | Expected speedup ceiling |
+|---|---|---|---|
+| **N-gram speculation** (`--spec-type`) | ✓ native, no draft artifact | zero | ~1.3-1.8× on repetitive output (code, JSON, tool-calls) |
+| **Off-the-shelf same-family draft** (`-md Qwen3-0.6B` for a Qwen3 target) | ✓ native | model download | ~2-4× when aligned |
+| **Distilled standalone draft** (train our own small same-family model) | ✓ native via `-md` | days-to-weeks on 5070 | ~2-4× with acceptance rate tunable via training recipe |
+| **Cross-tokenizer draft + `--spec-replace`** | ✓ native, lossy | small | Unknown; acceptance rate depends on translation-table quality |
+| **Medusa / EAGLE-style prediction heads** | ✗ **not supported upstream** | days of training | 3-5× in principle, but needs runtime changes upstream doesn't ship and AGENTS.md bars us from contributing AI-heavy PRs to. Research-only. |
+| **LayerSkip / early-exit self-speculation** | ✗ **not supported upstream** | near-zero to train | 1.5-2×; same upstream gap as Medusa. Research-only. |
+| **True from-scratch pretraining** | ✓ (the output is a normal GGUF) | not feasible on 5070 | n/a — home-lab can't produce a usefully-trained 500M model in reasonable time |
+
+**Deployable-now options:** n-gram, off-the-shelf, distilled,
+cross-tokenizer. **Research-only:** Medusa, EAGLE, LayerSkip, true
+from-scratch pretraining. "Building a draft from scratch" in the
+deployable sense means distillation — the output is an ordinary
+small GGUF, loaded via `-md`, indistinguishable to upstream from
+any other draft model.
+
+### Why this pairs well with the pipeline doc
+
+Each viable path slots into
+[model_prep_pipeline.md](model_prep_pipeline.md) as a stage:
+
+- `ngram_spec_configure` — marks a server config to use
+  `--spec-type ngram-*` (and writes the right `--spec-ngram-size-n/m`
+  for the workload). No model artifact. Smoke-test stage.
+- `draft_fetch` — downloads a published same-family draft
+  (e.g. `Qwen3-0.6B`) and validates tokenizer/template compatibility
+  with the target.
+- `distill_draft` — trains a small same-family model on target's
+  output distribution. Outputs a standalone GGUF. Calibration stage
+  provides teacher activations; training stage is new infra.
+- `draft_bench` — measures acceptance rate + decode tok/s vs
+  baseline (upstream target without speculation) and vs off-the-shelf
+  draft. Verdict feeds the acceptance criteria in the pipeline doc.
+
+The Medusa / EAGLE / LayerSkip paths could still live as stages, but
+they'd be tagged "research-only; not deployable to Atlas until
+upstream ships the runtime." Keeping them as stages means a fork-
+internal bench can still measure them for comparison.
+
+### First moves (not committed yet, just queued)
+
+Ordered by cost × information value:
+
+1. **N-gram speculation smoke** on the live Atlas llama-chat
+   service. Add `--spec-type ngram-cache` (or cycle through variants)
+   to `docker-compose.yml` behind a feature flag, measure
+   acceptance rate + decode tok/s on representative Atlas prompts.
+   Zero-artifact, ~30 min of wall time to set up.
+2. **Evaluate target-draft pairings** for upstream-deployable paths.
+   For Gemma-4-e4b (current target): no good same-family small draft;
+   so the pragmatic comparison is (Gemma-4-e4b, no draft)
+   vs (Qwen3-8B, `-md Qwen3-0.6B`). This is also the natural
+   checkpoint to decide whether Atlas should switch chat targets
+   to Qwen3 for the sake of cheap speculation wins.
+3. **Distilled draft for whichever target we pick.** Scope:
+   ~300-500M student, same tokenizer as target, trained on
+   teacher-emitted logits + free-corpus text. Validate acceptance
+   rate climbs past the off-the-shelf baseline for at least one
+   representative Atlas workload slice before scaling.
+
+Not a commitment to pursue all three; this is the map. Next concrete
+step is a short research doc (`research/cross-layer-svd/
+speculative_decoding.md`) when we actually start, mirroring the
+pipeline doc shape, with the upstream-only deployment constraint
+stated as a top-level invariant.
+
+### Track opened — 2026-04-20
+
+Research doc shipped:
+**[speculative_decoding.md](speculative_decoding.md)**.
+
+Scope: three tracks (n-gram native / off-the-shelf draft /
+distillation), upstream-only deployment invariant pinned at the
+top, metrics derived entirely from the llama-server `timings`
+response object (acceptance rate + effective speedup + cache hits,
+no log-scraping), non-disruptive bench via a parallel llama-server
+on port 11502 in a separate compose file (Atlas's live service not
+touched).
+
+First experiment specified: Track A n-gram-cache smoke against the
+current Gemma-4-e4b target. Kill criterion at 30% acceptance on
+tool-call slice routes us straight to Track B target-choice
+evaluation rather than knob-sweeping a losing config. Expected
+duration 2-3 hours of setup + bench.
+
+### Reframed 2026-04-20
+
+Research track reframed from "Atlas-specific deployment" to
+"universal efficiency for all llama.cpp users on consumer
+hardware." Atlas is one downstream consumer that adopts stable
+findings; not the target. Full rationale in
+[speculative_decoding.md](speculative_decoding.md) — new top-level
+"Purpose" section. Target for the first experiment switched from
+Gemma-4-e4b to **Qwen3-8B-Q4_K_M** (publicly available, modern
+8B-class representative, has a matching `Qwen3-0.6B` published as
+a draft for Track B later). Fixture now public-sourced
+(`public_prompt_fixture.json`), not drawn from Atlas logs.
+Upstream-only deployment invariant is unchanged and reinforced.
+
+---
+
+## 2026-04-20 — First speculative bench: ngram-cache on Qwen3-8B-Q4_K_M
+
+Executed the Track A feasibility test. Full writeup in
+[speculative_decoding.md](speculative_decoding.md) under the
+2026-04-20 dated section.
+
+**Result: kill criterion triggered.** `--spec-type ngram-cache`
+at upstream-default knobs (`--draft-max 8 --spec-ngram-size-n 4`)
+on Qwen3-8B-Q4_K_M produces **0.0% overall acceptance and a 0.98×
+decode speedup** (2% regression) across all 5 workload slices with
+`enable_thinking=false`. Temperature-0 correctness preserved —
+per-prompt outputs match byte-for-byte vs baseline. Server details:
+upstream llama.cpp release `b8855`, RTX 5080 Laptop 16 GB, decode
+~83-94 tok/s baseline.
+
+**Root cause (hypothesis).** `ngram-cache` has no cross-session
+state; each request starts with an empty cache. At n=4, short
+outputs finish before the cache populates; longer outputs are
+novel enough per prompt that n-gram lookups miss.
+
+**Methodological finding.** Qwen3 defaults to reasoning mode. With
+thinking on, n-gram-cache fires ~150× more often (formulaic
+reasoning prose matches n=4 lookups) but acceptance stays ~5% and
+end-to-end speedup is the same 0.98×. Archived think-on data under
+`bench/results/think_on/`. **Lesson:** on reasoning-capable models,
+bench reasoning-mode and answer-mode separately — a speculation
+config tuned for `<think>` tokens is a different config from one
+tuned for final-answer tokens.
+
+**Infrastructure shipped** under `research/cross-layer-svd/bench/`:
+`spec_bench.py` (llama-server client recording `timings` per
+prompt), `run_condition.py` (start-server → bench → stop
+orchestrator), `spec_compare.py` (JSONL → markdown), 25-prompt
+public fixture, raw + archived results, per-condition server logs.
+Upstream llama.cpp binary in `bin-upstream/`. All reproducible by
+anyone with the same model file and a consumer CUDA GPU.
+
+**Next action — Track B.** Pair Qwen3-8B-Q4_K_M with its published
+`Qwen3-0.6B` draft via `-md` and bench the same 25-prompt fixture.
+Reference point any llama.cpp user reaches with two flag additions;
+characterization target is "what do off-the-shelf same-family
+drafts actually deliver on consumer hardware at batch=1, greedy."
+The first bench artifacts / infrastructure will be reused wholesale;
+only the server command line changes.
+
+---
+
+## 2026-04-20 — Track B result: Qwen3-0.6B draft → 1.56× overall on Qwen3-8B
+
+Executed Track B with the same infrastructure as Track A. Added the
+draft via `-md Qwen3-0.6B-Q8_0.gguf --draft-max 8 -ngld 999`; every
+other flag, the fixture, temp, and seed were unchanged. Full writeup
+in [speculative_decoding.md](speculative_decoding.md) under the
+2026-04-20 Track B section.
+
+**Headline: 1.56× overall decode speedup, 71.5% overall acceptance,
+zero quality loss, zero regression.**
+
+Per-slice (identical 25-prompt fixture, temp=0):
+
+| Slice | tok/s Δ | speedup | acceptance |
+|---|---|---:|---:|
+| structured_output | 83.7 → 152.3 | 1.82× | 80.1% |
+| code | 89.7 → 163.0 | 1.82× | 81.3% |
+| reasoning | 84.7 → 143.4 | 1.69× | 83.9% |
+| factual_qa | 94.0 → 138.1 | 1.47× | 76.9% |
+| conversational | 84.1 → 84.5 | 1.00× | 55.4% |
+
+All 25 response previews match baseline byte-for-byte (temp=0
+correctness preserved). Cost of the config: +609 MB VRAM for the
+Q8_0 draft.
+
+### Three-way summary (same fixture, same target)
+
+| Config | tok/s | accept | speedup |
+|---|---:|---:|---:|
+| baseline | 87.2 | — | 1.00× |
+| ngram-cache (default knobs) | 85.4 | 0.0% | 0.98× |
+| **qwen-draft (default knobs)** | **136.3** | **71.5%** | **1.56×** |
+
+### The interesting metric finding
+
+**Acceptance rate alone does not predict speedup.**
+`conversational` had 55% acceptance but 1.00× speedup —
+`structured_output` had 80% acceptance and 1.82×. The difference is
+the distribution of **accepted run lengths**. Predictable slices
+accept in long contiguous runs (one target forward pass saves 7);
+conversational accepts in short chop (`accept 2, reject 1, accept
+3, reject 1 …`) so draft overhead amortizes poorly. Practical
+threshold at `draft-max=8` looks like **acceptance ≥ 70% is where
+speedups materialize**.
+
+This is worth recording as a characterization finding in its own
+right: papers often report per-slice acceptance rates, but the
+run-length distribution is the stronger speedup predictor.
+
+### Direct relevance to the efficiency thesis
+
+This is the "more capability without more hardware" result in its
+cleanest form:
+
+- Standard upstream llama.cpp binary (no fork changes)
+- Off-the-shelf target + draft from the same authors (no training)
+- Three extra server flags (no code)
+- Zero quality loss (temp=0 exact correctness)
+- +56% overall decode throughput on mixed workloads
+- +609 MB VRAM (trivial headroom on any card running the 8B)
+- Consumer GPU (RTX 5080 Laptop, 16 GB), batch=1, single-user
+
+It's directly usable by anyone. This lands in the middle of the
+"stop scaling hardware, use what's already there better" thesis
+for the research track.
+
+### Next candidates (priority order, not committed)
+
+1. **Knob sweep on conversational** — `--draft-max 4` + higher
+   `--draft-p-min` to see if we can get that 55% acceptance to
+   amortize into a modest win instead of 1.00×.
+2. **Cross-family pairs** — Llama-3.1-8B + Llama-3.2-1B,
+   Gemma-2-9B + Gemma-2-2B on the same fixture. Tests whether the
+   "70% acceptance threshold" is a Qwen thing or a universal one.
+3. **Track C (distilled draft)** — likely *not* priority. Current
+   evidence says off-the-shelf already works excellently for
+   modern families with a published tiny draft; training our own
+   only becomes compelling for families without one.
+
+---
+
+## 2026-04-20 — Writeup shipped + Track C opened
+
+### Public writeup
+
+Shipped a standalone writeup of the Track A + Track B results:
+**[writeups/2026-04-20-speculation-on-consumer-hardware.md](writeups/2026-04-20-speculation-on-consumer-hardware.md)**.
+
+Frames the finding as directly usable to any llama.cpp user running a
+modern 8B-class model with a published same-family tiny: three flags,
++56% decode throughput, −22% bench wall time, zero quality cost.
+Includes per-slice numbers, the acceptance-rate-vs-run-length metric
+discussion, the ngram-cache null result as a prior-art check, the
+Qwen3-thinking methodology note, and full reproduction instructions.
+Deliberately framed for a llama.cpp community audience, not Atlas.
+
+### Track C — draft distillation on demand
+
+Opened [draft_distillation.md](draft_distillation.md) to scope the
+"produce a tiny draft for targets without a published match"
+question. This is where Track B's finding points next: good
+same-family drafts work great, but lots of targets don't have them.
+
+Plan breaks into three sub-tracks by tractability:
+
+- **C.1 — Retrieval pipeline.** Before training anything, map what's
+  already possible via cross-family draft pairing using upstream's
+  `--spec-replace` or same-tokenizer different-family pairs. Cheap:
+  just runs the existing bench harness against pre-published
+  candidate drafts. Tells us which targets genuinely need training
+  vs which just need someone to try the existing tinies.
+- **C.2 — Rollout-distillation prototype.** Validate the training
+  infrastructure on Qwen3-8B (where we have the 71.5% acceptance
+  baseline to compare against). Seed student, target rollouts,
+  plain SFT. Goal is "pipeline works" not "beats the off-the-shelf."
+- **C.3 — Logit distillation on a target without a published match.**
+  The headline experiment. Pick Gemma-2-9B or Llama-3.1-8B, run
+  DistillSpec-style training, target ≥ 70% acceptance / ≥ 1.4×
+  overall speedup on our fixture.
+
+### First action for Track C
+
+**Retrieval-first (C.1). No training yet.** Start with Gemma-2-9B
+or similar target, enumerate the tokenizer-compatible published
+tinies, and bench them via the existing harness. If any hits the
+≥70% acceptance bar, we answer that target by retrieval and Track C
+immediately has a public registry artifact. If all fail, that's the
+motivating case study for C.2/C.3.
+
+Expected: 3-4 hours of downloads + benches, no training.
+
+Also queued for before any training runs: a prior-art read pass on
+DistillSpec (arxiv 2310.08461), EAGLE-2, and recent 2024-2025
+draft-training papers. Listed in draft_distillation.md's "prior
+art" section. Don't want to spend a week building a DistillSpec
+clone if the paper already answered our question.
+
+---
+
+## 2026-04-20 — Self-quant draft experiment + CALDERA correction
+
+Explored the intuitive "quantize the target itself as the draft"
+path instead of training. Downloaded Qwen3-8B-Q2_K (3.1 GB, from
+`bartowski/Qwen_Qwen3-8B-GGUF`) and ran it as `-md` for the
+Q4_K_M target on the same 25-prompt fixture.
+
+**Result: 82.8% acceptance, 0.83× speedup (17% wall-time
+regression).** Every slice regressed; worst is conversational at
+0.69×. Full writeup in [speculative_decoding.md](speculative_decoding.md)
+under the self-quant dated section, plus an addendum in
+[writeups/2026-04-20-speculation-on-consumer-hardware.md](writeups/2026-04-20-speculation-on-consumer-hardware.md).
+
+**The interesting finding isn't the regression itself — it's
+*why*.** Acceptance went *up* vs the 0.6B published draft (82.8%
+vs 71.5%) because the quantized 8B genuinely has a more
+target-aligned output distribution. But the draft was ~3× slower
+per token than the 0.6B — not because of the bit depth, but because
+it still has 8B parameters' worth of matmul ops per forward pass.
+Quantization reduces **bits per weight**, not **parameter count**.
+
+**Corrected claim for the record.** Earlier in this session I
+framed CALDERA (Q + L·R decomposition) as a plausible path to a
+tiny draft. That framing was wrong — CALDERA reduces storage bytes
+but not FLOPs (the quantized matmul is still O(d_out × d_in),
+plus the correction adds extra FLOPs on top). A CALDERA Qwen3-8B
+would sit on the wrong side of the bandwidth-per-token curve for
+speculation. CALDERA is a tool for "fit a bigger model in less
+VRAM," not "produce a cheap draft." Updated the speculative-decoding
+doc to make this explicit and call out the FLOPs-vs-bytes principle
+that the Q2_K experiment calibrated.
+
+### Principle calibrated by this experiment
+
+**Speculation speedup at batch=1 consumer decode is governed by
+FLOPs-per-token in the draft, not bytes-per-token.** Useful drafts
+must have materially **fewer parameters** than the target, not
+merely compressed parameters. The published Qwen3-0.6B draft wins
+not because it's smarter — by acceptance rate it's measurably less
+target-aligned — but because it has 14× fewer FLOPs per forward
+pass.
+
+### New research track opened — draft via pruning
+
+Pivoted the "compress the target to make a draft" intuition to
+**structural pruning** (layer drop, head/width drop) which reduces
+parameter count directly. Full plan in
+[draft_pruning.md](draft_pruning.md).
+
+Approach ladder, ranked by cost × expected value:
+
+- **A1** — Drop every other layer, no retraining. Quality-floor
+  smoke test. ~1-2 hours.
+- **A2** — A1 + rollout distillation overnight. First real attempt
+  at a useful pruned draft.
+- **A3** — Importance-based layer drop (ShortGPT-style) + rollout
+  distillation. Potentially better quality retention than blind
+  pruning.
+- **A4** — Width pruning (SliceGPT-style). More complex to implement.
+- **A5** — Combined depth + width + distillation. Max-compression bet.
+
+A1 is always first — it establishes the no-recovery floor before
+we commit training compute to A2.
+
+### Infrastructure prerequisite blocker flagged
+
+PyTorch on Python 3.14 (the user's installed version) is bleeding
+edge. Before A1 can run, need to confirm torch nightly supports
+3.14 on Windows, or fall back to installing 3.12 alongside / WSL2.
+Listed in draft_pruning.md's "Infrastructure prerequisites" section.
+This is the first concrete thing to verify on the pruning track
+before any experiments start.
+
+---
+
+## 2026-04-20 — Prior-art survey: zero-shot parameter reduction
+
+Dispatched a research agent to survey LLM compression techniques
+that reduce parameter count or FLOPs without gradient retraining.
+Full synthesis folded into [draft_pruning.md](draft_pruning.md)
+under a new "Prior art — synthesis" section.
+
+### Key takeaways
+
+- **ShortGPT-style layer drop (arxiv 2403.03853) is canonical and
+  fits our constraints.** ~25-30% of layers can be dropped with
+  calibration-only, <5-10% quality hit on 7-13B models. Universal
+  finding across ShortGPT / LaCo / SLEB / Gromov et al. 2403.17887:
+  later and middle layers are more redundant than early ones.
+- **LLM-Streamline** adds a cheap no-gradient refinement: replace
+  the dropped span with a linear layer fit via least squares. We
+  inserted this as an A1.5 step between "drop no retrain" (A1) and
+  "drop + rollout distillation" (A2).
+- **SliceGPT width pruning (arxiv 2401.15024) has GGUF friction** —
+  its rotation matrices fuse into the residual stream and mainline
+  GGUF has no loader support. A4 deprioritized.
+- **SparseGPT / Wanda explicitly ruled out.** Unstructured magnitude
+  pruning reduces storage but not FLOPs on dense GPU kernels;
+  llama.cpp doesn't use sparse kernels. Not a useful axis on our
+  runtime.
+- **LayerSkip zero-shot doesn't work** (arxiv 2404.16710). Needs
+  its own continued-pretraining regime. Meta ships LayerSkip
+  checkpoints precisely because you can't retrofit it.
+- **Medusa / EAGLE / Kangaroo / Draft&Verify** all require gradient
+  training — out of scope for this track.
+- **SVD-based methods** (LASER / ASVD / SVD-LLM / Basis Sharing)
+  are weak standalone. GGUF has no low-rank tensor type, so they
+  save bytes not FLOPs without loader extensions.
+
+### Novel gap identified
+
+**No published paper explicitly reports speculation-draft acceptance
+rates from zero-shot pruned targets.** Community anecdote suggests
+60-70% acceptance at ~25% layer drop, but nothing peer-reviewed.
+Our bench output — if A1/A1.5 work — would fill this gap with
+honest per-slice numbers. This is the first clearly-novel
+contribution in the speculation research direction since the track
+opened.
+
+### Plan changes
+
+- A1 mechanism refined: **Block-Influence–based layer drop targeting
+  middle/late layers**, not blind every-other drop. Costs nothing
+  extra (one calibration forward pass computes BI scores).
+- **A1.5 inserted**: LLM-Streamline linear-LSQ replacement layer
+  between A1 and A2. Genuinely gradient-free, potentially bridges
+  much of the A1→A2 quality gap cheaply.
+- **A4 deprioritized** (SliceGPT GGUF friction).
+- **Unstructured-sparsity and LayerSkip removed** from the ladder
+  entirely — documented as out-of-scope with reasons.
+
+Next action still the PyTorch-on-Python-3.14 infrastructure check.
+
+---
+
+## 2026-04-20 — A1 + A1.1 executed: zero-shot pruning characterized
+
+Infra cleared (PyTorch nightly + CUDA 12.8 + Python 3.14 work on the
+RTX 5080 Laptop). Built the pruning pipeline end-to-end: HF checkpoint
+→ `prune_layers.py` → `convert_hf_to_gguf.py` → `llama-quantize` →
+bench. Round-trip validated on unmodified Qwen3-8B first (96-byte
+metadata diff vs the pre-downloaded official Q4_K_M GGUF).
+
+Ran two zero-shot prune experiments on the same 25-prompt fixture as
+Track A/B:
+
+| Drop | Layers | Draft size | Accept | Speedup |
+|---|---|---|---|---|
+| A1: 28% (10 layers 20-29) | 26L | 3.7 GB | **26.3%** | **0.50×** |
+| A1.1: 8% (3 layers 20-22) | 33L | 4.6 GB | **72.1%** | **0.72×** |
+
+**The genuinely novel data point:** 3-layer drop hits 72% acceptance —
+*statistically identical to the published Qwen3-0.6B draft's 71.5%* —
+**without any retraining**. The prior-art survey flagged this exact
+measurement as unpublished in peer-reviewed form. It now has numbers.
+
+**The limitation:** 33L still executes 92% of target FLOPs, so the
+draft is only 1.08× faster than target per forward pass. Speculation
+math says that's not enough cost reduction to amortize even at 72%
+acceptance. Measured speedup 0.72× matches the theoretical 0.69× well.
+
+**Zero-shot pruning characterized as a frontier:**
+- Light drop (≤10%): high acceptance, too-slow draft → regression.
+- Heavy drop (≥25%): quality collapse → worse regression.
+- Middle ground where both axes cooperate does not exist zero-shot.
+  The acceptance-vs-FLOPs trade-off is bimodally bad.
+
+To win via pruning, aggressive FLOP reduction (50%+ layer drop) plus
+quality-recovering retraining is required — confirms A2 is the honest
+path, with A1.5 as the cheapest "try to recover some quality via
+calibration-only" middle step before committing gradient training.
+
+Full per-slice writeup in [draft_pruning.md](draft_pruning.md) dated
+section. Raw data: `bench/results/pruned_midlate10.jsonl` and
+`pruned_mid3.jsonl`. A1.5 (span-averaging replacement) is the next
+concrete action.
+
+### Disk note
+
+~70 GB of research artifacts now accumulated (HF source 16 GB + two
+pruned HFs 28 GB + bf16 GGUFs + Q4_K_M GGUFs + roundtrip validation
+files). The `Qwen3-8B-roundtrip-*` validation artifacts (~21 GB) can
+be reclaimed since the pipeline is validated; everything else is
+live research state.
+
+---
+
+## 2026-04-20 — A1.5 result: averaging replacement doesn't help; zero-shot frontier complete
+
+Implemented span-averaging replacement
+(`bench/prune_avg_replace.py`): drop 10 layers (20-29), insert one
+block whose weights are element-wise mean of the dropped ten.
+
+**Result: 26.5% accept, 0.50× speedup — statistically identical to
+A1 (drop 10, no replace: 26.3% accept, 0.50× speedup).** The averaged
+block contributes no measurable quality recovery. Intuition: 10
+transformer blocks of nonlinear processing isn't approximated by an
+averaged linear-ish single block.
+
+Full LSQ version of LLM-Streamline deferred — the theoretical
+ceiling (linear fit of 10 nonlinear blocks) plus the
+transformer-block-encoding complexity don't justify implementation
+given A1.5-lite's negative result.
+
+## 2026-04-20 — Session wrap-up and complete findings
+
+Full characterization of the "draft-from-target without training"
+space is now in hand. Six conditions on the same Qwen3-8B-Q4_K_M
+target, same 25-prompt public fixture, same flags:
+
+| Draft strategy | Accept | Speedup | Category |
+|---|---:|---:|---|
+| No draft (baseline) | — | 1.00× | control |
+| **Qwen3-0.6B-Q8_0 published tiny** | 71.5% | **1.56×** | **winner (trained-from-scratch)** |
+| Q2_K of target | 82.8% | 0.83× | self-quant — bytes not FLOPs |
+| Light prune (33L / drop 3) | 72.1% | 0.72× | high accept, insufficient FLOP savings |
+| Heavy prune (26L / drop 10) | 26.3% | 0.50× | quality collapse |
+| Averaged span-replace (27L) | 26.5% | 0.50× | averaging doesn't bridge |
+
+**Findings consolidated into three takeaways**:
+
+1. **Speculation speedup is FLOPs-bound at batch=1 consumer decode.**
+   Not bytes. Every zero-shot technique that reduces bytes without
+   reducing parameters (Q2_K of target) or preserves too many
+   parameters (light pruning) fails to produce speedup even when
+   acceptance is high.
+2. **Zero-shot aggressive parameter reduction collapses acceptance.**
+   Past ~25% layer drop without retraining, the pruned model's
+   output distribution diverges from target's enough that speculation
+   can't keep up, regardless of byte/FLOP savings.
+3. **The frontier is bimodally bad zero-shot.** Light drop: high
+   accept, slow draft → regression. Heavy drop: quality collapse →
+   bigger regression. Middle where both axes cooperate does not exist
+   without retraining.
+
+**Novel contribution documented**: no published paper reports
+speculation-draft acceptance rates from zero-shot pruned targets.
+Our 5-row pruning frontier is the first explicit measurement.
+72.1% accept at 3-layer drop specifically is noteworthy — it
+matches the published 0.6B's 71.5% accept, without training —
+but combined with the speedup regression, tells the complete
+story of *why* shortcutting training doesn't work.
+
+### Shipped this session (full list)
+
+**Runtime config for upstream llama.cpp**:
+- `Atlas/docker-compose.yml` updated with `-ctk q8_0 -ctv q8_0
+  --cache-reuse 256` on top of existing `--flash-attn on`.
+- No Atlas Nova.Api code changes needed.
+
+**Bench infrastructure** (`research/cross-layer-svd/bench/`):
+- `public_prompt_fixture.json` — 25 prompts across 5 public-sourced
+  slices, reproducible by anyone.
+- `spec_bench.py` — llama-server OpenAI-compat client recording
+  `timings` per prompt as JSONL, with thinking-mode toggle.
+- `run_condition.py` — orchestrator (start server → bench → stop).
+- `spec_compare.py` — JSONL → markdown comparison table.
+- `prune_layers.py` — HF-checkpoint layer dropper.
+- `prune_avg_replace.py` — drop-and-replace-with-averaged-layer.
+- `results/` — eight raw JSONLs across all conditions, server logs,
+  run logs for audit.
+
+**Binaries + models on disk**:
+- `bin-upstream/` — upstream llama.cpp b8855 release (Windows CUDA
+  13.1), including `llama-server.exe`, `llama-quantize.exe`, etc.
+- `Atlas/models/Qwen3-8B-Q4_K_M.gguf` (official, 5 GB)
+- `Atlas/models/Qwen3-0.6B-Q8_0.gguf` (official, 0.6 GB)
+- `Atlas/models/Qwen3-8B-Q2_K.gguf` (bartowski, 3.1 GB)
+- `Atlas/models/Qwen3-8B-pruned-midlate10-Q4_K_M.gguf` (3.7 GB)
+- `Atlas/models/Qwen3-8B-pruned-mid3-Q4_K_M.gguf` (4.6 GB)
+- `Atlas/models/Qwen3-8B-avgspan-10to1-Q4_K_M.gguf` (3.8 GB)
+- `research/models-hf/Qwen3-8B/` (bf16 HF source, 16 GB)
+- `research/models-hf/Qwen3-8B-pruned-*/` and
+  `research/models-hf/Qwen3-8B-avgspan-10to1/` — pruned HF
+  checkpoints retained for any A2 retraining experiment.
+
+**Research docs updated**:
+- `speculative_decoding.md` — Track A (n-gram null), Track B
+  (published tiny win), self-quant negative result with the
+  FLOPs-vs-bytes principle, CALDERA correction.
+- `draft_pruning.md` — complete prior-art synthesis, A1 / A1.1 /
+  A1.5 results, complete frontier table, decision.
+- `writeups/2026-04-20-speculation-on-consumer-hardware.md` —
+  standalone publishable article: three-flag config, per-slice
+  numbers, acceptance-vs-run-length finding, Q2_K and pruning
+  addenda covering all negative results honestly.
+
+**PyTorch infra cleared**:
+- `research/cross-layer-svd/venv-research/` — Python 3.14 + torch
+  2.12.0.dev20260408+cu128 + HF transformers 5.5.4 stack. Fully
+  working with the RTX 5080 Laptop (Blackwell SM 12.0). Available
+  for A2 or any further ML-training-adjacent work without
+  re-provisioning.
+
+### Open question — A2
+
+The only path that remains plausibly productive for "produce a draft
+from target without a published match" is gradient retraining of an
+aggressively pruned model. Estimate: ~8-16 hours of training on our
+GPU for a first attempt. **Not run this session** — left as a
+deliberate decision point rather than sinking overnight compute
+before consolidating today's findings.
+
+A2 implementation would start from
+`research/models-hf/Qwen3-8B-pruned-midlate10/` (26L pruned, HF
+format, ready to train) plus a rollout-distillation loop on
+target-emitted text from a public prompt corpus.
+
+### Closing status
+
+The "stop throwing hardware at it" thesis has one clean practical
+artifact shipped (the 1.56× published-draft recipe) and one clean
+negative-space map (the zero-shot frontier characterized fully).
+Both are publishable-quality contributions in the honest-measurement
+sense. Further investment decisions can be deferred to future
+sessions based on whether A2 retraining is worth the compute.
+
+---
+
 ## 2026-04-21 — Paper survey: sub-1-bit and low-bit quantization
 
 Follow-up to the 2026-04-19 synthesis, which named "retraining-allowed
