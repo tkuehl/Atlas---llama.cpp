@@ -2640,3 +2640,70 @@ Before committing gradient training to a full QAT reproduction, the
 7B rerun (§10.1.4) is the honest next step — 2 hours vs potentially
 days of wasted training on a paper whose init quality may not
 generalize down to our hardware profile.
+
+---
+
+## 2026-04-21 — LittleBit sanity on 7B + q_proj: three structural constants
+
+Ran §10.1.4 (7B gate_proj) and §10.1.5 (7B q_proj) with the same
+harness. Plus corrected a math error in the prior entry's discard-
+fraction formula. Findings:
+
+**Three structural constants, rank- and scale-invariant.**
+
+Across three matrix points tested (Qwen 0.5B gate_proj L12,
+Qwen 7B gate_proj L12, Qwen 7B q_proj L12), Dual-SVID produces
+identical values for three diagnostic quantities:
+
+| Constant | Value (≤1% spread) | What it measures |
+|---|---:|---|
+| Rank-1 sep of \|U'\|, \|V'\| | ~0.63 | The paper's Eq. 7 separability assumption captures ~5/8ths of magnitude variation |
+| Discard fraction | ~0.61 | Fraction of rank-`r` subspace info lost beyond truncation |
+| Captured fraction | ~0.39 | Of what FP-SVD captures at rank `r`, 39% survives Dual-SVID |
+
+Rank-independent (tested r=32…2048), scale-independent (0.5B vs
+7B), and shape-independent (18944×3584 wide-MLP vs 3584×3584
+square-attention).
+
+**The scale-hypothesis from §12.4 is rejected.** I'd predicted that
+larger models might exhibit stronger multiplicative magnitude
+structure (higher separability). They don't — both 0.5B and 7B sit
+at ~0.63 rank-1 separability. The constants appear to be structural
+properties of trained transformer weights, not model-size
+artifacts.
+
+**Corrected the discard-fraction formula.** Previous entry quoted
+~0.77 using `(Dual² − fp²) / Dual²`, which has no clean
+information-theoretic meaning. Correct formula is `1 − (1 − Dual²)
+/ (1 − fp²)` = fraction of rank-`r`-accessible energy discarded by
+binarization+scale-init beyond the rank truncation itself. Findings
+are unchanged in direction (init is weak, QAT must carry everything)
+— only the exact numeric value is 0.61, not 0.77.
+
+**Single cleanest statement of the finding.** LittleBit at sub-1-BPW
+is not a claim about Dual-SVID's warm-start; it is a claim about
+QAT's capacity to recover the ~61% of rank-`r` subspace information
+that sign-truncation + three-vector scale compensation systematically
+discards. The paper's headline quality numbers are entirely
+downstream of whether QAT succeeds at that recovery.
+
+**Reproduction bar, sharpened.** At matched BPW on Qwen 0.5B, can
+QAT-trained LittleBit beat our archived FP-SVD floor (PPL 86 at
+`r = 512`, no binarization, no training)? Pre-QAT, Dual-SVID captures
+~32% of the same matrix's energy where FP-SVD captures ~83%. That's
+the gap QAT has to close. If it does, LittleBit unlocks a regime our
+archived SVD sweep couldn't reach; if not, the post-training
+compression ceiling still stands.
+
+Shipped this entry:
+  - `littlebit_sanity_7b.json` — raw 7B gate_proj results.
+  - `littlebit_sanity_7b_qproj.json` — raw 7B q_proj results.
+  - `littlebit_math.md §12.5–12.13` — corrected discard formula,
+    7B rerun, q_proj rerun, three-structural-constants consolidation.
+
+Next concrete action remains §10.2: QAT reproduction on Qwen 0.5B
+with the PPL-86 acceptance bar. Now defensible to commit the
+training compute because: (a) the paper's math is verified;
+(b) the quality story is entirely QAT, which we know is what needs
+measuring; (c) three matrix samples give us a predictable pre-QAT
+baseline (0.39× captured) to score QAT's contribution against.

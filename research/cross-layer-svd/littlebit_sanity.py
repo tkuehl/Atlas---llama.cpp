@@ -75,14 +75,21 @@ def verify_proposition_1(seed: int = 0, d_out: int = 128, d_in: int = 96,
     }
 
 
-def load_matrix(model_id: str, role: str, layer: int) -> torch.Tensor:
-    """Load a single weight matrix from an HF model; float32 CPU."""
+def load_matrix(model_id: str, role: str, layer: int,
+                load_dtype: str = "bfloat16") -> torch.Tensor:
+    """Load a single weight matrix from an HF model; returns float32 CPU.
+
+    Model is loaded at `load_dtype` (default bf16 to keep RAM usage
+    reasonable on 7B+ models); only the extracted target matrix is
+    upcast to float32 for the SVD step.
+    """
     from transformers import AutoModelForCausalLM
 
-    print(f"  loading {model_id} ...")
+    dtype = getattr(torch, load_dtype)
+    print(f"  loading {model_id} ({load_dtype}) ...")
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float32,
+        model_id, torch_dtype=dtype,
     )
     print(f"  loaded in {time.time() - t0:.1f}s")
 
