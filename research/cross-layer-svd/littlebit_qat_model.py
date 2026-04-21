@@ -347,6 +347,17 @@ def main():
     p.add_argument("--eval-max-tokens", type=int, default=50_000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--warmup-steps", type=int, default=200)
+    p.add_argument("--early-stop-window", type=int, default=5,
+                   help="Stop training if the PPL range across the last "
+                        "N evals is below --early-stop-min-delta. "
+                        "0 disables plateau detection.")
+    p.add_argument("--early-stop-min-delta", type=float, default=2.0,
+                   help="Minimum PPL range across the recent eval window "
+                        "to keep training. Below this = converged.")
+    p.add_argument("--early-stop-min-steps", type=int, default=4000,
+                   help="Earliest step at which plateau detection can "
+                        "trigger.  Prevents stopping during early "
+                        "convergence before LR decay has bitten.")
     p.add_argument("--weight-decay", type=float, default=0.01,
                    help="AdamW weight decay.  Paper-default-adjacent; 0 disables.")
     p.add_argument("--optimizer", default="adamw8bit",
@@ -721,6 +732,31 @@ def main():
                 print("    kill criterion: PPL runaway, stopping")
                 history[-1]["killed"] = "ppl_runaway"
                 break
+            # Plateau early-stop: if the most recent `window` evals
+            # have a PPL range below `min_delta`, training has
+            # converged and further steps won't meaningfully help.
+            if args.early_stop_window > 0 and step >= args.early_stop_min_steps:
+                eval_hist = [h for h in history[1:]
+                             if h.get("ppl") is not None]
+                if len(eval_hist) >= args.early_stop_window:
+                    window_ppls = [h["ppl"]
+                                   for h in eval_hist[-args.early_stop_window:]]
+                    ppl_range = max(window_ppls) - min(window_ppls)
+                    if ppl_range < args.early_stop_min_delta:
+                        print(f"    plateau early-stop: last "
+                              f"{args.early_stop_window} evals "
+                              f"ranged only {ppl_range:.2f} PPL "
+                              f"(< {args.early_stop_min_delta:.2f}), "
+                              f"stopping at step {step}")
+                        history[-1]["killed"] = "plateau"
+                        # Save final rolling ckpt so we can resume if
+                        # we change our mind.
+                        if args.ckpt_every > 0:
+                            try:
+                                save_rolling(step, history)
+                            except Exception:
+                                pass
+                        break
 
             student.train()
 
