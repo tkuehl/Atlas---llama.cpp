@@ -1,5 +1,14 @@
 # Wall-time and resource reduction plan
 
+> **Part of the LittleBit plan set.** See [README.md](README.md)
+> and [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+> for context.  Related plans:
+> [savings](savings_exploration_plan.md) (memory) ·
+> [unexplored gains](unexplored_efficiency_gains.md) (quality) ·
+> [scale-to-30B](scale_to_30b_architecture.md) (architecture) ·
+> [memory research](memory_efficient_training_research.md) (external
+> survey).
+
 Companion to [unexplored_efficiency_gains.md](unexplored_efficiency_gains.md)
 (quality combinations) and [savings_exploration_plan.md](savings_exploration_plan.md)
 (memory ablations). **Focus here is wall-clock reduction**: get to a
@@ -409,21 +418,13 @@ ablations per day instead of 2-3.**
 ### For 7B local
 Memory-stacked 7B (from the savings plan) was estimated at 7-10
 hours. With wall-time stack, potentially **~3-4 hours for a 7B
-training run**. Comparable to cloud turnaround but $0.
+training run** — fits comfortably in an overnight or single-day
+turnaround once Sprint 3 (teacher cache) removes teacher from VRAM.
 
 ### For 30B local
 Already estimated at 100-200 hours under old architecture.
 Wall-time stack cuts this to maybe **~40-60 hours** — still very
 long but feasible for overnight runs over a weekend.
-
-### For cloud runs
-If we do end up using cloud, wall-time stack cuts A100 rental by
-the same factor. Vast.ai 7B at $0.67/hr:
-- Before: ~8h × $0.67 = $5-6
-- After: ~3h × $0.67 = $2
-
-For multiple ablations on cloud, this matters at ~$15 savings per
-5-ablation session.
 
 ## 8. Low-hanging fruit checklist
 

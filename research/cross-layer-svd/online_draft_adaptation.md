@@ -1,5 +1,12 @@
 # Online draft adaptation — LittleBit student learns from speculation rejections
 
+> **Part of the LittleBit plan set.** See [README.md](README.md)
+> and [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+> for context.  This doc covers Sprint 8 (deferred — standalone
+> inference is our primary goal, not speculation draft).
+> Related: [inference runtime](inference_runtime.md) ·
+> [unexplored gains](unexplored_efficiency_gains.md).
+
 Proposal for continuously updating the LittleBit-compressed draft
 model during deployment, using teacher-vs-student rejections as
 free training signal. Preserves speculation's correctness

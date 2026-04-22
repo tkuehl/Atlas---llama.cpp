@@ -1,5 +1,14 @@
 # Scaling LittleBit QAT to 30B+ on consumer hardware
 
+> **Part of the LittleBit plan set.** See [README.md](README.md)
+> for the index and
+> [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+> for Sprint ordering.  Gated on Sprint 2 (teacher cache).
+> Related: [savings](savings_exploration_plan.md) ·
+> [wall-time](wall_time_reduction_plan.md) ·
+> [inference runtime](inference_runtime.md) ·
+> [memory research](memory_efficient_training_research.md).
+
 Architectural plan for training 30B-70B models with LittleBit QAT on
 a 16 GB laptop GPU + consumer system RAM. Built on two core ideas:
 
@@ -84,23 +93,27 @@ Our validation plan:
 ### 2.4 Where to run teacher forward
 
 Teacher extraction is **embarrassingly parallel** (each token
-independent) and **one-time per corpus**. Options by scale:
+independent) and **one-time per corpus**. All extraction runs
+locally — cloud compute is not an option for this project. Options
+by scale:
 
-| Teacher size | Where to run | Wall clock | Cost |
-|---|---|---:|---:|
-| 0.5B — 7B | Local GPU, bf16 | 0.5 — 4 hours | $0 |
-| 13B — 30B | **Rented cloud GPU** (single A100 for hours) | 2 — 6 hours | **~$5-15** |
-| 70B+ | Rented H100 or A100 x2 | 6 — 20 hours | ~$25-80 |
+| Teacher size | Local approach | Wall clock |
+|---|---|---:|
+| 0.5B — 7B | Full model on 16 GB GPU, bf16, large batch | 0.5 — 4 hours |
+| 13B — 30B | Streamed layers (same CPU↔GPU architecture as student §3) | 1 — 5 days |
+| 70B+ | Streamed layers + NVMe tier (§11) | ~1-3 weeks |
 
-Cloud for teacher is **much cheaper** than cloud for student
-training because:
+Teacher extraction is faster per token than student training at the
+same scale because:
 - It's forward-only, no backward
 - No optimizer, no Adam state
 - No gradient checkpointing overhead
-- Larger batches easily fit → better GPU utilization
+- Larger batches easily fit → better GPU utilization per layer swap
 
-**30B teacher extraction on one cloud A100**: ~$8 one-time, enables
-unlimited local student training runs.
+**30B teacher extraction locally**: multi-day one-time run via the
+same streaming architecture as student training. The cost is wall
+clock, not cash. Amortizes across every subsequent student
+ablation on that teacher + corpus — run once, reuse forever.
 
 ### 2.5 Caching format
 
@@ -202,13 +215,13 @@ Per-step cost breakdown:
 - Per opt-step (grad_accum=4): ~40-120 seconds
 - 8000 opt-steps: **~90-270 hours for 30B**
 
-**That's 4-11 days per training run.** Long but possible. Compare:
+**That's 4-11 days per training run.** Long but possible. Compare
+against our existing local baseline:
 - Current Phase B 0.5B on GPU: ~10 hours
-- 30B via this architecture: ~100-200 hours
-- 30B via cloud A100x4: ~30 hours, $180
+- 30B via this architecture: ~100-200 hours (4-8 days)
 
-Cloud still wins on wall time. Local wins on total cost if you run
-multiple ablations (amortize teacher extraction cost).
+That wall clock is the cost of this project's local-only
+constraint. Accept it, plan for it, amortize it across ablations.
 
 ## 4. Quality considerations
 
@@ -275,21 +288,20 @@ unchanged.
 Write up the architecture. This is genuinely novel for QAT at
 consumer scale.
 
-## 6. Comparison: this architecture vs cloud
+## 6. Wall-clock expectations (local-only)
 
-| Path | Wall clock | Cash | Per-run cost after setup |
-|---|---:|---:|---:|
-| 30B cloud (4× A100, Vast.ai) | ~30 hours | $180 | $180 |
-| 30B local, this architecture | ~100-200 hours | ~$10 (teacher) | ~$10 |
-| 70B cloud | ~100 hours | $1500 | $1500 |
-| 70B local, this architecture | ~300-500 hours | ~$25 | $25 |
+| Path | Teacher extraction | Per student run |
+|---|---:|---:|
+| 7B local (post Sprint 3 teacher cache) | ~2-4 hours | ~3-6 hours |
+| 13B local, this architecture | ~1-2 days | ~1-2 days |
+| 30B local, this architecture | ~3-5 days | ~4-8 days |
+| 70B local, NVMe tier (§11) | ~1-3 weeks | ~14-21 days |
 
-Local wins on cash but **loses decisively on wall clock**. The
-economics favor local only if:
-- You plan to run many ablation variants (cache once, reuse many
-  times) — amortize teacher extraction across 10+ runs
-- You have patience / don't need fast turnaround
-- You don't want to set up cloud workflow
+Teacher extraction is paid once per teacher + corpus combo and
+amortized over every subsequent student ablation. The per-run
+wall clock is the cost of this project's local-only constraint.
+Plan ablation batches so each run has time to complete overnight
+or over a weekend.
 
 ## 7. Key risks
 
@@ -304,10 +316,14 @@ economics favor local only if:
 
 ## 8. When NOT to do this
 
-- If cloud 30B for $180 once is an acceptable cost
-- If you don't need ablation iteration (one-and-done training)
+- If you don't need ablation iteration (one-and-done training) —
+  the one-time wall clock is hard to justify without reuse
 - If disk space (1.5+ TB) is constrained
-- If system RAM is ≤64 GB (hard limit for streamed 30B)
+- If system RAM is ≤64 GB (hard limit for streamed 30B — see §11
+  NVMe tier for a workaround at cost of additional wall clock)
+- If wall-clock multi-day training is incompatible with the project
+  timeline — in which case, stop at whatever scale fits in a
+  single overnight run (7B is comfortably in range)
 
 ## 9. Open questions
 
@@ -320,22 +336,25 @@ economics favor local only if:
   storage. Precision loss unclear.
 - **What's the right corpus size?** 50M tokens is a guess. Could be
   20M or 100M. Should ablate.
-- **Teacher extraction on CPU vs GPU for 30B**: haven't benchmarked.
-  CPU int4 30B forward might take 10-30 days for 50M tokens. Cloud
-  GPU cheaper in wall time.
+- **Teacher extraction for 30B — streamed GPU vs CPU int4**: haven't
+  benchmarked. CPU int4 30B forward might take 10-30 days for 50M
+  tokens. Streamed-layer GPU forward (same architecture as student
+  §3) likely lands in the 1-5 day range per the table in §2.4, but
+  needs measurement. One-time cost either way; benchmark before
+  committing to which path.
 
 ## 10. Relation to Atlas deployment
 
 If we pull this off locally:
 - We can produce LittleBit-compressed Atlas models in-house
-- No cloud dependency for reproduction / iteration
+- Zero external dependency for reproduction / iteration
 - Faithful to the "llama.cpp fork, local everything" ethos of this
   repository
 - Downstream: compressed GGUF would ship as an upstream-loadable
   tensor type (separate engineering project)
 
-Worth pursuing as a longer-term architecture whether or not the
-short-term 7B work goes cloud vs local.
+Worth pursuing as a longer-term architecture once short-term
+7B local work lands.
 
 ## 11. NVMe tier — extending to 70B+ on consumer hardware
 
@@ -540,9 +559,10 @@ autograd, we fall back to the hand-rolled `NVMeLayerStore`.
 
 Total build: **~$3000-4000 one-time** for a dedicated workstation.
 
-vs cloud 70B at $1500 per run: **break-even at 2-3 runs**, which
-includes teacher extraction reruns.  If we plan to train and
-ablate 70B more than once, local workstation is the right spend.
+This is the only path to 70B training under the project's
+local-only constraint. A workstation upgrade is the prerequisite;
+without it, 70B stays out of reach regardless of software
+architecture.
 
 ---
 

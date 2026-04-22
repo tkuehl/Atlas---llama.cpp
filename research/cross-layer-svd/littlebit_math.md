@@ -1,5 +1,15 @@
 # LittleBit — math walkthrough and findings
 
+> **Fresh session?** Start at [README.md](README.md) and
+> [JOURNAL.md](JOURNAL.md).  Plan docs organized by axis:
+> [roadmap](consolidated_implementation_roadmap.md) ·
+> [enhancements](littlebit_enhancements.md) ·
+> [savings](savings_exploration_plan.md) ·
+> [unexplored gains](unexplored_efficiency_gains.md) ·
+> [30B scale](scale_to_30b_architecture.md) ·
+> [wall-time](wall_time_reduction_plan.md) ·
+> [inference runtime](inference_runtime.md).
+
 Math reconstruction of LittleBit (Lee et al., Samsung Research, NeurIPS
 2025, arXiv [2506.13771](https://arxiv.org/abs/2506.13771)) with
 commentary grounded in this fork's archived per-matrix SVD results.

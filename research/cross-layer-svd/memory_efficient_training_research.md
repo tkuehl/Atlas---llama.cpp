@@ -1,5 +1,13 @@
 # Memory-efficient training on resource-limited GPUs — research survey
 
+> **Part of the LittleBit plan set.** See [README.md](README.md)
+> for the index and
+> [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+> for execution sequence.  This doc surveys external techniques;
+> [savings_exploration_plan.md](savings_exploration_plan.md) picks
+> which to ablate first, and [wall_time_reduction_plan.md](wall_time_reduction_plan.md)
+> catalogs the per-step-time versions.
+
 State-of-the-art (April 2026) techniques for training transformer
 models under tight VRAM budgets. Focused on the 16 GB consumer-GPU
 regime that this fork operates in. Organized by mechanism; each
@@ -302,23 +310,28 @@ Stacking techniques 1-6 (excluding speculative FP8 for now):
 
 ## 11. Honest conclusion
 
-Three clean paths emerge:
+Three clean paths emerge (all local — cloud compute is not an
+option for this project):
 
 **A. Stay at ≤3B locally, adopt Liger + Tier 1 stack.**
 Fully fits 16 GB with headroom. Establishes scaling story.
 Time: ~2 hours coding + normal training time per run.
 
-**B. Integrate full stack (Liger + nf4 teacher + bf16 student +
-8-bit Adam + chunked KL) + cloud for 7B.**
-~$15-25 per cloud run. Total stack fits 24 GB desktop GPU if we
-eventually buy one. Time: ~1 day coding + $25 cloud.
+**B. Full memory stack + Sprint 3 teacher cache → 7B local.**
+Stack: Liger + nf4 teacher (if cache not used) + bf16 student +
+8-bit Adam + chunked KL. With the teacher cache from
+[consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+Sprint 3, teacher is out of GPU entirely; 7B fits in 16 GB
+laptop budget. Time: ~1 day coding on top of Sprint 3.
 
 **C. Go speculative with COAT FP8 training on laptop for 7B.**
 Research-grade, high variance. Would be a legitimate contribution
 if it works. Time: days of coding + debugging, outcome uncertain.
 
-**Recommendation**: Path A during Phase B's completion. If Phase B
-is clean, do Path B for 7B. Keep Path C as an optional follow-on.
+**Recommendation**: Path A during Phase B's completion. Once
+Phase B is clean and Sprint 3 (teacher cache) has landed, do
+Path B for 7B. Keep Path C as an optional follow-on — FP8 would
+be a further squeeze if 7B is tight even with teacher cached.
 
 ## Sources
 

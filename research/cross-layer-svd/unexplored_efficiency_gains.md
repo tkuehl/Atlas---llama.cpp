@@ -1,5 +1,13 @@
 # Unexplored efficiency gains — consolidation review
 
+> **Part of the LittleBit plan set.** See [README.md](README.md) and
+> [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md).
+> Related:
+> [savings](savings_exploration_plan.md) ·
+> [wall-time](wall_time_reduction_plan.md) ·
+> [scale-to-30B](scale_to_30b_architecture.md) ·
+> [online draft adaptation](online_draft_adaptation.md).
+
 Systematic review of all accumulated LittleBit research for gaps,
 missed combinations, and under-optimized pipeline steps. The theme
 is **combining techniques that individually worked** — either in our

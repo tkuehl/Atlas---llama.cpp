@@ -1,5 +1,10 @@
 # LittleBit inference runtime
 
+> **Part of the LittleBit plan set.** See [README.md](README.md)
+> and [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md).
+> This doc covers Sprints 5.5–8 (export → kernel → llama.cpp
+> integration).
+
 High-level view of what's needed to turn a trained LittleBit
 checkpoint into a fast standalone-deployable model.  Linked to
 detail docs where the implementation specifics live.

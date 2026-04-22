@@ -1,5 +1,14 @@
 # LittleBit QAT — potential enhancements
 
+> **Part of the LittleBit plan set.** See
+> [README.md](README.md) for the index and
+> [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+> for the execution sequence.  Baseline and math foundation:
+> [littlebit_math.md](littlebit_math.md).
+> Related: [savings](savings_exploration_plan.md) ·
+> [unexplored gains](unexplored_efficiency_gains.md) ·
+> [wall-time](wall_time_reduction_plan.md).
+
 Catalogue of speed / memory / accuracy improvements identified during
 the implementation review of our QAT pipeline
 ([`littlebit_qat_model.py`](littlebit_qat_model.py),

@@ -1,5 +1,12 @@
 # LittleBit QAT — savings exploration plan
 
+> **Part of the LittleBit plan set.** See [README.md](README.md)
+> and [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md).
+> Related: [wall-time](wall_time_reduction_plan.md) ·
+> [unexplored gains](unexplored_efficiency_gains.md) ·
+> [scale-to-30B](scale_to_30b_architecture.md) ·
+> [memory research](memory_efficient_training_research.md).
+
 Systematic ablation plan for exploring **every tractable source of
 memory / compute savings** in our QAT pipeline, with explicit
 quality-degradation gates so no technique is adopted if it damages
@@ -12,8 +19,9 @@ Downstream of:
   candidate optimizations
 - [memory_efficient_training_research.md](memory_efficient_training_research.md) —
   state-of-the-art techniques survey
-- [littlebit_cloud_30b.md](littlebit_cloud_30b.md) — why scale-up
-  needs memory optimization
+- [scale_to_30b_architecture.md](scale_to_30b_architecture.md) —
+  local-only architecture for 30B+; why scale-up needs memory
+  optimization
 
 Status: **planning**. Written while Phase B training runs. Actual
 ablations begin after Phase B completes.
@@ -412,11 +420,13 @@ Phase B result:
 ├── Generation coherent + PPL < 90 (clear win)
 │   ├── Run A (nf4 teacher) next
 │   ├── If A survives: Run C + D + G in parallel (all safe)
-│   └── Aim for 7B cloud run at ~$25 once 0.5B stack is established
+│   └── Aim for 7B local run once Sprint 3 (teacher cache) lands;
+│       0.5B stack transfers directly
 ├── Generation word-level-broken + PPL 60-90 (partial win, like Run 3)
 │   ├── Priority on quality ablations: E (tau warmup), F (KD temp)
 │   ├── Then memory: A, C, D
-│   └── Reproduction story less clear; cloud 7B harder to justify
+│   └── Reproduction story less clear; 7B attempt deferred until
+│       quality ablations lift generation off the partial-win plateau
 └── Generation still-digit-spam OR PPL > 150 (fail)
     ├── Debug: did MSE weight fire correctly? Hidden state capture?
     ├── Try increasing MSE weight (λ=20) or adding temperature
@@ -485,9 +495,12 @@ This plan's done when:
   running the adopted stack on 0.5B
 - **Honest recommendation** written in JOURNAL: either
   (a) "7B local training is feasible with our stacked ablations —
-  go for it" or
-  (b) "7B local needs cloud regardless of these savings — budget
-  $25 for one run"
+  go for it once Sprint 3 teacher cache lands" or
+  (b) "7B local is not yet feasible on current hardware even with
+  stacked savings — defer 7B until NVMe tier
+  ([scale_to_30b_architecture.md §11](scale_to_30b_architecture.md))
+  lands, or until hardware (RAM / GPU) is upgraded"
 
 Both are acceptable outcomes. The point is to reach a defensible
-decision backed by data, not to force 7B local.
+decision backed by data. Cloud compute is not an option — no
+scenario in this plan routes through cloud GPU rental.

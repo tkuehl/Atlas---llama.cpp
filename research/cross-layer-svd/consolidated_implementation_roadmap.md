@@ -3,15 +3,29 @@
 Cross-reference of techniques across our four plans to find
 overlapping wins and build a single execution sequence.
 
-Plans reviewed:
+Plans cross-referenced here:
 - [savings_exploration_plan.md](savings_exploration_plan.md) —
-  memory
+  memory ablations
 - [unexplored_efficiency_gains.md](unexplored_efficiency_gains.md)
-  — quality
+  — quality combinations
 - [scale_to_30b_architecture.md](scale_to_30b_architecture.md) —
-  scale
+  scale-to-30B+ architecture
 - [wall_time_reduction_plan.md](wall_time_reduction_plan.md) —
-  wall time
+  wall-time reduction
+- [inference_runtime.md](inference_runtime.md) — 4-layer deployment
+  stack (export → Python → CUDA → llama.cpp)
+- [online_draft_adaptation.md](online_draft_adaptation.md) — online
+  KD during speculation deployment
+- [memory_efficient_training_research.md](memory_efficient_training_research.md)
+  — external-techniques survey (Liger, COAT, ZenFlow, etc.)
+
+Also relevant:
+- [littlebit_math.md](littlebit_math.md) — paper walkthrough and
+  sanity experiments (foundation for all of the above)
+- [littlebit_enhancements.md](littlebit_enhancements.md) — per-
+  technique enhancement catalog
+- [JOURNAL.md](JOURNAL.md) — chronological log of runs and findings
+- [README.md](README.md) — directory index for fresh sessions
 
 **Question**: which techniques hit multiple axes? Those are the
 highest leverage and should be implemented first.
@@ -210,9 +224,9 @@ tokens the teacher agrees with, saving teacher forward passes.
 
 **Decision gates**:
 - **≥ 60% acceptance** → deployment path validated. LittleBit
-  produces a genuinely useful draft even at 0.5B. Cloud spend
-  on 7B becomes triple-value (paper reproduction + new scale data
-  point + draft model for Atlas deployment).
+  produces a genuinely useful draft even at 0.5B. A local 7B run
+  (post-Sprint 3) becomes triple-value (paper reproduction + new
+  scale data point + draft model for Atlas deployment).
 - **40-60% acceptance** → marginal but usable. Quality ablations
   from Sprint 4 worth pursuing specifically to push acceptance
   toward 70%.
@@ -268,8 +282,10 @@ Apply the consolidated stack to progressively larger models:
 Only if Sprint 5 produces a paper-grade 7B result:
 
 - [ ] NVMe layer storage (Sprint 6 or Sprint 3 depending on urgency)
-- [ ] 30B teacher extraction (cloud, ~$8)
-- [ ] 30B student training with NVMe + cached teacher (~40-60h)
+- [ ] 30B teacher extraction locally (~10-30 days per
+  [scale_to_30b_architecture.md §9](scale_to_30b_architecture.md) —
+  one-time, amortizes across ablations)
+- [ ] 30B student training with NVMe + cached teacher (~100-200h)
 
 ## 5. Redundancies to drop
 
@@ -295,7 +311,7 @@ After each sprint, check what's now within reach:
 | 2 | Faster + slightly less memory. Ablations go 2h each. |
 | 3 | **No teacher in training memory.** 7B local feasible. 30B architecturally possible. Teacher cache reusable across all future runs. |
 | 4 | Quality-tuned recipe. Know which combinations help. |
-| 5 | Scale-validated method. Clear signal on cloud vs local for 30B. |
+| 5 | Scale-validated method. Clear signal on whether 30B local is worth the multi-week run. |
 | 6 | 30B locally produced. Publishable novelty. |
 
 ## 7. Gates and off-ramps
@@ -355,7 +371,7 @@ Things that could derail this plan:
 | Teacher cache top-k truncation hurts quality more than expected | 3 | Fall back to online teacher | Keep infrastructure, use online for small scales |
 | NVMe wear rate higher than calculated | 6 | Drive fails | Enterprise SSD ($500-1000) |
 | 1.5B or 3B ablations show method plateaus | 5 | No 30B justification | Write up as reproduction study |
-| Local system RAM insufficient for 30B | 6 | 30B infeasible locally | Cloud $180 fallback |
+| Local system RAM insufficient for 30B | 6 | 30B infeasible on current hardware | Defer 30B until RAM upgrade (128 GB+ for §11 NVMe tier); stop at 7B or 13B in the meantime |
 
 ## 10. When to revisit
 
