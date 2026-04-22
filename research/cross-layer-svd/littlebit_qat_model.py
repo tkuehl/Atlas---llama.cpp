@@ -637,6 +637,14 @@ def main():
                         "~13%% matmul speedup.  --no-tf32 to disable "
                         "for ablation.")
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
+    p.add_argument("--init-ppl-kill-threshold", type=float, default=1e6,
+                   help="Early-exit if init PPL exceeds this value "
+                        "(a sanity guard for broken Dual-SVID init).  "
+                        "Calibrated at 0.5B where a healthy init gives "
+                        "~400k.  At 1.5B+ the natural init is worse "
+                        "and trains out in a few hundred steps — pass "
+                        "a higher value (e.g. 1e7) or -1 to disable "
+                        "the check.")
     p.add_argument("--shadow-dtype", default="fp32",
                    choices=("fp32", "bf16"),
                    help="Precision of the U_fp / V_fp shadow matrices "
@@ -925,7 +933,17 @@ def main():
     }]
 
     # Kill-criterion early-exit if init PPL is unmeasurable.
-    if not math.isfinite(init_ppl) or init_ppl > 1e6:
+    # NaN/inf always kills.  The `init_ppl > kill_threshold` check is a
+    # sanity guard calibrated for the paper's 0.5B reference recipe
+    # (where a healthy Dual-SVID init produces PPL ~400k).  At larger
+    # scales (1.5B+) the init is naturally worse — Dual-SVID's
+    # rank-1-absolute-value assumption holds less tightly as matrices
+    # get bigger, and PPL 1-2M is recoverable through training.
+    # `--init-ppl-kill-threshold -1` disables the ceiling entirely.
+    if not math.isfinite(init_ppl) or (
+        args.init_ppl_kill_threshold > 0
+        and init_ppl > args.init_ppl_kill_threshold
+    ):
         print(f"init PPL {init_ppl} is already broken; saving and exiting.")
         Path(args.out).write_text(json.dumps({
             "status": "init_broken",

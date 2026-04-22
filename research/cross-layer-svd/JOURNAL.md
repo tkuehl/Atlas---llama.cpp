@@ -4034,4 +4034,154 @@ TODO(C) for the KL gap (lse caching) still on the board; would
 independently close 5% more PPL regardless of scale.  Lower
 priority than the scale validation.
 
+## 2026-04-22 — 1.5B attempt: the memory wall, and the case for Phase II streaming
+
+Fifth journal entry this day.  Attempted to extend today's
+full-stack result (bf16 shadow + teacher cache beating Run 3 at
+0.5B while freeing 31% of VRAM) to 1.5B.  Result: **1.5B at
+r=1024 cannot be trained on a 16 GB card even with the full
+stack active**.  The memory budget extrapolates linearly with
+model size, and at 3.36× the parameter count of 0.5B we're
+pushed over the cap regardless of seq_len.  Phase II streaming
+(CPU↔GPU layer movement during forward/backward) is now on the
+critical path.
+
+### What we built today toward 1.5B
+
+- [build_init_cache.py](build_init_cache.py) — dedicated one-off
+  Dual-SVID builder so we don't have to spin up the full training
+  pipeline (teacher + optimizer + token stream) just to produce an
+  init cache.  Pure CPU SVDs; takes ~10 min for 1.5B r=768 / 1.5B
+  r=1024, produces a .pt state-dict keyed to match the HF model's
+  Linear-replacement layout.
+- Added `--init-ppl-kill-threshold` CLI flag on the training
+  script.  The previous hard-coded `init_ppl > 1e6` sanity guard
+  was calibrated for the paper's 0.5B reference recipe (~400k init
+  PPL is healthy there).  At 1.5B the natural Dual-SVID init is
+  over 1e6 — not because it's broken, but because the approximation
+  error compounds through 28 layers instead of 24 and the
+  underlying rank-1-absolute-value assumption holds less tightly
+  as matrices get bigger.  Flag defaults to the old 1e6; `-1`
+  disables.
+- Moved cache storage to `D:/atlas-caches/` (949 GB free, vs C
+  drive at 81% full).  `.gitignore` already excludes `caches/`
+  and `*.bin`; no code changes needed for the move.
+
+### The init-PPL puzzle at 1.5B
+
+| model | rank | init PPL | notes |
+|---|---|---:|---|
+| Qwen2.5-0.5B | 512 | ~400,000 | healthy per paper recipe |
+| Qwen2.5-1.5B | 768 | **8,500,000** | 20x 0.5B's init — well past threshold |
+| Qwen2.5-1.5B | 1024 | **1,700,000** | better but still over 1e6 |
+
+Rank coverage comparison:
+- 0.5B r=512 on MLP (896×4864): 57% coverage
+- 1.5B r=768 on MLP (1536×8960): 50% coverage
+- 1.5B r=1024 on MLP (1536×8960): 67% coverage
+
+67% > 57%, so the 1.5B r=1024 init should be *better* than 0.5B
+r=512 if rank coverage were the only factor.  It's not — 28 layer
+compoundings vs 24 is part of it, and the teacher's peakier
+distribution at 1.5B (teacher PPL 12.2 vs 0.5B's 17.2) means
+sign-approximation errors propagate more sharply.  Raised the
+kill threshold to `-1` to let training attempt to rescue the init;
+training didn't get far enough to confirm whether it could (see
+memory wall below).
+
+### The memory wall
+
+Attempted 1.5B r=1024 training with full stack (bf16 shadow +
+teacher cache, grad_accum=4, seq=512, `inter_mse_weight=10`):
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate
+892 MB. GPU 0 has a total capacity of 15.92 GiB; 12.74 GiB
+allowed (80% safety cap); 12.37 GiB already allocated.
+```
+
+Dropped to seq=256 (re-extracted teacher cache, 44 GB at seq=256
+vs 88 GB at seq=512).  **Still OOM'd**: the activation savings
+were only ~0.35 GB despite halving sequence length, because
+gradient checkpointing was already absorbing most of the
+activation footprint.  The dominant memory consumers at 1.5B are
+static: student params + grads + Adam state + KL workspace, which
+don't scale with seq_len.
+
+Memory breakdown at the point of OOM (estimates per component):
+
+| component | 1.5B r=1024 bf16+cache | lever |
+|---|---:|---|
+| Student weights (bf16 shadow) | 2.14 GB | ✓ would be 4.3 GB at fp32 |
+| Student grads (bf16) | 2.14 GB | ✓ would be 4.3 GB |
+| 8-bit Adam state | 1.0 GB | ✓ would be 4 GB at fp32 Adam |
+| Activations w/ grad-ckpt | 4-5 GB | ✓ ckpt already absorbing most |
+| Teacher | **0** | ✓ via cache (was 3 GB live) |
+| KL workspace (fp32 logits @ 152k vocab) | ~0.8 GB | ✓ top-k (was ~3 GB full-vocab) |
+| Cache reads | 45 MB | cheap |
+| Peak + fragmentation | **~13-14 GB** | **exceeds 12.74 GB cap** |
+
+Every existing lever is already pulled as far as it goes.  Without
+the stack, 1.5B fp32 + live teacher would need ~25-30 GB —
+infeasible on 16 GB.  **With the stack, we're still 1-2 GB over
+the safe cap.**
+
+### Scaling verdict
+
+- 0.5B r=512 bf16+cache peak: 7.18 GB reserved
+- 1.5B r=1024 bf16+cache: OOMs at the 12.74 GB cap
+- Linear extrapolation (3.36× params): projected peak 24 GB
+
+**1.5B at r=1024 is simply past what 16 GB can hold.**  The
+bf16 shadow + teacher cache stack doesn't scale through the 1.5B
+threshold on a single consumer GPU.  7B would need ~60-80 GB at
+the same recipe — far past any rescue via the levers we have.
+
+### What this changes
+
+Today's "skip Phase II streaming?" hypothesis is refuted.  The
+arch doc §3 Phase II (CPU↔GPU layer streaming) is on the
+critical path for 1.5B+ local training.  Estimate:
+
+- **Path A (accelerate's `cpu_offload_with_hook`)**: ~1 day.
+  Risk: may not compose with LittleBit's custom modules or
+  SmoothSign's straight-through autograd.
+- **Path B (DeepSpeed ZeRO-3 + CPU offload)**: 1-2 days but big
+  dependency footprint, overkill for single-GPU.
+- **Path C (custom forward pre/post-hook streaming)**: 2-3 days,
+  matches arch doc §3 spec exactly, full control over
+  prefetching/async.
+
+Recommend trying (A) first as a half-day PoC next session.
+
+### What's still valid from today
+
+- Sprint 0 + Sprint 3 cache + bf16 shadow: **0.5B validated,
+  shipping, committed**.  -31% VRAM, -63% wall time, +8.1% PPL
+  vs live-teacher ceiling, -28% PPL vs Run 3's paper recipe.
+- The 1.5B r=1024 init cache (5.1 GB on disk, gitignored) is
+  reusable once streaming lands.
+- Teacher cache seq=256 + seq=512 versions on D drive: reusable
+  as-is (88 GB seq=512 re-extracted as 44 GB seq=256 on disk).
+  Deleted the seq=512 one to recover the disk space.
+
+### Artifacts
+
+- [build_init_cache.py](build_init_cache.py) — offline Dual-SVID
+  builder
+- [littlebit_qat_15b_v1.json](littlebit_qat_15b_v1.json) —
+  r=768 init-broken attempt
+- [littlebit_qat_15b_v3.json](littlebit_qat_15b_v3.json) —
+  r=1024 + kill-threshold-bypassed attempt (hit OOM at step 1)
+- [littlebit_qat_15b_s256.json](littlebit_qat_15b_s256.json) —
+  r=1024 seq=256 attempt (OOM'd at step 1 forward)
+
+### Next session
+
+1. Path (A) accelerate PoC with LittleBit 1.5B r=1024 — test if
+   `cpu_offload_with_hook` plays nice.  Half day.
+2. If clean: run the 1.5B 2000-step matched smoke we wanted today.
+3. If broken: fall back to Path (C), budget 2-3 days.
+4. Once 1.5B validates, 7B is next.
+
 

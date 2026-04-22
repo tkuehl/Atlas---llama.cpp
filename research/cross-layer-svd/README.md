@@ -64,11 +64,19 @@ After those two, branch to whichever concern you're picking up.
   noise trains out inside 1000 steps).  Peak VRAM 7.18 GB at 0.5B
   (-31% from baseline).  **Probably skips the arch-doc Phase II
   streaming work for 7B**: 7B fits natively in 16 GB.
-- **Next planned**: 1.5B validation of the full stack (Sprint 0 +
-  Sprint 3 + bf16 shadow).  Same Qwen2.5 family, peakier
-  distribution should close the 8% gap; fits in an afternoon.  Then
-  7B.  TODO(C) lse caching for independent 5% PPL gain remains
-  lower-priority.
+- **1.5B attempt hit the memory wall** (2026-04-22 fifth entry):
+  even with bf16 shadow + cache + gradient checkpointing + 8-bit
+  Adam + top-k KL workspace, 1.5B at r=1024 OOMs at the 80%
+  safety cap.  Linear extrapolation of the 0.5B footprint says
+  1.5B needs ~24 GB — past what 16 GB can hold with any rescue
+  via the levers we have.  7B would need ~60-80 GB.  The
+  "skip Phase II streaming" hypothesis is refuted.
+- **Next planned**: Phase II (CPU↔GPU layer streaming) per
+  arch doc §3.  Try accelerate's `cpu_offload_with_hook` first
+  (~1 day PoC); fall back to custom hook-based streaming
+  (2-3 days) if accelerate doesn't compose with LittleBit.
+  Once streaming works, run the 1.5B validation we wanted today.
+  TODO(C) lse caching lower-priority, still on the board.
 
 ## Decisions locked in
 

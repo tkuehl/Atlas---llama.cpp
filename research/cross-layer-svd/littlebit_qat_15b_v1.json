@@ -1,0 +1,52 @@
+{
+  "status": "init_broken",
+  "teacher_ppl": 12.233353051587885,
+  "init_ppl": 8549814.767586555,
+  "args": {
+    "model": "Qwen/Qwen2.5-1.5B",
+    "rank": 768,
+    "tau": 100.0,
+    "steps": 500,
+    "lr": 0.0001,
+    "batch_size": 1,
+    "grad_accum_steps": 4,
+    "seq_len": 512,
+    "eval_every": 250,
+    "eval_max_tokens": 50000,
+    "log_every": 50,
+    "warmup_steps": 200,
+    "early_stop_window": 5,
+    "early_stop_min_delta": 2.0,
+    "early_stop_min_steps": 4000,
+    "weight_decay": 0.01,
+    "optimizer": "adamw8bit",
+    "grad_checkpoint": true,
+    "c4_samples": 0,
+    "inter_mse_weight": 10.0,
+    "out": "littlebit_qat_15b_v1.json",
+    "gpu_mem_fraction": 0.8,
+    "checkpoint": "littlebit_qat_15b_v1.pt",
+    "init_cache": "littlebit_qat_init_qwen15b_r768.pt",
+    "ckpt_every": 0,
+    "rolling_ckpt": "littlebit_qat_rolling.pt",
+    "best_ckpt": "",
+    "resume": "",
+    "save_dtype": "bf16",
+    "compile": true,
+    "compile_mode": "default",
+    "liger": true,
+    "mse_via_hooks": false,
+    "tf32": true,
+    "shadow_dtype": "bf16",
+    "teacher_cache": "D:/atlas-caches/qwen15b_500",
+    "delete_init_cache_after_start": false
+  },
+  "history": [
+    {
+      "step": 0,
+      "loss": null,
+      "ppl": 8549814.767586555,
+      "teacher_ppl": 12.233353051587885
+    }
+  ]
+}
