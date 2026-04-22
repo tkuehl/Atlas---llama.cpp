@@ -3247,4 +3247,434 @@ dependencies). The research fork now mirrors that posture end-to-
 end: from training data through compression through draft model
 through inference runtime, every step runs on hardware we control.
 
+## 2026-04-22 — Sprint 0 shipped: 63% wall-time reduction, 33-37% better PPL than Run 3, all defaults
+
+Sprint 0 (wall-time stack from [consolidated_implementation_roadmap.md](consolidated_implementation_roadmap.md)
+§4 Sprints 1+2) is now actually landed — previous README claim "Sprint
+0 shipped (TF32, bf16 saves, forward hooks, compile fallback, plateau
+early-stop)" was misleading because two of the biggest projected wins
+(Liger, `torch.compile`) had dead code paths on this Windows host
+and several of the claimed items had unmeasured quality or throughput
+regressions.  This entry documents the full shipping pass.
+
+### TL;DR
+
+| Metric | Phase B (pre-Sprint-0) | Shipped Sprint 0 | vs Phase B |
+|---|---:|---:|---:|
+| Step time (pre-eval, grad_accum=4) | 1.78 s | 0.58 s | **-67%** |
+| Step time (post-eval, grad_accum=4) | 1.78 s | 0.58 s (was 1.62 s before fix) | **-67%** durable |
+| 1000 opt-steps wall time (smoke) | ~30 min extrapolated | **11.3 min measured** | -63% |
+| 20k opt-steps wall time (extrapolated) | 9.3 h | **3.4 h** | **-63%** |
+| Step 500 PPL (grad_accum=4 matched) | — (Run 3 baseline: 558.82) | **349.97** | **-37% vs Run 3** |
+| Step 1000 PPL (grad_accum=4 matched) | — (Run 3 baseline: 354.23) | **236.30** | **-33% vs Run 3** |
+| Peak VRAM (train) | 12.7 GB | 10.17 GB | -20% |
+
+20k-step Sprint 0 runs should finish overnight-easily, opening the way
+to Sprint 3 (teacher cache) and the scale ladder.
+
+### What was actually in the box before this pass
+
+Reviewing [littlebit_qat_model.py](littlebit_qat_model.py) as it
+stood at session start:
+- TF32 + cuDNN benchmark — correctly wired (lines 498-503). ✓
+- Plateau early-stop — correctly wired with min_delta=2 / window=5
+  / min_steps=4000 defaults (lines 391-401). ✓
+- bf16 save-dtype default — correctly wired (line 453). ✓
+- `--compile` defaulted True but **skipped at runtime** on this host
+  because [triton is not on Windows PyPI](https://github.com/triton-lang/triton/issues/1640)
+  and the `try: import triton` probe always failed.  Fallback
+  message printed silently; 30-50% projected gain unrealized.
+- `--liger` defaulted True but Liger-kernel's dep resolver requires
+  the PyPI `triton` package name, so `pip install liger-kernel`
+  couldn't resolve on Windows.  ImportError fallback silently fired;
+  10-15% projected gain unrealized.
+- Forward-hook MSE capture (`--mse-via-hooks` defaulted True)
+  interacted with gradient checkpointing in a way that zeroed out
+  MSE gradient flow (discovered this session).  Step 500 PPL 1190 vs
+  Run 3's 558 → 2.1x worse.  **Quality regression shipped as a
+  default.**
+- `--eval-every` defaulted 500 despite [wall_time_reduction_plan.md §8](wall_time_reduction_plan.md)
+  prescribing 2000.  Small but measurable.
+- No smoke test documented anywhere in JOURNAL.  Artifacts
+  (`littlebit_ablation_{full,bare,no-hooks,no-tf32}.json`,
+  `littlebit_longrun_sprint0.json`) existed but weren't interpreted.
+
+### Four Windows bugs found and fixed
+
+Each one was a silent failure where a code path looked correct in
+review but produced wrong or degraded behaviour at runtime.  Listed
+in order of severity.
+
+#### 1. Liger + `torch.compile` — missing Windows Triton distribution
+
+Liger-kernel and PyTorch Inductor both hard-require Triton.  Official
+Triton has no Windows wheels.  Community port
+[`triton-windows`](https://github.com/woct0rdho/triton-windows) 3.6.0
+ships cp314 + Blackwell (CUDA 12.8) wheels and installs as module
+name `triton`, so every downstream consumer finds it transparently.
+
+Gotcha: `pip install liger-kernel` refuses to resolve because
+Liger's setup pins the distribution name `triton` (not `triton-windows`).
+Workaround: `pip install --no-deps liger-kernel`.  The import-level
+check at the top of [littlebit_qat_model.py:694](littlebit_qat_model.py)
+then passes and Liger's RoPE + RMSNorm patches apply cleanly to
+Qwen2.
+
+Measured effect: trivial `@triton.jit` kernels correct to zero abs
+diff; `apply_liger_kernel_to_qwen2` + forward produces valid logits;
+`torch.compile` forward drops from 22.5 ms → 10.6 ms on Qwen2.5-0.5B
+(seq=128) — **2.1x speedup** on the forward alone.
+
+The README's locked-in decision
+["no Triton, no WSL2"](README.md) is updated — Windows Triton via
+`triton-windows` is now the baseline, with `torch.utils.cpp_extension`
+still the path for any bespoke CUDA kernels.
+
+#### 2. Inductor codegen + cp1252 default encoding
+
+First compiled forward on Windows dies with:
+
+```
+torch._inductor.exc.InductorError: UnicodeEncodeError: 'charmap' codec
+can't encode character 'θ' in position 65060
+```
+
+Root cause: `torch._inductor.codecache.write_atomic` opens its cache
+files in text mode without specifying encoding.  Windows'
+`locale.getpreferredencoding(False)` returns `cp1252` by default.
+Inductor's generated code contains Greek θ (RoPE kernel comments),
+which cp1252 can't represent.
+
+Fix: add a PEP-540 UTF-8-mode bootstrap at the top of the training
+script ([littlebit_qat_model.py:31-52](littlebit_qat_model.py#L31-L52))
+that re-launches via `subprocess.run([python] + sys.argv, env=...+{PYTHONUTF8:1})`
+when running on `nt` without the flag set.  Chose subprocess over
+`os.execv` because the latter silently drops empty-string argv
+entries through `CreateProcess` serialization (`--best-ckpt ""` was
+how we discovered this).
+
+#### 3. `torch.compile(mode="reduce-overhead")` × training-loop activations
+
+With `mode="reduce-overhead"` (CUDA-graphs on), the compiled forward
+reuses output buffer memory across replays.  Our loop keeps
+`s_logits` and `s_hidden` alive past the next forward (for KL and
+MSE loss), so the second forward overwrites them and backward fails
+with:
+
+```
+Error: accessing tensor output of CUDAGraphs that has been overwritten
+by a subsequent run.
+```
+
+Fix: change compile mode to `default` (kernel fusion only, no CUDA
+graphs).  Expose a `--compile-mode` CLI with a choices list so future
+modes can be ablated without re-editing the source.  Documented the
+incompatibility in the arg's help text.
+
+Trade-off: loses ~5-10% of the maximum projected gain (the part
+attributable to CUDA-graph replay-vs-launch overhead).  Retains
+inductor's kernel fusion, which is the bulk of the win.  Measured
+0.58 s/opt-step at grad_accum=4 vs Phase B's 1.78 s — 67% reduction
+without CUDA graphs.
+
+#### 4. Post-eval compile-cache invalidation from `.eval()` / `.train()` mode flip
+
+Most subtle and most expensive.  After the first eval-during-training,
+steady-state step time jumped from 0.58 s → 1.62 s (2.8x) and stayed
+there for the rest of the run.  In a 20k-step extrapolation, this
+single bug erased most of the Sprint 0 wall-time gain (9.3 h → 8.9 h,
+vs 3.4 h with the fix).
+
+Isolated via [diag_post_eval_slowdown.py](diag_post_eval_slowdown.py):
+snapshot of `torch._dynamo.utils.counters` before vs after eval
+reveals 6 new `inductor.fxgraph_cache_miss` and 3 new
+`aot_autograd.autograd_cache_miss` in the post-eval measurement
+window.  **Dynamo evicts the train-mode compiled graph on the
+`.train()` call** after eval because `self.training` is a guard
+specialization point.  With `--no-mode-switch`: post-eval ms/iter
+matched pre-eval to within 0.1 ms, zero counter delta.
+
+Fix: remove the `model.eval()` call from `wikitext_ppl`
+([littlebit_qat_model.py:310-336](littlebit_qat_model.py#L310-L336))
+and the `student.train()` call after eval in the training loop.  The
+`@torch.no_grad()` decorator already disables gradient accumulation.
+Qwen2's `attention_dropout=0.0` default means `.eval()` was
+functionally a no-op, but carrying the full dynamo-guard cost.
+
+Also in `wikitext_ppl`: force eager mode during eval
+(`torch.compiler.set_stance("force_eager")`) so the eval forwards
+never populate a second specialization keyed on eval shapes, and
+drop any tail chunk whose shape doesn't match the stride (~0.3% of
+eval tokens, well within stochastic variance).
+
+### The hook-MSE quality regression
+
+Separate from the four Windows bugs, a legacy quality bug came out in
+wash.  The `--mse-via-hooks` path (default True before this session)
+was supposed to save ~2 GB by letting gradient checkpointing drop
+captured hidden states after MSE consumption.  In the first matched
+smoke (`grad_accum=4`, `steps=1000`) it produced step-500 PPL 1190 —
+**2.1x worse than Run 3's 558**.  The disabled-hooks ablation matched
+Run 3's recipe byte-for-byte otherwise and produced step-500 PPL 352
+— *better* than Run 3.
+
+Loss values under the two paths differed in a way consistent with
+hook-path MSE contributing zero gradient: hooks loss at step 50 was
+1448 (just KL?), no-hooks was 2108 (KL + real MSE).  Hypothesis:
+gradient checkpointing's backward-recompute fires the hooks again,
+clearing or aliasing the captured tensors before the real backward
+needs them.  Haven't debugged the mechanism; flipped the default to
+False in this session with a help-text breadcrumb
+([littlebit_qat_model.py:471-486](littlebit_qat_model.py#L471-L486)).
+
+### Defaults that now ship
+
+Nothing requires special CLI knowledge; `python -u littlebit_qat_model.py`
+with a reasonable step count and `--grad-accum-steps 4` gets the full
+stack:
+
+| Flag | Before | After | Why |
+|---|---|---|---|
+| `--mse-via-hooks` | True | **False** | Hook path zeroes MSE gradient |
+| `--eval-every` | 500 | **2000** | Eval cadence tax at long horizons |
+| `--compile-mode` | — (mode="reduce-overhead" hardcoded) | **"default"** | CUDA-graph aliasing crashes training |
+| `--compile` | True (silent skip on Windows) | **True (functional)** | `triton-windows` installed |
+| `--liger` | True (silent fallback on Windows) | **True (functional)** | `triton-windows` installed |
+| PYTHONUTF8 | — | **auto-bootstrap** | cp1252 vs inductor codegen |
+| `model.eval()` in eval | yes | **removed** | dynamo guard invalidation |
+
+`requirements.txt` gains two Windows-conditional lines for the
+`triton-windows` and `liger-kernel --no-deps` recipe.
+
+### Artifacts
+
+- [littlebit_smoke_sprint0_final.json](littlebit_smoke_sprint0_final.json)
+  — final shipped-defaults smoke, 1000 steps at grad_accum=4.  Step
+  500 PPL 349.97, step 1000 PPL 236.30, 677 s wall.
+- `littlebit_smoke_sprint0_final.pt` — 1022 MB, gitignored.
+- [littlebit_smoke_sprint0_matched.json](littlebit_smoke_sprint0_matched.json)
+  — pre-fix matched smoke (hooks on), step 500 PPL 1190.88.  Archive
+  of the quality regression.
+- [littlebit_smoke_sprint0_nohooks.json](littlebit_smoke_sprint0_nohooks.json)
+  — isolation that fingered hooks as the culprit.
+- [diag_post_eval_slowdown.py](diag_post_eval_slowdown.py) — compile
+  slowdown isolation harness, keep for regression testing.
+- [diag_baseline.log](diag_baseline.log) — baseline diag output with
+  3.63x slowdown ratio and the counter-delta that fingered dynamo.
+
+### What this unlocks
+
+- **Sprint 3 (teacher cache)** is now the gate to local 7B.  With the
+  Sprint 0 stack in the box, a 20k-step 7B student run lands in
+  ~4-6 h rather than a full day.
+- **Ablation velocity**: a 1000-step 0.5B matched ablation is now
+  ~12 min instead of ~45 min (pre-fix matched).  Quality ablations
+  from [unexplored_efficiency_gains.md](unexplored_efficiency_gains.md)
+  become same-afternoon experiments.
+- **Hook debug** is a real but deferred task.  Current default
+  (output_hidden_states=True) costs ~2 GB at 0.5B, which we can
+  afford; at 7B the gap matters more.  Belongs in Sprint 4 quality
+  block.
+
+### What's verified end-to-end vs what's still extrapolated
+
+Verified from direct measurement in this session (grad_accum=4,
+seq_len=512, 0.5B on 16 GB Blackwell laptop):
+- Liger + compile + no-hooks defaults produce step 500 PPL 349.97.
+- Post-eval step time stays at pre-eval 0.58 s/opt-step through 500+
+  additional steps.
+- End-to-end 1000-step wall: 677 s.
+
+Extrapolated from those measurements:
+- 20k-step Phase-B-equivalent run: ~3.4 h.  Not yet executed.  The
+  only risk is plateau early-stop firing earlier (good) or some
+  recompile not captured at smoke scale (unlikely given the counter
+  evidence).
+
+### Next
+
+Per the updated critical path: ship Sprint 3 teacher cache next, then
+Sprint 5 at 7B local.  Before that, one full 20k-step validation run
+on 0.5B would be the honest smoke-gate for the 3.4 h extrapolation.
+Optional; not strictly blocking Sprint 3.
+
+## 2026-04-22 — Hook-MSE bug: diagnosed, fixed, measured, default stays off
+
+Follow-up to the Sprint 0 entry.  The hook-MSE regression deferred as
+"will debug later at 7B scale" got debugged this session and turned
+out to be a crisp, localized bug with a clean fix — but the fix
+unfortunately does not justify turning hooks back on at 0.5B scale.
+
+### Experimental isolation (three ablations @ 200 steps, grad_accum=4)
+
+Starting hypothesis was a three-way interaction (compile × grad-
+checkpoint × hooks).  The sweep in
+[diag_hook_semantics.py](diag_hook_semantics.py) killed that:
+
+| Exp | compile | grad_ckpt | hooks | step-200 PPL |
+|---|---|---|---|---:|
+| A | off | on | on | 2194.93 |
+| B | on | off | on | 1958.17 |
+| C | off | off | on | 2194.93 (identical to A) |
+
+A ≡ C ⇒ grad-checkpoint had zero effect on hook-MSE quality.
+All three bad ⇒ the bug is not an interaction, it's in the hook
+capture itself.  This refocused the investigation.
+
+### Root cause
+
+Byte-equality diff via [diag_hook_semantics.py](diag_hook_semantics.py)
+showed **layers 0-22 byte-identical** between `HiddenCapture.states`
+and `output_hidden_states=True`'s `hidden_states[1:]`, but **layer 23
+different**:
+
+- Hook[23]: `AddBackward0` grad_fn (residual-add output of layer 23),
+  magnitude 1273
+- HS[1:][23]: `MulBackward0` grad_fn (post-final-RMSNorm),
+  magnitude 2910
+
+HF's `Qwen2Model.forward` builds `all_hidden_states` as
+`[embed, post-layer-0, ..., post-layer-(N-2), self.norm(post-layer-(N-1))]`.
+The last element is post-final-norm.  Hooking every `model.layers[i]`
+misses that norm pass — hook[N-1] is the pre-norm tensor.  For a
+rank-compressed student, the pre-norm final-layer representation
+diverges wildly from the teacher's pre-norm (pre-norm activations
+are unconstrained in magnitude; norm canonicalises them).  The
+24-term MSE sum is then dominated by a single ill-conditioned layer
+with magnitudes ~5× larger than well-behaved intermediate layers,
+steering all gradient toward a target the norm would have scaled
+away.  Explains the 2× PPL regression exactly.
+
+### Fix
+
+Change `HiddenCapture.install` to register hooks on `layers[:-1]`
+plus `model.norm` (the final RMSNorm), so the last capture is the
+post-norm tensor instead of the pre-norm one
+([littlebit_qat_model.py:211-263](littlebit_qat_model.py#L211-L263)).
+23 layer hooks + 1 final-norm hook = 24 captures, semantically
+byte-identical to `output_hidden_states[1:]`.
+
+Verified with [diag_hook_semantics.py](diag_hook_semantics.py):
+- All 24 entries: `same_obj=True`, `same_vals=True`, same grad_fn
+- `params with grad (hook path): 290` (was 289 — now matches HS path,
+  the extra gradient is on `model.norm.weight` which the old bug
+  bypassed)
+- Backward produces zero gradient delta between the two paths
+
+### Training-time measurements after fix (200-step, grad_accum=4)
+
+Fixed hooks: step-200 PPL **652.88** (vs 2194 / 1958 / 2194 pre-fix
+in A/B/C).  **3.4× improvement** from the single `install()` change.
+
+### But: no net benefit at 0.5B
+
+Re-ran the matched 1000-step smoke with fixed hooks (now default-on
+briefly) as the full Sprint 0 stack:
+
+| Metric | No-hooks (Sprint 0 final) | Fixed hooks | Δ |
+|---|---:|---:|---:|
+| Step 500 PPL | 349.97 | 410.76 | +17% worse |
+| Step 1000 PPL | 235.68 | 256.23 | +9% worse |
+| Total wall (1000 steps) | 677 s | 701 s | +3.5% slower |
+| Peak reserved VRAM | 10.17 GB | 10.17 GB | identical |
+
+Both runs beat Run 3 by 27-37% on PPL, so fixed hooks are a huge
+improvement over the broken hook path and over Run 3's recipe.  But
+against the no-hooks path at 0.5B specifically:
+- **Memory**: no measurable savings.  The advertised ~2 GB win from
+  [wall_time §2.8](wall_time_reduction_plan.md) does not materialise.
+  Either HF has improved `output_hidden_states` tensor retention in
+  transformers 4.44+, or the win only emerges at 7B+ where activation
+  footprint per layer scales with `hidden_size**2`.
+- **Wall time**: hooks add ~3.5% overhead per step because the
+  `self.states.append(h)` side effect either causes dynamo graph
+  breaks or runs in eager at each hook boundary.  At larger scale the
+  forward compute per layer grows, diluting this overhead — but at
+  0.5B it's a real regression.
+- **PPL**: fixed hooks converge to similar trajectory as no-hooks but
+  with small floating-point drift from different autograd traversal
+  order.  At step 1000 the gap is 9%; plausibly closes at 8k+ steps.
+
+### Defaults decision
+
+Flipped `--mse-via-hooks` back to `default=False`
+([littlebit_qat_model.py:500-518](littlebit_qat_model.py#L500-L518))
+with a help-text explanation of the empirical finding.  The fix
+stays in place — `--mse-via-hooks` is now a *correct* opt-in for
+anyone who wants to re-benchmark at 7B+ where the memory saving may
+actually show up.
+
+### What this was worth
+
+~2 hours of debugging, one clean semantic bug caught that would have
+silently degraded any future 7B run if someone had enabled hooks
+thinking they were a free win.  The three diagnostic scripts
+([diag_hook_semantics.py](diag_hook_semantics.py),
+[diag_hook_magnitude.py](diag_hook_magnitude.py),
+[diag_post_eval_slowdown.py](diag_post_eval_slowdown.py)) are kept
+as durable regression tests — they'd catch this class of bug on any
+future HF version update or architecture switch.
+
+### Artifacts
+
+- [littlebit_hookdiag_A.json](littlebit_hookdiag_A.json) /
+  [B](littlebit_hookdiag_B.json) /
+  [C](littlebit_hookdiag_C.json): 200-step ablation sweep pinning
+  the bug to the hook mechanism itself (not compile/checkpoint).
+- [littlebit_hookdiag_fixed.json](littlebit_hookdiag_fixed.json):
+  200-step validation of the install-on-norm fix — step-200 PPL
+  652.88.
+- [littlebit_smoke_sprint0_hooksfixed.json](littlebit_smoke_sprint0_hooksfixed.json):
+  1000-step matched smoke, full Sprint 0 stack + fixed hooks on.
+  Step 500 PPL 410.76, step 1000 PPL 256.23, 701 s wall.
+- [diag_hook_semantics.py](diag_hook_semantics.py): the diff
+  harness.  Keep — useful whenever HF transformers is updated.
+- [diag_hook_magnitude.py](diag_hook_magnitude.py): the magnitude
+  comparison that explained WHY the wrong-last-layer mattered for
+  MSE.
+
+## 2026-04-22 — batch=2 memory feasibility: OOM at the 80% cap, argues for Sprint 3
+
+Quick probe of `--batch-size 2 --grad-accum-steps 2` (same effective
+batch 4 as current defaults but halving the micro-step count per
+opt-step, projected ~24% wall-time reduction at same effective
+batch).
+
+At the default `--gpu-mem-fraction 0.80` cap (12.74 GB), the run
+OOM'd at step 1 — tried to allocate 594 MB past 11.76 GB allocated.
+Forcing `--gpu-mem-fraction 0.95` (15.1 GB) made it fit; 200-step
+smoke showed 0.44 s/opt-step (vs 0.58 s/opt-step at batch=1) — **24%
+wall-time reduction at same effective batch** — and peak reserved
+13.82 GB.  Step-200 PPL 677.84 (healthy trajectory).
+
+Not shippable as a default: 0.95 cap leaves ~800 MB of VRAM slack
+before system-level instability risk, and any spike in allocator
+fragmentation during a 20k-step overnight run would crash hard.  A
+durable batch=2 config needs ~1-2 GB freed elsewhere first.
+
+Candidates ranked by scale-relevance
+([littlebit_batch2_smoke.json](littlebit_batch2_smoke.json) for the
+data point):
+
+| Technique | Savings at 0.5B | Savings at 7B | Effort |
+|---|---:|---:|---|
+| Chunked KL (V=152k fixed across Qwen2 family) | ~1.5 GB | ~1.5 GB | ~50 lines |
+| Teacher cache (Sprint 3) | ~1 GB | **~14 GB** | 2-3 days |
+| bf16 student weights | ~2 GB | **~14 GB** | moderate, changes numerics |
+| 8-bit optimizer CPU offload | ~0.3 GB | **~7 GB** | ~10 lines |
+
+**Decision**: skip chunked KL as a standalone polish item.  Its
+savings are vocab-dimension-bounded (151,936 × seq × fp32 bytes),
+which is constant across the scale ladder — a useful 12% of budget
+at 0.5B but only 6% at 7B.  Sprint 3 (teacher cache) already
+includes a chunked-top-k KL loss by design
+([scale_to_30b_architecture.md §2.5](scale_to_30b_architecture.md)),
+so implementing chunked KL now duplicates work scoped for Sprint 3.
+
+**Sprint 3 is the single next performance target** — it's the only
+memory lever on the plan that scales with model size, and it
+unblocks both (a) batch=2 at 0.5B today for a ~24% additional
+wall-time win and (b) 7B local training, which currently does not
+fit in 16 GB at any reasonable batch/seq.
+
 

@@ -5,3 +5,16 @@ numpy
 tqdm
 python-dotenv
 httpx
+
+# --- Windows-specific accelerator stack ---
+# Upstream `triton` has no Windows distribution.  The community
+# `triton-windows` port ships wheels including cp314 + Blackwell
+# (CUDA 12.8).  Installs as the `triton` import name, so downstream
+# libs (liger, torch.compile/inductor) find it transparently.
+triton-windows ; sys_platform == "win32"
+# Liger's setup.py pins `triton>=2.3` by package name, which blocks
+# the resolver from accepting triton-windows.  Install it with
+# --no-deps on Windows:
+#   pip install --no-deps liger-kernel
+# On Linux, the standard `pip install liger-kernel` works.
+liger-kernel ; sys_platform != "win32"

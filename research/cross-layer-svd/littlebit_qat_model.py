@@ -28,6 +28,31 @@ Usage:
 
 from __future__ import annotations
 
+# --- Windows / torch.compile bootstrap ---
+# torch.compile's inductor backend writes generated Python/Triton
+# source to its on-disk cache using the default Python text-mode
+# encoding, which on Windows is cp1252.  Inductor's emitted code
+# contains non-ASCII characters (e.g. Greek theta in RoPE kernel
+# comments) that cp1252 can't encode, so the first compiled
+# forward dies with a UnicodeEncodeError from codecache.write_atomic.
+# Python's UTF-8 mode (PEP 540) forces every `open(...)` to use
+# UTF-8, which fixes this at the source.  The flag must be set
+# before the interpreter starts, so we re-launch via a subprocess
+# on first entry when running on Windows without it already set.
+# Note: subprocess (not os.execv) because os.execv on Windows
+# routes through CreateProcess and silently drops empty-string
+# argv entries (like `--best-ckpt ""`), whereas subprocess quotes
+# them properly via list2cmdline.
+import os as _os
+import sys as _sys
+if _os.name == "nt" and _os.environ.get("PYTHONUTF8") != "1":
+    import subprocess as _subprocess
+    _env = dict(_os.environ)
+    _env["PYTHONUTF8"] = "1"
+    _sys.exit(_subprocess.run(
+        [_sys.executable] + _sys.argv, env=_env
+    ).returncode)
+
 import argparse
 import json
 import math
@@ -166,37 +191,76 @@ class HiddenCapture:
     checkpointing; hooks let us capture, use for MSE, then explicitly
     release, letting checkpointing drop the activations.
 
-    Order of entries in self.states matches layer order 0..N-1, which
-    is equivalent to output_hidden_states=True's hidden_states[1:]
-    (skipping the embedding-output tensor that would be at index 0).
+    Semantic equivalence with output_hidden_states=True:
+    HF's `Qwen2Model.forward` builds hidden_states as:
+        [ embed, post-layer-0, post-layer-1, ..., post-layer-(N-2),
+          post-final-norm(post-layer-(N-1)) ]
+    `hidden_states[1:]` drops the embedding, giving N tensors where
+    the last one is **post** the final RMSNorm.  A naive hook bank
+    on `model.layers` captures N decoder-layer outputs, but its last
+    entry is **pre** the final norm — different tensor, different
+    magnitude (measured 2.3x at Qwen2.5-0.5B), and with a rank-
+    compressed student the pre-norm MSE blows up and dominates the
+    24-term sum, steering all gradient toward fixing a representation
+    the final norm would have rescaled away.  Measured impact: ~2x
+    worse step-500 PPL vs output_hidden_states=True
+    ([JOURNAL.md](JOURNAL.md) 2026-04-22).
+
+    Fix: hook layers[0 .. N-2] and also hook model.norm, so the final
+    entry is post-final-norm — matching HF exactly.
     """
 
     def __init__(self):
         self.states: list[torch.Tensor] = []
 
-    def _hook(self, _module, _inputs, output):
+    def _layer_hook(self, _module, _inputs, output):
         # Decoder layers return a tuple (hidden_states, ...) or just a
         # tensor depending on HF version.
         h = output[0] if isinstance(output, tuple) else output
         self.states.append(h)
 
+    def _post_norm_hook(self, _module, _inputs, output):
+        # Final RMSNorm returns a tensor, not a tuple.
+        self.states.append(output)
+
     def clear(self) -> None:
         self.states.clear()
 
     def install(self, model: nn.Module) -> list:
-        """Register hooks on all decoder layers of an HF model."""
+        """Register hooks on layers[0..N-2] and on the final norm.
+
+        The first N-1 hooks capture post-layer outputs (pre-norm).
+        The final hook captures the post-final-norm tensor so
+        self.states aligns with output_hidden_states=True's
+        hidden_states[1:] byte-for-byte.
+        """
         layers = None
+        final_norm = None
         if hasattr(model, "model") and hasattr(model.model, "layers"):
             layers = model.model.layers
+            # Qwen2 / Llama-like: model.model.norm is the final RMSNorm.
+            final_norm = getattr(model.model, "norm", None)
         elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
             layers = model.transformer.h
+            # GPT-2 / Neo-style: model.transformer.ln_f is the final norm.
+            final_norm = getattr(model.transformer, "ln_f", None)
         else:
             raise RuntimeError(
                 "HiddenCapture: couldn't find decoder layers on "
                 "model; expected model.model.layers or "
                 "model.transformer.h"
             )
-        return [layer.register_forward_hook(self._hook) for layer in layers]
+        if final_norm is None:
+            raise RuntimeError(
+                "HiddenCapture: couldn't find final-norm module "
+                "(looked for model.model.norm / model.transformer.ln_f).  "
+                "Either add a case for your architecture or fall back "
+                "to --no-mse-via-hooks."
+            )
+        handles = [layer.register_forward_hook(self._layer_hook)
+                   for layer in layers[:-1]]
+        handles.append(final_norm.register_forward_hook(self._post_norm_hook))
+        return handles
 
 
 def wrap_model_littlebit_shapes(model: nn.Module, r: int,
@@ -274,6 +338,28 @@ def wikitext_ppl(model, tokenizer, split: str = "test",
     `seq_len` with full stride (non-overlapping). Compute mean NLL
     across non-padding positions, then exp() for PPL. Caps total
     tokens for speed during training-time eval.
+
+    Compile-safety: this function is called between training steps
+    on a torch.compile-wrapped student, so naive implementations
+    poison dynamo's compile cache and cost 2-3x per training step
+    for the rest of the run. Three specific guards:
+
+      1. Do NOT flip `model.training` (no `.eval()` / `.train()`).
+         Dynamo guards specialize on `self.training`, so every mode
+         flip invalidates the cached train-mode graph and forces a
+         recompile burst (measured 3.6x slowdown in isolation).
+         @torch.no_grad() already disables grad accumulation — the
+         only other thing `.eval()` changes is dropout, and Qwen2
+         runs attention_dropout=0.0 by default, so the mode flip is
+         functionally a no-op but carries the full guard cost.
+      2. Force eager mode for the eval forwards themselves via
+         `torch.compiler.set_stance("force_eager")`, so the train-
+         mode compiled graph is never evaluated with eval-shaped
+         inputs (which would create an additional specialization).
+      3. Drop any tail chunk whose shape doesn't match the stride
+         — different shapes spawn new dynamo guards.  Loses ~0.3%
+         of eval tokens at max_tokens=50k, seq_len=512, well within
+         stochastic variance.
     """
     from datasets import load_dataset
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
@@ -282,23 +368,23 @@ def wikitext_ppl(model, tokenizer, split: str = "test",
     if len(ids) > max_tokens:
         ids = ids[:max_tokens]
 
-    model.eval()
     nll_sum = 0.0
     count = 0
-    for i in range(0, len(ids) - 1, seq_len):
-        chunk = ids[i:i + seq_len].to(device).unsqueeze(0)
-        if chunk.shape[1] < 2:
-            break
-        logits = model(chunk).logits  # (1, T, V)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = chunk[:, 1:].contiguous()
-        loss = nn.functional.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            reduction="sum",
-        )
-        nll_sum += loss.item()
-        count += shift_labels.numel()
+    with torch.compiler.set_stance("force_eager"):
+        for i in range(0, len(ids) - 1, seq_len):
+            chunk = ids[i:i + seq_len].to(device).unsqueeze(0)
+            if chunk.shape[1] != seq_len:
+                break
+            logits = model(chunk, output_hidden_states=False).logits
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = chunk[:, 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="sum",
+            )
+            nll_sum += loss.item()
+            count += shift_labels.numel()
     return math.exp(nll_sum / max(1, count))
 
 
@@ -384,7 +470,11 @@ def main():
                         "= batch_size * grad_accum_steps.  Use this to "
                         "emulate paper's batch=4 on a tight memory budget.")
     p.add_argument("--seq-len", type=int, default=1024)
-    p.add_argument("--eval-every", type=int, default=500)
+    p.add_argument("--eval-every", type=int, default=2000,
+                   help="Run PPL eval every N opt-steps.  Default 2000 "
+                        "to minimise the ~5-7s/eval tax on long runs; "
+                        "drop to 500 for tighter early-convergence "
+                        "resolution during debugging.")
     p.add_argument("--eval-max-tokens", type=int, default=50_000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--warmup-steps", type=int, default=200)
@@ -458,22 +548,51 @@ def main():
     p.add_argument("--compile", action="store_true", default=True,
                    help="Enable torch.compile on the student model. "
                         "Potential 30-50%% per-step speedup via graph "
-                        "fusion.  Gracefully falls back to eager mode "
-                        "if compilation fails.  --no-compile to disable.")
+                        "fusion (measured ~2.1x on 0.5B forward on "
+                        "Blackwell).  Requires Triton; on Windows, "
+                        "install `triton-windows` (see requirements.txt). "
+                        "Gracefully falls back to eager mode if "
+                        "compilation fails.  --no-compile to disable.")
     p.add_argument("--no-compile", dest="compile", action="store_false")
+    p.add_argument("--compile-mode", default="default",
+                   choices=("default", "reduce-overhead",
+                            "max-autotune", "max-autotune-no-cudagraphs"),
+                   help="torch.compile optimisation mode.  `default` "
+                        "applies inductor kernel fusion without CUDA "
+                        "graphs — safe for training.  `reduce-overhead` "
+                        "adds CUDA graphs but reuses output buffers "
+                        "across replays, which is incompatible with "
+                        "training loops that thread activations into "
+                        "a later loss (raises 'accessing tensor output "
+                        "of CUDAGraphs that has been overwritten').  "
+                        "Only use it for pure inference.")
     p.add_argument("--liger", action="store_true", default=True,
                    help="Apply Liger Kernel fused RMSNorm + RoPE to the "
                         "student.  Excludes SwiGLU (our LittleBit wrap "
                         "replaces the Linears in the MLP) and fused "
                         "cross-entropy (we use soft-target KL, not CE). "
+                        "Requires Triton; on Windows install "
+                        "`triton-windows` and `pip install --no-deps "
+                        "liger-kernel` (see requirements.txt). "
                         "--no-liger to disable.")
     p.add_argument("--no-liger", dest="liger", action="store_false")
-    p.add_argument("--mse-via-hooks", action="store_true", default=True,
+    p.add_argument("--mse-via-hooks", action="store_true", default=False,
                    help="Capture hidden states for MSE loss via forward "
                         "hooks instead of output_hidden_states=True. "
-                        "Lets gradient checkpointing drop hidden states "
-                        "after MSE consumption.  Saves ~2 GB at 0.5B, "
-                        "more at scale.  --no-mse-via-hooks to disable.")
+                        "Correct but off by default: the 2026-04-22 "
+                        "benchmark on 0.5B showed zero measurable "
+                        "memory win vs output_hidden_states=True "
+                        "(10.17 GB peak both ways) and a ~3.5%% wall "
+                        "tax from hook side-effects (701 vs 677 s for "
+                        "1000 opt-steps).  The earlier 2x-PPL "
+                        "regression was a real bug — hooks captured "
+                        "pre-final-norm for the last layer instead of "
+                        "post-final-norm — and is now fixed, so "
+                        "--mse-via-hooks is safe if someone wants to "
+                        "re-benchmark it at 7B+ where activation "
+                        "footprint scales larger and the savings may "
+                        "actually materialize.  "
+                        "--no-mse-via-hooks is the shipping default.")
     p.add_argument("--no-mse-via-hooks", dest="mse_via_hooks",
                    action="store_false")
     p.add_argument("--tf32", action="store_true", default=True,
@@ -650,10 +769,19 @@ def main():
               f"({len(student.model.layers)} decoder layers)",
               flush=True)
 
-    # torch.compile: potential 30-50% per-step speedup via graph
-    # fusion.  PyTorch's inductor backend REQUIRES Triton, which has
-    # no Windows distribution.  Detect at startup so we don't fail
+    # torch.compile: inductor kernel fusion.  PyTorch's inductor
+    # backend requires Triton; on Windows install `triton-windows`
+    # (see requirements.txt).  Detect at startup so we don't fail
     # on the first forward pass mid-training.
+    #
+    # Mode choice: `default` (kernel fusion only) rather than
+    # `reduce-overhead` (fusion + CUDA graphs).  CUDA graphs reuse
+    # the same memory buffers across replays, so any tensor kept
+    # alive past the next compiled forward (e.g. for backward or
+    # for our hidden-state MSE) gets overwritten and raises
+    # `accessing tensor output of CUDAGraphs that has been
+    # overwritten`.  That's fatal for training loops that thread
+    # activations into a later loss; safe only for pure inference.
     if args.compile:
         try:
             import triton  # noqa: F401
@@ -662,17 +790,17 @@ def main():
             triton_available = False
 
         if not triton_available:
-            print("torch.compile: skipped (Triton not installed — "
-                  "no Windows wheels).  Set --no-compile to silence "
-                  "this message.",
+            print("torch.compile: skipped (triton not importable; "
+                  "on Windows install `triton-windows`).  "
+                  "--no-compile to silence this message.",
                   flush=True)
         else:
             try:
                 compile_t0 = time.time()
-                student = torch.compile(student, mode="reduce-overhead",
+                student = torch.compile(student, mode=args.compile_mode,
                                         fullgraph=False, dynamic=False)
                 print(f"torch.compile: wrapped student "
-                      f"(mode=reduce-overhead, "
+                      f"(mode={args.compile_mode}, "
                       f"graph_breaks_allowed=True) in "
                       f"{time.time() - compile_t0:.1f}s",
                       flush=True)
@@ -916,10 +1044,11 @@ def main():
         if step % args.log_every == 0:
             recent = float(np.mean(loss_recent[-args.log_every:]))
             print(f"  step {step:5d}  lr={lr_at(step-1):.2e}  "
-                  f"loss={recent:.4f}  elapsed={time.time()-t0:.0f}s")
+                  f"loss={recent:.4f}  elapsed={time.time()-t0:.0f}s",
+                  flush=True)
 
         if step % args.eval_every == 0 or step == args.steps:
-            print(f"  evaluating PPL at step {step}...")
+            print(f"  evaluating PPL at step {step}...", flush=True)
             te = time.time()
             ppl = wikitext_ppl(student, tokenizer,
                                 max_tokens=args.eval_max_tokens,
@@ -983,7 +1112,11 @@ def main():
                                 pass
                         break
 
-            student.train()
+            # Note: no student.train() — wikitext_ppl does not call
+            # .eval() anymore (see the compile-safety docstring there),
+            # so student.training stays True throughout training.  A
+            # .train() call here would trigger a dynamo cache evict on
+            # the next compiled forward.
 
         # Rolling periodic checkpoint (overwrite-in-place).  Fires
         # independently of eval, so pausing is possible between evals.

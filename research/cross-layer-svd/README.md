@@ -45,17 +45,31 @@ After those two, branch to whichever concern you're picking up.
 
 - Phase B training complete on Qwen 2.5 0.5B: **PPL 76.8 full-test,
   88.5% hidden-state capture, sentence-level loop generation**
-- Sprint 0 shipped (TF32, bf16 saves, forward hooks, compile
-  fallback, plateau early-stop)
+- **Sprint 0 fully shipped and validated** (2026-04-22 journal entry):
+  TF32 + Liger + torch.compile (via `triton-windows`) + bf16 saves +
+  plateau early-stop + UTF-8 bootstrap + eval mode-flip removed +
+  hook-MSE default-disabled.  Measured **63% wall-time reduction**
+  (9.3 h → 3.4 h extrapolated for 20k steps) and **33-37% better PPL
+  than Run 3** at matched budget.  See JOURNAL for four Windows bugs
+  uncovered and fixed.
 - Layer 1 deployment export shipped (292 MB, 7× compression)
-- **Next planned**: Sprint 2 — teacher cache infrastructure
+- **Next planned**: Sprint 3 — teacher cache infrastructure (now the
+  single remaining gate to local 7B training)
 
 ## Decisions locked in
 
 - **Goal**: standalone inference (not just speculation draft)
 - **No cloud**: fully local
 - **Windows-native CUDA**: raw `torch.utils.cpp_extension` for
-  kernel work (no Triton, no WSL2, no Warp)
+  our own kernel work; no WSL2, no Warp.  Triton was originally
+  on this exclusion list, but the community
+  [`triton-windows`](https://github.com/woct0rdho/triton-windows)
+  port now ships cp314 + Blackwell (CUDA 12.8) wheels and is
+  picked up transparently by the `triton` import.  That unblocks
+  Liger's fused kernels (RMSNorm/RoPE) and `torch.compile` on
+  Windows — measured ~2.1× forward speedup on Qwen2.5-0.5B at
+  seq=128 (2026-04-22).  See `requirements.txt` for the install
+  recipe.
 - **Scale ladder**: 0.5B (done) → 1.5B → 3B → 7B
 - **Method validated at 0.5B**; quality gap expected to close at 7B+
 
