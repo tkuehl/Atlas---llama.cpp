@@ -104,20 +104,37 @@ class LittleBitLinearHF(nn.Module):
     """Drop-in replacement for nn.Linear under the LittleBit factorization.
 
     Forward uses Prop. 1 efficient form (Eq. 5).  Parameters:
-      U_fp (d_out, r), V_fp (d_in, r) — soft factors, sign each step
-      h (d_out), g (d_in), ell (r)     — FP16 scale vectors
+      U_fp (d_out, r), V_fp (d_in, r) — sign-shadow matrices
+      h (d_out), g (d_in), ell (r)     — FP32 scale vectors
       bias (d_out)                     — if original Linear had one
+
+    Shadow dtype: U_fp / V_fp can be stored as bf16 instead of fp32
+    (see `shadow_dtype` arg).  These are the "shadow weights" that
+    drive SmoothSign's forward + backward — the actual ±1 signs are
+    recomputed from them every forward.  Halving their precision
+    halves the VRAM spent on sign matrices, their gradients, and
+    (as a follow-on) their optimizer state.  At 0.5B that's ~600 MB
+    saved; at 7B it's ~5.5 GB; at 30B it's ~24 GB — the savings
+    scale with model size, which makes this the cheapest memory
+    lever for going up the scale ladder.
+
+    Scale vectors (h, g, ell) and bias stay FP32: they're small
+    (O(d) each, not O(d·r)) so the memory saving wouldn't be
+    meaningful, and they enter the forward as multiplicative
+    scales where precision matters more than for the binary U/V.
     """
 
     def __init__(self, d_in: int, d_out: int, r: int, bias: bool,
-                 tau: float = 100.0):
+                 tau: float = 100.0,
+                 shadow_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.in_features = d_in
         self.out_features = d_out
         self.r = r
         self.tau = tau
-        self.U_fp = nn.Parameter(torch.empty(d_out, r))
-        self.V_fp = nn.Parameter(torch.empty(d_in, r))
+        self.shadow_dtype = shadow_dtype
+        self.U_fp = nn.Parameter(torch.empty(d_out, r, dtype=shadow_dtype))
+        self.V_fp = nn.Parameter(torch.empty(d_in, r, dtype=shadow_dtype))
         self.h = nn.Parameter(torch.empty(d_out))
         self.g = nn.Parameter(torch.empty(d_in))
         self.ell = nn.Parameter(torch.empty(r))
@@ -128,7 +145,9 @@ class LittleBitLinearHF(nn.Module):
 
     @classmethod
     def from_linear(cls, lin: nn.Linear, r: int,
-                    tau: float = 100.0) -> "LittleBitLinearHF":
+                    tau: float = 100.0,
+                    shadow_dtype: torch.dtype = torch.float32
+                    ) -> "LittleBitLinearHF":
         """Initialize via Dual-SVID from an FP linear."""
         W = lin.weight.data.detach().to(torch.float64).cpu().numpy()
         d_out, d_in = W.shape
@@ -157,10 +176,17 @@ class LittleBitLinearHF(nn.Module):
         ell0 = l_u0 * l_v0
 
         out = cls(d_in=d_in, d_out=d_out, r=r_eff,
-                  bias=lin.bias is not None, tau=tau)
+                  bias=lin.bias is not None, tau=tau,
+                  shadow_dtype=shadow_dtype)
         with torch.no_grad():
-            out.U_fp.copy_(torch.tensor(Up, dtype=torch.float32))
-            out.V_fp.copy_(torch.tensor(Vp, dtype=torch.float32))
+            # Dual-SVID is computed in fp64 for numerical stability,
+            # then cast to the shadow dtype.  Note that fp64 → bf16 is
+            # a large precision drop (56-bit → 7-bit mantissa) but the
+            # *signs* are what matter for the binary factorization;
+            # the exact magnitudes will be recovered by gradient
+            # descent within a few hundred steps.
+            out.U_fp.copy_(torch.tensor(Up, dtype=shadow_dtype))
+            out.V_fp.copy_(torch.tensor(Vp, dtype=shadow_dtype))
             out.h.copy_(torch.tensor(h0,   dtype=torch.float32))
             out.g.copy_(torch.tensor(g0,   dtype=torch.float32))
             out.ell.copy_(torch.tensor(ell0, dtype=torch.float32))
@@ -171,12 +197,18 @@ class LittleBitLinearHF(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Eq. 5 efficient form: Y = ((((X*g) @ V_sign) * ell) @ U_sign.T) * h
         # x: (..., d_in)
+        # SmoothSign output inherits the shadow dtype.  Cast the signs
+        # to the activation dtype (y picks that up from x * self.g,
+        # with g fp32 so y is fp32) — ±1 values are lossless across
+        # any float dtype, so this is free.  Keeps the matmul in the
+        # activation precision; the memory savings come entirely from
+        # storing U_fp / V_fp (and their grads / Adam state) in bf16.
         U_sign = smooth_sign(self.U_fp, self.tau)
         V_sign = smooth_sign(self.V_fp, self.tau)
         y = x * self.g
-        y = y @ V_sign
+        y = y @ V_sign.to(y.dtype)
         y = y * self.ell
-        y = y @ U_sign.T
+        y = y @ U_sign.to(y.dtype).T
         y = y * self.h
         if self.bias is not None:
             y = y + self.bias
@@ -265,7 +297,9 @@ class HiddenCapture:
 
 def wrap_model_littlebit_shapes(model: nn.Module, r: int,
                                 tau: float = 100.0,
-                                skip: tuple[str, ...] = ("lm_head",)) -> int:
+                                skip: tuple[str, ...] = ("lm_head",),
+                                shadow_dtype: torch.dtype = torch.float32
+                                ) -> int:
     """Replace nn.Linear with empty LittleBitLinearHF modules (no init).
 
     Used by the init-cache fast path: we need the module structure to
@@ -284,7 +318,8 @@ def wrap_model_littlebit_shapes(model: nn.Module, r: int,
             d_in = child.in_features
             r_eff = min(r, d_out, d_in)
             new = LittleBitLinearHF(d_in=d_in, d_out=d_out, r=r_eff,
-                                    bias=child.bias is not None, tau=tau)
+                                    bias=child.bias is not None, tau=tau,
+                                    shadow_dtype=shadow_dtype)
             setattr(module, child_name, new)
             count += 1
     return count
@@ -293,7 +328,8 @@ def wrap_model_littlebit_shapes(model: nn.Module, r: int,
 def wrap_model_littlebit(model: nn.Module, r: int,
                          tau: float = 100.0,
                          skip: tuple[str, ...] = ("lm_head",),
-                         log_every: int = 10) -> int:
+                         log_every: int = 10,
+                         shadow_dtype: torch.dtype = torch.float32) -> int:
     """Recursively replace nn.Linear with LittleBitLinearHF in-place.
 
     Returns the number of layers wrapped.
@@ -314,7 +350,8 @@ def wrap_model_littlebit(model: nn.Module, r: int,
     t0 = time.time()
     for i, (parent, child_name, full, child) in enumerate(targets, start=1):
         t_i = time.time()
-        new = LittleBitLinearHF.from_linear(child, r=r, tau=tau)
+        new = LittleBitLinearHF.from_linear(child, r=r, tau=tau,
+                                            shadow_dtype=shadow_dtype)
         setattr(parent, child_name, new)
         if i % log_every == 0 or i == len(targets):
             per = (time.time() - t0) / i
@@ -600,6 +637,21 @@ def main():
                         "~13%% matmul speedup.  --no-tf32 to disable "
                         "for ablation.")
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
+    p.add_argument("--shadow-dtype", default="fp32",
+                   choices=("fp32", "bf16"),
+                   help="Precision of the U_fp / V_fp shadow matrices "
+                        "inside each LittleBitLinear.  fp32 is the "
+                        "conservative default that matches the paper.  "
+                        "bf16 halves the shadow-weight memory + their "
+                        "gradient + 8-bit-Adam state — saves ~600 MB at "
+                        "0.5B, ~5.5 GB at 7B, ~24 GB at 30B — the one "
+                        "lever in our stack that scales proportionally "
+                        "with model size.  Numerical risk: SmoothSign's "
+                        "tanh(tau*x) surrogate is sharp near x=0; bf16's "
+                        "7-bit mantissa may alias nearby x values, "
+                        "though in practice the saturated region (|x| >> "
+                        "1/tau) is the dominant regime and is fine.  "
+                        "Scales h/g/ell/bias stay fp32 regardless.")
     p.add_argument("--teacher-cache", default=None,
                    help="Path to an offline teacher cache produced by "
                         "littlebit_teacher_extract.py.  When provided, "
@@ -701,6 +753,9 @@ def main():
     # Student: separate copy, then wrap, then move to device.
     # (Wrap creates new CPU tensors via np.linalg.svd; must .to(device)
     # the whole model after wrapping.)
+    _shadow_dtype = {
+        "fp32": torch.float32, "bf16": torch.bfloat16,
+    }[args.shadow_dtype]
     init_cache_path = Path(args.init_cache)
     print(f"loading student copy and wrapping at r={args.rank}...")
     t0 = time.time()
@@ -743,16 +798,26 @@ def main():
         # We still need to wrap to put LittleBitLinearHF modules in
         # place; then load their learned parameters from cache.
         wrapped = wrap_model_littlebit_shapes(student, r=args.rank,
-                                              tau=args.tau)
+                                              tau=args.tau,
+                                              shadow_dtype=_shadow_dtype)
         state = torch.load(init_cache_path, map_location="cpu",
                            weights_only=True)
+        # The cached init may be fp32 even when we're training with
+        # bf16 shadows.  Cast U_fp / V_fp tensors to the target dtype
+        # at load time — scales stay fp32 regardless.
+        if _shadow_dtype is not torch.float32:
+            for name, tensor in list(state.items()):
+                if name.endswith(".U_fp") or name.endswith(".V_fp"):
+                    state[name] = tensor.to(_shadow_dtype)
         student.load_state_dict(state)
         print(f"  loaded cached init in {time.time() - t0:.1f}s "
-              f"({wrapped} layers)", flush=True)
+              f"({wrapped} layers; shadow_dtype={args.shadow_dtype})",
+              flush=True)
     else:
-        wrapped = wrap_model_littlebit(student, r=args.rank, tau=args.tau)
+        wrapped = wrap_model_littlebit(student, r=args.rank, tau=args.tau,
+                                       shadow_dtype=_shadow_dtype)
         print(f"  wrapped {wrapped} Linear layers  "
-              f"({time.time() - t0:.1f}s)")
+              f"({time.time() - t0:.1f}s; shadow_dtype={args.shadow_dtype})")
         # Cache for future runs.  Save on CPU so the file is portable.
         try:
             torch.save(student.state_dict(), init_cache_path)

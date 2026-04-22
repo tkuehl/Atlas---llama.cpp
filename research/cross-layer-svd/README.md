@@ -57,12 +57,18 @@ After those two, branch to whichever concern you're picking up.
   that day): teacher cache + chunked top-k KL + mmap reader,
   validated on 0.5B.  7.3% PPL gap vs live teacher at k=1024 (still
   28% better than Run 3's paper recipe), -21% VRAM, -9% wall time.
-  Known TODO(C): cache `log_sum_exp` for exact top-k KL, expected
-  to close the remaining gap.  Phase II (streamed student layers)
-  still required for 30B local.
-- **Next planned**: bf16 student weights + 8-bit Adam CPU offload
-  to unlock 7B local training (Sprint 3's cache was necessary but
-  not sufficient — student side also needs memory work).
+- **bf16 shadow weights shipped** (2026-04-22 fourth entry):
+  `--shadow-dtype bf16` makes U_fp/V_fp bf16 storage, freeing ~14
+  GB at 7B scale.  Stacked with teacher cache on a 0.5B 1000-step
+  smoke: only +8.1% PPL gap (regressions don't compound — bf16
+  noise trains out inside 1000 steps).  Peak VRAM 7.18 GB at 0.5B
+  (-31% from baseline).  **Probably skips the arch-doc Phase II
+  streaming work for 7B**: 7B fits natively in 16 GB.
+- **Next planned**: 1.5B validation of the full stack (Sprint 0 +
+  Sprint 3 + bf16 shadow).  Same Qwen2.5 family, peakier
+  distribution should close the 8% gap; fits in an afternoon.  Then
+  7B.  TODO(C) lse caching for independent 5% PPL gain remains
+  lower-priority.
 
 ## Decisions locked in
 

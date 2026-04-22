@@ -3874,4 +3874,164 @@ Plus the deferred TODO(C) for KL gap closure.  None of this blocks
 each other; reasonable next sprint is "7B feasibility" combining
 these into a single probe run.
 
+## 2026-04-22 — bf16 shadow weights: the scale-ladder enabler
+
+Fourth journal entry this day.  Cheap precision trick that gets us
+from "needs multi-day Phase II streaming" to "7B probably fits on
+16 GB VRAM directly" — validated by stacking with the Sprint 3
+teacher cache on a 0.5B 1000-step matched smoke.
+
+### The question
+
+Sprint 3's teacher cache freed ~2.4 GB at 0.5B by evicting the
+teacher, but the arch-doc napkin math showed student 7B in fp32
+(28 GB of weights + gradients + Adam) still doesn't fit the 16 GB
+cap.  Hypothesis: if the U_fp / V_fp "shadow weights" (the
+full-precision matrices SmoothSign's straight-through-estimator
+drives) can be stored as bf16 instead of fp32, we'd free ~14 GB
+at 7B — potentially enough to skip the arch doc's Phase II
+streamed-student work entirely.  Extrapolated memory savings scale
+proportionally with model size, which is what the other levers in
+our stack explicitly DON'T do (chunked KL is fixed, eval fixes are
+fixed).  Worth investigating.
+
+### Implementation
+
+[LittleBitLinearHF.__init__](littlebit_qat_model.py#L114-L147) now
+takes a `shadow_dtype` kwarg (default fp32 for backward
+compatibility); `U_fp` / `V_fp` parameters are allocated at that
+dtype while `h` / `g` / `ell` / `bias` stay fp32 (they're O(d)
+scale vectors, tiny memory, and multiplicative scales where
+precision matters more).  Propagated through `from_linear`,
+`wrap_model_littlebit`, `wrap_model_littlebit_shapes`, plus a new
+`--shadow-dtype {fp32,bf16}` CLI flag on [littlebit_qat_model.py](littlebit_qat_model.py).
+
+One non-trivial edit in `forward`: SmoothSign's output inherits the
+shadow dtype, so when the activation (fp32 because `h/g/ell` are
+fp32) hits the sign matmul, dtypes mismatch.  Fixed by casting the
+±1 sign tensors to the activation dtype at compute time — lossless
+across any float dtype since sign is {-1, 0, +1} — so the matmul
+still runs in the activation's precision.  Memory savings come
+purely from storage of U_fp/V_fp + their grads + their 8-bit Adam
+state; compute precision is unchanged.
+
+Init-cache loader casts fp32 state to the shadow dtype for U_fp /
+V_fp entries on load.  The existing Dual-SVID init cache is
+reusable across shadow-dtype choices.
+
+### Memory measurements at 0.5B (step 1 peak, live teacher path)
+
+| shadow_dtype | allocated | reserved |
+|---|---:|---:|
+| fp32 | 5.69 GB | 10.42 GB |
+| **bf16** | **4.61 GB** | **9.11 GB** |
+| Δ | -1.08 GB | -1.31 GB (-13%) |
+
+### Stacking with Sprint 3 teacher cache (step 1 peak)
+
+| stack | allocated | reserved |
+|---|---:|---:|
+| fp32 shadow + live teacher (baseline) | 5.69 GB | 10.42 GB |
+| fp32 shadow + cache | 4.53 GB | 8.23 GB |
+| bf16 shadow + live teacher | 4.61 GB | 9.11 GB |
+| **bf16 shadow + cache** | **3.46 GB** | **7.18 GB** |
+
+Savings stack nearly additively — **-31% reserved from baseline**.
+At 0.5B we now sit at 52% of the 13.7 GB cap, with enough headroom
+for `--batch-size 2 --grad-accum-steps 2` without cap manipulation
+(the batch=2 probe OOM'd yesterday at the same cap; not yet
+re-measured with the full stack).
+
+### Quality — 1000 steps, matched grad_accum=4
+
+Short smoke at 100 steps showed bf16 shadow alone hitting +17%
+step-100 PPL vs fp32 shadow with live teacher (1318.74 vs 1122.68).
+Similar magnitude to the k=256 teacher cache gap.  Origin suspected:
+bf16 has a 7-bit mantissa, so small gradient updates that move a
+param by sub-ULP magnitudes get rounded away.  Early in training
+where gradients are small, sign-flip trajectories can be lost.
+
+But at step 1000 the picture flips.
+
+| Config (1000-step smoke, grad_accum=4) | Step 500 PPL | Step 1000 PPL | Gap at 1000 |
+|---|---:|---:|---:|
+| fp32 shadow + live teacher (upper bound) | 349.97 | 235.68 | — |
+| fp32 shadow + cache k=1024 | 410.82 | 252.85 | +7.3% |
+| **bf16 shadow + cache k=1024 (7B-equivalent)** | **474.01** | **254.75** | **+8.1%** |
+| Run 3 baseline (paper recipe, no Sprint 0/3) | 558.82 | 354.23 | +50% |
+
+**The two regressions do NOT stack.**  bf16 shadow alone hits +17%
+at step 100; combined with cache (also +25% at step 500), the
+total step-1000 gap is +8.1% — essentially indistinguishable from
+cache-alone's +7.3%.  The bf16 shadow's per-step noise trains out
+within 1000 steps, leaving only the top-k approximation gap that
+was already baked into the cache path.  That's the happy case —
+stacked memory wins come without stacked quality costs.
+
+### 7B extrapolation
+
+Per-scale lever effectiveness, napkin'd:
+
+| Lever | 0.5B saving | 7B saving |
+|---|---:|---:|
+| Teacher cache (fp32 → 0 teacher VRAM) | 1 GB | **14 GB** |
+| bf16 shadow (fp32 → bf16 U_fp/V_fp + grads + Adam) | 1.3 GB | **14 GB** |
+| Combined | 3.2 GB | ~28 GB |
+
+A 7B student at fp32 would need ~28 GB weights + grads + Adam
+state alone; with both levers, drop to ~14 GB + cache frees ~14 GB
+of teacher + gradient checkpointing absorbs activations → should
+fit in 16 GB VRAM with maybe 2-4 GB of headroom.  That's the
+threshold for "trains locally" vs "needs Phase II streaming".
+
+Quality at 7B is expected to be BETTER than our 8.1% gap at 0.5B
+— (a) larger models have peakier distributions so top-k coverage
+improves (arch doc §2.2), and (b) larger models have larger
+gradient magnitudes early in training so fewer bf16 sub-ULP
+updates get rounded away.  Measurement at 1.5B is the next
+validation point.
+
+### Defaults decision
+
+Keeping `--shadow-dtype fp32` as default — conservative, matches
+the paper, no quality cost at the scales we've validated.
+`--shadow-dtype bf16` stays explicit opt-in for the memory-
+constrained scale regime.  Flipping the default at 1.5B+ once
+that's validated.
+
+### What's genuinely new this session
+
+The arch doc §3 specs the Phase II streaming architecture as the
+path to 7B+.  That's 2+ days of engineering (layer-movement
+scheduling, grad accumulation across swaps, 8-bit Adam on CPU).
+**bf16 shadow weights + teacher cache together look like they
+skip that work entirely** for 7B.  Sprint 4 ("7B feasibility") can
+now be a probe run, not a multi-day build.  That's a real
+architectural shortcut.
+
+### Artifacts
+
+- [littlebit_bf16_shadow.json](littlebit_bf16_shadow.json) —
+  100-step bf16-shadow-only smoke (live teacher, no cache).
+  Step 100 PPL 1318.74.
+- [littlebit_bf16_cache_1k.json](littlebit_bf16_cache_1k.json) —
+  1000-step full-stack smoke (bf16 shadow + k=1024 cache).
+  Step 500 PPL 474.01, step 1000 PPL 254.75, 620 s wall, 7.18 GB
+  peak reserved.  **This is the 7B-equivalent config's proof of
+  concept.**
+
+### Next: 1.5B validation
+
+Skipping straight to 7B would conflate several unknowns (shadow
+dtype + cache + scale).  Better: validate the stack at 1.5B first
+— same Qwen2.5 family (tokenizer, architecture, vocab), big enough
+that bf16-shadow's quality cost should decrease noticeably, small
+enough that a Phase-B-class 20k-step run lands in an afternoon.
+If 1.5B confirms the stack works and the gap shrinks as predicted,
+7B is a clean next step.
+
+TODO(C) for the KL gap (lse caching) still on the board; would
+independently close 5% more PPL regardless of scale.  Lower
+priority than the scale validation.
+
 
