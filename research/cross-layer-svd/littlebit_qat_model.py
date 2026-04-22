@@ -476,6 +476,11 @@ def main():
                         "more at scale.  --no-mse-via-hooks to disable.")
     p.add_argument("--no-mse-via-hooks", dest="mse_via_hooks",
                    action="store_false")
+    p.add_argument("--tf32", action="store_true", default=True,
+                   help="Enable TF32 on matmul + cuDNN (Ampere+ / Blackwell). "
+                        "~13%% matmul speedup.  --no-tf32 to disable "
+                        "for ablation.")
+    p.add_argument("--no-tf32", dest="tf32", action="store_false")
     p.add_argument("--delete-init-cache-after-start", action="store_true",
                    default=False,
                    help="Delete the init-cache file once training's first "
@@ -490,12 +495,19 @@ def main():
     # Free wall-time knobs (Sprint 0 Tier A).  TF32 on Ampere+ gives
     # ~13% matmul speedup for fp32 with essentially no quality cost.
     # cudnn.benchmark autotunes conv kernel selection for fixed shapes.
-    if device.type == "cuda":
+    if device.type == "cuda" and args.tf32:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         print("tf32: on (matmul), cudnn.benchmark: on", flush=True)
+    elif device.type == "cuda":
+        # Explicit disable — force fp32 matmul to measure TF32 contribution
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        print("tf32: OFF (ablation)", flush=True)
 
     # Cap GPU memory so allocations past the cap OOM cleanly rather
     # than taking the whole system down with a driver hang.
