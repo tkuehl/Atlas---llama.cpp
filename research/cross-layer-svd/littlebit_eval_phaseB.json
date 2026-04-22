@@ -1,0 +1,177 @@
+{
+  "checkpoint": "littlebit_qat_checkpoint_r512_phaseB.pt",
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "rank": 512,
+    "tau": 100.0,
+    "steps": 20000,
+    "seq_len": 512,
+    "wrapped_layers": 168
+  },
+  "training_summary": {
+    "teacher_ppl": 16.392793375785796,
+    "init_ppl": 391596.3963838121,
+    "final_ppl": 54.92895907723544,
+    "best_ppl": 54.92895907723544,
+    "best_step": 20000
+  },
+  "wikitext2_full": {
+    "teacher_ppl": 17.299124320438946,
+    "student_ppl": 76.81312819370046,
+    "seq_len": 512,
+    "max_tokens": 250000
+  },
+  "activation_drift": {
+    "per_layer": [
+      {
+        "layer": 0,
+        "rel_err": 0.7930545210838318,
+        "captured": 0.3710645265884942
+      },
+      {
+        "layer": 1,
+        "rel_err": 0.673987865447998,
+        "captured": 0.5457403572288513
+      },
+      {
+        "layer": 2,
+        "rel_err": 0.1878070831298828,
+        "captured": 0.9647284995262453
+      },
+      {
+        "layer": 3,
+        "rel_err": 0.10037543624639511,
+        "captured": 0.9899247717983459
+      },
+      {
+        "layer": 4,
+        "rel_err": 0.10846918076276779,
+        "captured": 0.9882344368246541
+      },
+      {
+        "layer": 5,
+        "rel_err": 0.11000975966453552,
+        "captured": 0.9878978527785511
+      },
+      {
+        "layer": 6,
+        "rel_err": 0.11387073248624802,
+        "captured": 0.9870334562830454
+      },
+      {
+        "layer": 7,
+        "rel_err": 0.11574158072471619,
+        "captured": 0.986603886491344
+      },
+      {
+        "layer": 8,
+        "rel_err": 0.11907165497541428,
+        "captured": 0.985821940981416
+      },
+      {
+        "layer": 9,
+        "rel_err": 0.11931511759757996,
+        "captured": 0.9857639027126757
+      },
+      {
+        "layer": 10,
+        "rel_err": 0.12273188680410385,
+        "captured": 0.9849368839615047
+      },
+      {
+        "layer": 11,
+        "rel_err": 0.12247907370328903,
+        "captured": 0.9849988765047843
+      },
+      {
+        "layer": 12,
+        "rel_err": 0.12500809133052826,
+        "captured": 0.9843729771018983
+      },
+      {
+        "layer": 13,
+        "rel_err": 0.12894411385059357,
+        "captured": 0.9833734155032852
+      },
+      {
+        "layer": 14,
+        "rel_err": 0.13778027892112732,
+        "captured": 0.9810165947404164
+      },
+      {
+        "layer": 15,
+        "rel_err": 0.14813554286956787,
+        "captured": 0.9780558609387384
+      },
+      {
+        "layer": 16,
+        "rel_err": 0.17482112348079681,
+        "captured": 0.969437574784912
+      },
+      {
+        "layer": 17,
+        "rel_err": 0.19223763048648834,
+        "captured": 0.9630446934249404
+      },
+      {
+        "layer": 18,
+        "rel_err": 0.2134920209646225,
+        "captured": 0.9544211569844412
+      },
+      {
+        "layer": 19,
+        "rel_err": 0.24163368344306946,
+        "captured": 0.9416131630257345
+      },
+      {
+        "layer": 20,
+        "rel_err": 0.2782464027404785,
+        "captured": 0.9225789393619834
+      },
+      {
+        "layer": 21,
+        "rel_err": 0.42455920577049255,
+        "captured": 0.8197494807955286
+      },
+      {
+        "layer": 22,
+        "rel_err": 0.4378848969936371,
+        "captured": 0.8082568169848718
+      },
+      {
+        "layer": 23,
+        "rel_err": 0.908424973487854,
+        "captured": 0.17476406754359175
+      }
+    ],
+    "mean_rel_err": 0.2540867440402508,
+    "mean_captured": 0.8851430888695938
+  },
+  "generation_samples": [
+    {
+      "prompt": "The capital of France is",
+      "student": " the capital of France. France is the capital of France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France, France,",
+      "teacher": " Paris. It is the largest city in Europe and the second largest in the world. It is also the capital of France, the second largest country in Europe, and the third largest country in the world. It is the seat of the French government, the French parliament, and the French Supreme Court."
+    },
+    {
+      "prompt": "To compress neural network weights to sub-1 bit per weight,",
+      "student": " and the number of weights in the 1000s is 1.5% in the 1990s. The number of weights in the 1980s has increased significantly. The number of weights in the 1980s has increased significantly.",
+      "teacher": " the network should be trained on a dataset with a resolution of 1024x1024 pixels. The network is trained on a dataset with a resolution of 1024x1024 pixels, and the weights are compressed to sub-1 bit per weight."
+    },
+    {
+      "prompt": "Once upon a time,",
+      "student": " the first time I had to go to the house, I had to go to the house, and I was in the house. I was not in the house, but I was in the house. I was in the house, I was sitting in the house, I was sitting in the house,",
+      "teacher": " there was a little girl named Lily. She loved to play with her toys. One day, she found a box of colorful blocks. She wanted to build a tower with her blocks. She started with a single block and added more blocks to make bigger towers. \n\nLily noticed that when she added"
+    },
+    {
+      "prompt": "def fibonacci(n):\n    if n <= 1:\n        return n\n    ",
+      "student": " 0.00\n> n. 0.00\n(3) 0.00:00:00\n(3) 0.00:00:00:00:00:00\n(3) 0.",
+      "teacher": " else:\n        return fibonacci(n-1) + fibonacci(n-2)\nn = int(input(\"Enter the number of terms: \"))\nprint(fibonacci(n))"
+    },
+    {
+      "prompt": "Q: What's 7 times 8?\nA:",
+      "student": " The first time I was in the 1990s, I was a young girl. I was a young girl, and I was a girl. I was a girl, I was a girl. I was a girl, I was a girl. I was a girl, I was a",
+      "teacher": " 56"
+    }
+  ]
+}
