@@ -639,21 +639,34 @@ def main():
               flush=True)
 
     # torch.compile: potential 30-50% per-step speedup via graph
-    # fusion.  Our SmoothSignEfficient custom autograd might cause
-    # graph breaks; reduce-overhead mode is tolerant of these.
-    # Wrap in try/except so startup doesn't fail if compile errors.
+    # fusion.  PyTorch's inductor backend REQUIRES Triton, which has
+    # no Windows distribution.  Detect at startup so we don't fail
+    # on the first forward pass mid-training.
     if args.compile:
         try:
-            compile_t0 = time.time()
-            student = torch.compile(student, mode="reduce-overhead",
-                                    fullgraph=False, dynamic=False)
-            print(f"torch.compile: wrapped student "
-                  f"(mode=reduce-overhead, "
-                  f"graph_breaks_allowed=True) in "
-                  f"{time.time() - compile_t0:.1f}s",
+            import triton  # noqa: F401
+            triton_available = True
+        except ImportError:
+            triton_available = False
+
+        if not triton_available:
+            print("torch.compile: skipped (Triton not installed — "
+                  "no Windows wheels).  Set --no-compile to silence "
+                  "this message.",
                   flush=True)
-        except Exception as e:
-            print(f"torch.compile failed ({e}); running eager", flush=True)
+        else:
+            try:
+                compile_t0 = time.time()
+                student = torch.compile(student, mode="reduce-overhead",
+                                        fullgraph=False, dynamic=False)
+                print(f"torch.compile: wrapped student "
+                      f"(mode=reduce-overhead, "
+                      f"graph_breaks_allowed=True) in "
+                      f"{time.time() - compile_t0:.1f}s",
+                      flush=True)
+            except Exception as e:
+                print(f"torch.compile failed ({e}); running eager",
+                      flush=True)
 
     # Initial (post-init, pre-QAT) PPL
     print("evaluating student PPL post-init (pre-QAT)...")
