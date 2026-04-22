@@ -158,6 +158,47 @@ class LittleBitLinearHF(nn.Module):
         return y
 
 
+class HiddenCapture:
+    """Per-layer hidden-state collector via forward hooks.
+
+    Replaces output_hidden_states=True.  HF's list-based return
+    retains references across backward and partially defeats gradient
+    checkpointing; hooks let us capture, use for MSE, then explicitly
+    release, letting checkpointing drop the activations.
+
+    Order of entries in self.states matches layer order 0..N-1, which
+    is equivalent to output_hidden_states=True's hidden_states[1:]
+    (skipping the embedding-output tensor that would be at index 0).
+    """
+
+    def __init__(self):
+        self.states: list[torch.Tensor] = []
+
+    def _hook(self, _module, _inputs, output):
+        # Decoder layers return a tuple (hidden_states, ...) or just a
+        # tensor depending on HF version.
+        h = output[0] if isinstance(output, tuple) else output
+        self.states.append(h)
+
+    def clear(self) -> None:
+        self.states.clear()
+
+    def install(self, model: nn.Module) -> list:
+        """Register hooks on all decoder layers of an HF model."""
+        layers = None
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = model.model.layers
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            layers = model.transformer.h
+        else:
+            raise RuntimeError(
+                "HiddenCapture: couldn't find decoder layers on "
+                "model; expected model.model.layers or "
+                "model.transformer.h"
+            )
+        return [layer.register_forward_hook(self._hook) for layer in layers]
+
+
 def wrap_model_littlebit_shapes(model: nn.Module, r: int,
                                 tau: float = 100.0,
                                 skip: tuple[str, ...] = ("lm_head",)) -> int:
@@ -414,6 +455,27 @@ def main():
                    help="Precision for saved checkpoints.  bf16 halves "
                         "file size with no measurable quality loss on "
                         "round-trip (load auto-casts to fp32 for training).")
+    p.add_argument("--compile", action="store_true", default=True,
+                   help="Enable torch.compile on the student model. "
+                        "Potential 30-50%% per-step speedup via graph "
+                        "fusion.  Gracefully falls back to eager mode "
+                        "if compilation fails.  --no-compile to disable.")
+    p.add_argument("--no-compile", dest="compile", action="store_false")
+    p.add_argument("--liger", action="store_true", default=True,
+                   help="Apply Liger Kernel fused RMSNorm + RoPE to the "
+                        "student.  Excludes SwiGLU (our LittleBit wrap "
+                        "replaces the Linears in the MLP) and fused "
+                        "cross-entropy (we use soft-target KL, not CE). "
+                        "--no-liger to disable.")
+    p.add_argument("--no-liger", dest="liger", action="store_false")
+    p.add_argument("--mse-via-hooks", action="store_true", default=True,
+                   help="Capture hidden states for MSE loss via forward "
+                        "hooks instead of output_hidden_states=True. "
+                        "Lets gradient checkpointing drop hidden states "
+                        "after MSE consumption.  Saves ~2 GB at 0.5B, "
+                        "more at scale.  --no-mse-via-hooks to disable.")
+    p.add_argument("--no-mse-via-hooks", dest="mse_via_hooks",
+                   action="store_false")
     p.add_argument("--delete-init-cache-after-start", action="store_true",
                    default=False,
                    help="Delete the init-cache file once training's first "
@@ -483,6 +545,34 @@ def main():
     student = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.float32,
     )
+
+    # Liger fused kernels BEFORE LittleBit wrap.  Liger patches
+    # RMSNorm / RoPE at the class-instance level; our LittleBit
+    # wrap then replaces specific nn.Linear instances.  Order
+    # matters: if we wrap first, some Liger patches may fail to
+    # detect their target modules.  Skip SwiGLU (our LittleBit
+    # Linears live inside the MLP) and cross-entropy (our loss is
+    # soft-target KL, not standard CE).
+    if args.liger:
+        try:
+            from liger_kernel.transformers import apply_liger_kernel_to_qwen2
+            apply_liger_kernel_to_qwen2(
+                rope=True,
+                rms_norm=True,
+                swiglu=False,          # MLP contains our wrapped Linears
+                cross_entropy=False,   # we use KL
+                fused_linear_cross_entropy=False,
+                model=student,
+            )
+            print("liger kernels: rope + rms_norm applied to student",
+                  flush=True)
+        except ImportError:
+            print("liger not installed; continuing with PyTorch native",
+                  flush=True)
+        except Exception as e:
+            print(f"liger apply failed ({e}); continuing without",
+                  flush=True)
+
     if init_cache_path.exists():
         # Fast path: skip Dual-SVID SVDs, load cached init instead.
         print(f"  init-cache hit: {init_cache_path} "
@@ -532,6 +622,38 @@ def main():
                            if p.requires_grad)
     print(f"  student trainable params: {trainable_params:,}")
     _gpu_mem("after student")
+
+    # Hidden-state capture hooks for MSE (installed BEFORE compile
+    # so they persist through module wrapping).  Only register when
+    # both MSE is active and --mse-via-hooks is enabled.
+    student_hidden = None
+    teacher_hidden = None
+    use_hook_mse = bool(args.inter_mse_weight) and args.mse_via_hooks
+    if use_hook_mse:
+        student_hidden = HiddenCapture()
+        teacher_hidden = HiddenCapture()
+        student_hidden.install(student)
+        teacher_hidden.install(teacher)
+        print(f"hidden-state capture: hook-based "
+              f"({len(student.model.layers)} decoder layers)",
+              flush=True)
+
+    # torch.compile: potential 30-50% per-step speedup via graph
+    # fusion.  Our SmoothSignEfficient custom autograd might cause
+    # graph breaks; reduce-overhead mode is tolerant of these.
+    # Wrap in try/except so startup doesn't fail if compile errors.
+    if args.compile:
+        try:
+            compile_t0 = time.time()
+            student = torch.compile(student, mode="reduce-overhead",
+                                    fullgraph=False, dynamic=False)
+            print(f"torch.compile: wrapped student "
+                  f"(mode=reduce-overhead, "
+                  f"graph_breaks_allowed=True) in "
+                  f"{time.time() - compile_t0:.1f}s",
+                  flush=True)
+        except Exception as e:
+            print(f"torch.compile failed ({e}); running eager", flush=True)
 
     # Initial (post-init, pre-QAT) PPL
     print("evaluating student PPL post-init (pre-QAT)...")
@@ -690,14 +812,21 @@ def main():
         step_loss = 0.0
         for micro in range(accum):
             batch = next(it).to(device)
+            # Clear hook captures from previous micro-step.
+            if use_hook_mse:
+                student_hidden.clear()
+                teacher_hidden.clear()
+            # When hooks are active, output_hidden_states is False
+            # to avoid doubling work.
+            want_hidden = bool(args.inter_mse_weight) and not use_hook_mse
             # Teacher forward (no grad, bf16 logits/hidden)
             with torch.no_grad():
-                t_out = teacher(batch, output_hidden_states=bool(args.inter_mse_weight))
+                t_out = teacher(batch, output_hidden_states=want_hidden)
                 t_logits = t_out.logits
-                t_hidden = t_out.hidden_states if args.inter_mse_weight else None
+                t_hidden = t_out.hidden_states if want_hidden else None
 
             # Student forward
-            s_out = student(batch, output_hidden_states=bool(args.inter_mse_weight))
+            s_out = student(batch, output_hidden_states=want_hidden)
             s_logits = s_out.logits
 
             log_p_s = torch.nn.functional.log_softmax(s_logits, dim=-1)
@@ -711,14 +840,25 @@ def main():
             loss = l_kl
 
             if args.inter_mse_weight:
-                s_hidden = s_out.hidden_states[1:]
-                t_hidden_list = t_hidden[1:]
+                if use_hook_mse:
+                    # Hook-captured states: aligned with
+                    # output_hidden_states[1:], one per decoder layer.
+                    s_hidden = student_hidden.states
+                    t_hidden_list = teacher_hidden.states
+                else:
+                    s_hidden = s_out.hidden_states[1:]
+                    t_hidden_list = t_hidden[1:]
                 l_inter = 0.0
                 for sh, th in zip(s_hidden, t_hidden_list):
                     l_inter = l_inter + torch.nn.functional.mse_loss(
                         sh, th.to(sh.dtype)
                     )
                 loss = loss + args.inter_mse_weight * l_inter
+                # Release hook references so gradient checkpointing
+                # can actually drop these activations during backward.
+                if use_hook_mse:
+                    student_hidden.clear()
+                    teacher_hidden.clear()
 
             # Average micro-step losses so the effective gradient
             # matches a single batch=effective_batch forward.
