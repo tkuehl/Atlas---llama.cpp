@@ -3168,5 +3168,83 @@ is the right next major milestone.  Local memory optimizations
 Wall clock: 9h 20min for one 20k-step run.  Future runs with
 Sprint 1-2 stack projected at ~3-4h for same 20k steps.
 
+## 2026-04-22 — Cloud compute ruled out; roadmap reframed to local-only
+
+**Decision:** This project will not use rented cloud GPUs. Not for
+student training, not for teacher extraction, not for "one-shot
+validation." All compute runs on local consumer hardware.
+
+This supersedes the 2026-04-21 Phase B entry above, which
+recommended a cloud-rented 7B run (~$25, ~8h on A100) as the next
+major milestone. That recommendation is withdrawn. Prior journal
+entries are preserved as historical record — they reflect the
+plan as it stood before this decision.
+
+**What changes in the plans:**
+
+- [`littlebit_cloud_30b.md`](littlebit_cloud_30b.md) — **deleted**.
+  It was entirely a cost / scenario comparison across Vast.ai /
+  RunPod / Lambda and a recommendation to spend $150-310 on a 30B
+  run. Obsolete in full. Any still-useful engineering pieces
+  (checkpoint-resume, DeepSpeed ZeRO-Infinity references) are
+  already captured in
+  [`scale_to_30b_architecture.md §11.8`](scale_to_30b_architecture.md).
+- [`consolidated_implementation_roadmap.md`](consolidated_implementation_roadmap.md)
+  — Sprint 6 "30B teacher extraction (cloud, ~$8)" rewritten to
+  local streamed extraction; risk row "Cloud $180 fallback"
+  replaced with "defer 30B until hardware supports it."
+- [`scale_to_30b_architecture.md`](scale_to_30b_architecture.md)
+  — §2.4 table rewritten (no cloud row); §3.4, §6, §8, §9, §10,
+  §11.9 all scrubbed of cloud alternatives and cost comparisons.
+- [`savings_exploration_plan.md`](savings_exploration_plan.md) —
+  decision-tree branches that routed to a "$25 cloud 7B run"
+  rewritten to "7B local after Sprint 3 teacher cache"; exit
+  criterion (b) rewritten to defer 7B rather than cloud-fallback.
+- [`memory_efficient_training_research.md`](memory_efficient_training_research.md)
+  — §11 Path B reframed: full memory stack + Sprint 3 teacher
+  cache → 7B local on 16 GB laptop (no cloud).
+- [`wall_time_reduction_plan.md`](wall_time_reduction_plan.md) —
+  §7 "For cloud runs" subsection deleted entirely.
+
+**What the new critical path looks like:**
+
+1. Sprint 1-2 (wall-time stack) — still on, as planned.
+2. Sprint 3 (teacher cache) — now the **gate to 7B**, not a nice
+   optimization. 7B cannot start locally until teacher is out of
+   VRAM.
+3. Sprint 5 at 7B — local, overnight-feasible run once teacher
+   cache lands. Replaces the prior "cloud 7B" validation milestone.
+4. Sprint 6 30B — multi-day local run via the NVMe-tier + streamed
+   architecture. Gated on Sprint 5 result + hardware (RAM, NVMe)
+   being sufficient.
+5. 70B — requires workstation upgrade (128 GB+ RAM) before it can
+   be attempted at all.
+
+**Wall-clock honesty:** The cloud path had 7B validation at ~8
+hours and 30B at ~30 hours. The local path puts 7B at ~3-4h
+(post Sprint 1-2, with teacher cache) and 30B at ~100-200h. The
+extra wall clock is the cost of the local-only constraint. Plan
+ablation batches accordingly — runs should fit in an overnight or
+weekend window.
+
+**What this does not change:**
+
+- The research thesis (consumer-hardware efficiency for LLM
+  inference) — unchanged. If anything, strengthened; the
+  local-only constraint is consistent with what the fork is
+  trying to prove.
+- Phase B's result (PPL 76.8, rel-err 0.25, hidden-state energy
+  88.5%) — unchanged; already a local result.
+- The speculation track (1.56× on Qwen3-8B / 0.6B) — unchanged;
+  also already local.
+- Sprint 3.5 speculation-acceptance diagnostic — still on. It's a
+  30-minute local experiment on the Phase B checkpoint; cheaper
+  than ever relative to the new "no cloud validation" posture.
+
+**Why this matters for deployment:** Atlas deployment was always
+local-first (home server, upstream-compatible GGUF, no external
+dependencies). The research fork now mirrors that posture end-to-
+end: from training data through compression through draft model
+through inference runtime, every step runs on hardware we control.
 
 
