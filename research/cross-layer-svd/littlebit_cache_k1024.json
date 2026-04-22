@@ -1,0 +1,31 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "rank": 512,
+  "tau": 100.0,
+  "steps": 100,
+  "lr": 0.0001,
+  "batch_size": 1,
+  "seq_len": 512,
+  "inter_mse_weight": 10.0,
+  "teacher_ppl": 17.202212845184807,
+  "init_ppl": 402799.7959624755,
+  "final_ppl": 1273.1375277434624,
+  "best_ppl": 1273.1375277434624,
+  "best_step": 100,
+  "history": [
+    {
+      "step": 0,
+      "loss": null,
+      "ppl": 402799.7959624755,
+      "teacher_ppl": 17.202212845184807
+    },
+    {
+      "step": 100,
+      "loss": 1698.6074853515624,
+      "ppl": 1273.1375277434624,
+      "teacher_ppl": 17.202212845184807
+    }
+  ],
+  "wrapped_layers": 168,
+  "trainable_params": 399491968
+}

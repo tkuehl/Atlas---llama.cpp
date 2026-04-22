@@ -3677,4 +3677,201 @@ unblocks both (a) batch=2 at 0.5B today for a ~24% additional
 wall-time win and (b) 7B local training, which currently does not
 fit in 16 GB at any reasonable batch/seq.
 
+## 2026-04-22 — Sprint 3 Phase I shipped: teacher cache works at 0.5B with 7.3% quality gap
+
+Continuation of the same session.  Built out Phase I of
+[scale_to_30b_architecture.md §5](scale_to_30b_architecture.md):
+offline teacher extraction + mmap'd cache + chunked top-k KL loss +
+training-loop integration.  Validated end-to-end on 0.5B.  Cache
+works; quality gap is bounded (7.3% worse step-1000 PPL vs live
+teacher, still 28% BETTER than Run 3's paper recipe) and expected
+to shrink at larger scales.  Infrastructure is ready for 7B once
+memory-for-student work lands.
+
+### What shipped
+
+Three new files:
+
+- [teacher_cache.py](teacher_cache.py): `TeacherCacheWriter`,
+  `TeacherCacheReader`, `kl_topk_loss`, `compute_corpus_hash`, and
+  the `CacheMetadata` dataclass.  Pre-allocates memmap files sized
+  for the full run; reader does zero-copy mmap lookup by
+  micro-step index; validates config (seed, seq_len, batch_size,
+  grad_accum, c4_samples, teacher_model, corpus_hash) on load so a
+  mismatched cache fails fast instead of silently training on stale
+  data.
+- [littlebit_teacher_extract.py](littlebit_teacher_extract.py):
+  extraction script that mirrors the training CLI's sampling
+  trajectory (same seed → same iter_batches sequence) and writes
+  top-k logits + all-N-layer hidden states + teacher_ppl to the
+  cache.  Extraction rate on 0.5B: ~20 micro-steps/s.
+- [diag_cache_kl_equivalence.py](diag_cache_kl_equivalence.py) +
+  [diag_hook_magnitude.py](diag_hook_magnitude.py) +
+  [diag_topk_coverage.py](diag_topk_coverage.py): regression
+  harnesses — the first confirms cached KL matches live KL within
+  fp16 roundtrip noise; the third sweeps k values to quantify the
+  top-k approximation error at our 152k vocab.
+
+Training-loop integration in [littlebit_qat_model.py](littlebit_qat_model.py):
+new `--teacher-cache <dir>` flag.  When provided, teacher model is
+never loaded; each micro-step pulls top-k values + indices + all
+24 layer hidden states from the cache via mmap, and KL runs through
+`kl_topk_loss` instead of full-vocab `F.kl_div`.  MSE uses cached
+hiddens as targets byte-for-byte identical to live teacher.
+
+### Validation — 1000-step matched smoke at 0.5B
+
+Three runs, same hyperparameters, differing only in teacher source:
+
+| Config | Step 500 PPL | Step 1000 PPL | Wall (1000 steps) | Peak VRAM |
+|---|---:|---:|---:|---:|
+| Live teacher (no cache) | 349.97 | **235.68** | 677 s | 10.42 GB |
+| Cache k=256 (fixed KL)  | 436.40 | 255.81 | 602 s | 8.23 GB |
+| Cache k=1024            | 410.82 | **252.85** | 615 s | 8.26 GB |
+| Run 3 baseline (for context) | 558.82 | 354.23 | n/a | n/a |
+
+**Cache-path vs live-teacher at step 1000: +7.3% PPL (k=1024), -21%
+peak VRAM, -9% wall time.**  Cache path beats Run 3 by 28% on PPL
+regardless of which k is used — it's a Pareto improvement over the
+paper recipe, with a known quality gap vs the live-teacher
+full-vocab-KL upper bound.
+
+### The KL-approximation learning path
+
+Three corners got debugged this session:
+
+**1. Vocab coverage at our scale.**  The arch doc §2.2 cites
+"k=256 is essentially lossless" from distillation literature.  That
+literature assumes 32-50k vocab.  For Qwen2.5's 152k vocab, a
+measurement sweep via [diag_topk_coverage.py](diag_topk_coverage.py)
+shows:
+
+| k | top-k prob coverage | KL approx error |
+|---|---:|---:|
+| 32 | 83.6% | 6.85% |
+| 256 | 93.5% | 2.38% |
+| 1024 | 97.2% | 1.00% |
+| 4096 | 99.2% | 0.29% |
+
+So "essentially lossless" at our vocab size starts around k=1024,
+not k=256.  Plan was to bump k; the bump alone recovered only a
+fraction of the gap (see below).
+
+**2. Softmax-over-top-k vs full-vocab student.**  First
+`kl_topk_loss` implementation softmaxed both teacher and student
+over top-k only.  This zero'd the student gradient's ability to
+push mass between top-k and the tail — 2× PPL regression at step
+500.  Fixed by keeping teacher softmaxed over top-k (tail ignored)
+but doing `log_softmax(student_logits)` over the full vocab, then
+gathering at top-k indices.  Dropped the step-500 gap from 101% →
+25%.
+
+**3. Re-normalisation bias — the residual gap.**  Even with fix
+(2), `softmax(topk_values)` sums teacher probs to 1 over top-k,
+effectively dividing each by the top-k coverage ratio (~0.93 at
+k=256, ~0.97 at k=1024).  That's a systematic ~3-7% over-scaling
+on the KL term relative to MSE.  Going 256 → 1024 only narrowed
+the step-1000 gap from 8.5% → 7.3% — diminishing returns.  The
+remaining gap is structural, not a k-coverage issue.  **TODO(C)**:
+cache `log_sum_exp` of the teacher's full-vocab logits (4
+bytes/position, trivial storage overhead — ~8 MB for a 1000-step
+cache) and use `t_log_probs = topk_values − lse` directly; expected
+to close the gap to 1-3%.  Punted to keep Sprint 3 from turning
+into a multi-day KL-formulation project; the scale argument says
+the gap will decrease naturally at 7B (peakier distributions, so
+top-k coverage increases).
+
+### Disk and wall-clock economics
+
+At 0.5B, 1000-step validation cache:
+
+- Top-k logits (k=256): 3 GB
+- Top-k logits (k=1024): 12 GB
+- Hidden states (all 24 layers, bf16): 88 GB
+- **Total**: 91-100 GB
+- Extraction wall time: 5-6 min
+
+Extrapolating to 30B per the napkin math (50M token corpus, 3
+cached layers per arch doc §2.3): ~2-3 TB cache, 1-5 day
+extraction.  Fits one consumer NVMe.  Extraction is the one-time
+cost that amortises across every subsequent student ablation.
+
+### What this unlocks
+
+- **batch=2 at 0.5B** at the safe 80% cap now fits comfortably —
+  the 2.4 GB freed by the cache is the difference between yesterday's
+  95%-cap-tourniquet and a durable run-anywhere config.  Not yet
+  measured; a follow-up.
+- **7B local training** was gated on teacher cache because live 7B
+  teacher in bf16 = 14 GB alone exhausts the 16 GB VRAM before we
+  add student.  Cache frees that 14 GB.  Student at 7B fp32 still
+  doesn't fit (needs bf16 weights + further memory work — separate
+  sprint).  Sprint 3 is necessary-but-not-sufficient for 7B.
+- **30B local training** additionally needs Phase II (streamed
+  student layers, `scale_to_30b_architecture.md §3`).  Sprint 3
+  ships Phase I only.
+
+### Defaults decision
+
+The cache path is now shipping-correct but introduces a 7.3% PPL
+gap vs live teacher at 0.5B.  Keeping `--teacher-cache` as an
+opt-in flag (default None = live teacher) rather than a default —
+live teacher is still higher-quality at scales where it fits, and
+the opt-in gate forces an explicit decision when memory pressure
+demands cache.  Future users can flip the default after validating
+at their specific scale.
+
+### TODO(C) — dial in the residual KL gap
+
+Three paths to close the 7.3%:
+
+1. **Cache `log_sum_exp`** along with top-k values (4 bytes/pos).
+   Rewrite `kl_topk_loss` to use exact teacher log-probs on top-k
+   support.  Expected: gap → 1-3%.  Cost: ~1 hour of code + 15 min
+   re-validation.
+2. **Cache top-1024 or top-2048** with current code.  Going from
+   256 → 1024 bought 1.2 percentage points; 1024 → 2048 would
+   probably buy another 0.5-1.  Not worth the 2x storage at 7B+.
+3. **Accept scale-dependent closing.**  Larger models are peakier,
+   so top-k coverage naturally improves.  Measure the gap at 1.5B
+   and 7B; may be under 5% without any code changes.
+
+Probably (1) first, then validate at 1.5B + 7B.  Not blocking any
+other sprint work.
+
+### Artifacts
+
+- [teacher_cache.py](teacher_cache.py) — cache module
+- [littlebit_teacher_extract.py](littlebit_teacher_extract.py) — extraction script
+- [diag_cache_kl_equivalence.py](diag_cache_kl_equivalence.py) —
+  cached-vs-live KL diff regression harness
+- [diag_topk_coverage.py](diag_topk_coverage.py) — k-sweep to pick
+  the right k for a given vocab
+- [littlebit_cache_baseline.json](littlebit_cache_baseline.json) —
+  100-step no-cache baseline (step 100 PPL 1122)
+- [littlebit_cache_cached_v2.json](littlebit_cache_cached_v2.json) —
+  100-step k=256 cache after KL fix (step 100 PPL 1329)
+- [littlebit_cache_k1024.json](littlebit_cache_k1024.json) —
+  100-step k=1024 cache (step 100 PPL 1273)
+- [littlebit_cache_1k_v2.json](littlebit_cache_1k_v2.json) —
+  1000-step k=256 cache (step 1000 PPL 255.81)
+- [littlebit_cache_1k_k1024.json](littlebit_cache_1k_k1024.json) —
+  1000-step k=1024 cache (step 1000 PPL 252.85) ← the shipping data
+
+### Next
+
+Teacher-cache infrastructure is in place.  Remaining items before
+7B training can even be attempted:
+
+1. **bf16 student weights** at 7B (fp32 at 7B = 28 GB, won't fit).
+   Requires careful handling of the SmoothSign autograd path which
+   currently assumes fp32 input.
+2. **8-bit Adam CPU offload** at 7B (Adam state at 7B = 14 GB).
+3. **Actually run a 7B teacher extraction**, ~1-4 hours per arch
+   doc §2.4.
+
+Plus the deferred TODO(C) for KL gap closure.  None of this blocks
+each other; reasonable next sprint is "7B feasibility" combining
+these into a single probe run.
+
 

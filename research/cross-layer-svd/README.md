@@ -53,8 +53,16 @@ After those two, branch to whichever concern you're picking up.
   than Run 3** at matched budget.  See JOURNAL for four Windows bugs
   uncovered and fixed.
 - Layer 1 deployment export shipped (292 MB, 7× compression)
-- **Next planned**: Sprint 3 — teacher cache infrastructure (now the
-  single remaining gate to local 7B training)
+- **Sprint 3 Phase I shipped** (2026-04-22, second journal entry
+  that day): teacher cache + chunked top-k KL + mmap reader,
+  validated on 0.5B.  7.3% PPL gap vs live teacher at k=1024 (still
+  28% better than Run 3's paper recipe), -21% VRAM, -9% wall time.
+  Known TODO(C): cache `log_sum_exp` for exact top-k KL, expected
+  to close the remaining gap.  Phase II (streamed student layers)
+  still required for 30B local.
+- **Next planned**: bf16 student weights + 8-bit Adam CPU offload
+  to unlock 7B local training (Sprint 3's cache was necessary but
+  not sufficient — student side also needs memory work).
 
 ## Decisions locked in
 

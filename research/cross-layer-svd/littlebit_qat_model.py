@@ -600,6 +600,17 @@ def main():
                         "~13%% matmul speedup.  --no-tf32 to disable "
                         "for ablation.")
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
+    p.add_argument("--teacher-cache", default=None,
+                   help="Path to an offline teacher cache produced by "
+                        "littlebit_teacher_extract.py.  When provided, "
+                        "the teacher model is NOT loaded; per-micro-step "
+                        "top-k logits and hidden states are read from the "
+                        "cache via mmap, eliminating the teacher from GPU "
+                        "memory and from the per-step forward cost.  "
+                        "Cache is trajectory-keyed — training must use "
+                        "the same seed / seq_len / batch_size / "
+                        "grad_accum_steps / c4_samples / teacher model "
+                        "as extraction (validated on load).")
     p.add_argument("--delete-init-cache-after-start", action="store_true",
                    default=False,
                    help="Delete the init-cache file once training's first "
@@ -647,25 +658,45 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print(f"loading teacher {args.model} (bfloat16)...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    teacher = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16,
-    ).to(device)
-    teacher.eval()
-    for p_ in teacher.parameters():
-        p_.requires_grad_(False)
-    print("teacher loaded.")
-    _gpu_mem("after teacher")
 
-    # Baseline PPL (teacher)
-    print("evaluating teacher PPL...")
-    t0 = time.time()
-    teacher_ppl = wikitext_ppl(teacher, tokenizer,
-                               max_tokens=args.eval_max_tokens,
-                               seq_len=args.seq_len, device=device)
-    print(f"  teacher PPL = {teacher_ppl:.3f}  "
-          f"({time.time() - t0:.1f}s)")
+    # Teacher path: either live (bf16 on GPU) or cached (mmap from disk).
+    # Cached path eliminates ~1 GB VRAM at 0.5B and ~14 GB at 7B, plus
+    # the per-step teacher forward cost.
+    teacher = None
+    teacher_cache = None
+    if args.teacher_cache:
+        from teacher_cache import TeacherCacheReader, compute_corpus_hash
+        print(f"using teacher cache: {args.teacher_cache}", flush=True)
+        teacher_cache = TeacherCacheReader(Path(args.teacher_cache))
+        # We haven't built the token stream yet; defer config validation
+        # until after prepare_train_stream + corpus_hash below.
+        teacher_ppl = (teacher_cache.meta.teacher_ppl
+                       if teacher_cache.meta.teacher_ppl is not None
+                       else float("nan"))
+        print(f"  teacher PPL (from cache metadata): {teacher_ppl:.3f}"
+              if teacher_cache.meta.teacher_ppl is not None
+              else "  teacher PPL: n/a (cache did not record it)",
+              flush=True)
+    else:
+        print(f"loading teacher {args.model} (bfloat16)...")
+        teacher = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.bfloat16,
+        ).to(device)
+        teacher.eval()
+        for p_ in teacher.parameters():
+            p_.requires_grad_(False)
+        print("teacher loaded.")
+        _gpu_mem("after teacher")
+
+        # Baseline PPL (teacher)
+        print("evaluating teacher PPL...")
+        t0 = time.time()
+        teacher_ppl = wikitext_ppl(teacher, tokenizer,
+                                   max_tokens=args.eval_max_tokens,
+                                   seq_len=args.seq_len, device=device)
+        print(f"  teacher PPL = {teacher_ppl:.3f}  "
+              f"({time.time() - t0:.1f}s)")
 
     # Student: separate copy, then wrap, then move to device.
     # (Wrap creates new CPU tensors via np.linalg.svd; must .to(device)
@@ -762,11 +793,17 @@ def main():
     use_hook_mse = bool(args.inter_mse_weight) and args.mse_via_hooks
     if use_hook_mse:
         student_hidden = HiddenCapture()
-        teacher_hidden = HiddenCapture()
         student_hidden.install(student)
-        teacher_hidden.install(teacher)
+        # Teacher hooks only when the teacher is live.  Under --teacher-cache
+        # the teacher's hidden states are already materialised on disk
+        # (stored as post-layer outputs plus post-final-norm, matching the
+        # hook-fix layout) and will be loaded per micro-step.
+        if teacher is not None:
+            teacher_hidden = HiddenCapture()
+            teacher_hidden.install(teacher)
         print(f"hidden-state capture: hook-based "
-              f"({len(student.model.layers)} decoder layers)",
+              f"({len(student.model.layers)} decoder layers"
+              f"{'; teacher side via cache' if teacher is None else ''})",
               flush=True)
 
     # torch.compile: inductor kernel fusion.  PyTorch's inductor
@@ -875,6 +912,25 @@ def main():
     accum = max(1, args.grad_accum_steps)
     effective_batch = args.batch_size * accum
 
+    # Validate teacher-cache config now that the token stream is built
+    # (we need its corpus_hash).  Fails fast if cache was produced for
+    # a different trajectory.
+    if teacher_cache is not None:
+        from teacher_cache import compute_corpus_hash
+        teacher_cache.validate_config(
+            seed=0,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            grad_accum_steps=accum,
+            c4_samples=args.c4_samples,
+            teacher_model=args.model,
+            corpus_hash=compute_corpus_hash(train_tokens),
+            required_steps=args.steps,
+        )
+        print(f"  teacher cache validated: {teacher_cache.meta.n_microsteps} "
+              f"micro-steps available for {args.steps} opt-steps × "
+              f"{accum} accum", flush=True)
+
     # Resume-from-checkpoint support: if --resume points to a valid
     # rolling checkpoint, restore model / optimizer / RNG / step /
     # history and skip ahead to the saved step.
@@ -965,31 +1021,47 @@ def main():
         step_loss = 0.0
         for micro in range(accum):
             batch = next(it).to(device)
+            microstep_idx = (step - 1) * accum + micro
             # Clear hook captures from previous micro-step.
             if use_hook_mse:
                 student_hidden.clear()
-                teacher_hidden.clear()
+                if teacher_hidden is not None:
+                    teacher_hidden.clear()
             # When hooks are active, output_hidden_states is False
             # to avoid doubling work.
             want_hidden = bool(args.inter_mse_weight) and not use_hook_mse
-            # Teacher forward (no grad, bf16 logits/hidden)
-            with torch.no_grad():
-                t_out = teacher(batch, output_hidden_states=want_hidden)
-                t_logits = t_out.logits
-                t_hidden = t_out.hidden_states if want_hidden else None
+
+            # Teacher signal: either live forward or from cache.
+            if teacher_cache is not None:
+                t_topk_vals, t_topk_idx, t_cached_hidden = teacher_cache.get(
+                    microstep_idx, device
+                )
+                t_logits = None
+            else:
+                t_topk_vals = t_topk_idx = t_cached_hidden = None
+                with torch.no_grad():
+                    t_out = teacher(batch, output_hidden_states=want_hidden)
+                    t_logits = t_out.logits
+                    t_hidden = t_out.hidden_states if want_hidden else None
 
             # Student forward
             s_out = student(batch, output_hidden_states=want_hidden)
             s_logits = s_out.logits
 
-            log_p_s = torch.nn.functional.log_softmax(s_logits, dim=-1)
-            with torch.no_grad():
-                p_t = torch.nn.functional.softmax(t_logits, dim=-1).to(log_p_s.dtype)
-            l_kl = kl(
-                log_p_s.view(-1, log_p_s.size(-1)),
-                p_t.view(-1, p_t.size(-1)),
-            )
-            del log_p_s, p_t, s_logits, t_logits
+            if teacher_cache is not None:
+                # Top-k truncated KL against cached teacher logits.
+                from teacher_cache import kl_topk_loss
+                l_kl = kl_topk_loss(s_logits, t_topk_vals, t_topk_idx)
+                del s_logits
+            else:
+                log_p_s = torch.nn.functional.log_softmax(s_logits, dim=-1)
+                with torch.no_grad():
+                    p_t = torch.nn.functional.softmax(t_logits, dim=-1).to(log_p_s.dtype)
+                l_kl = kl(
+                    log_p_s.view(-1, log_p_s.size(-1)),
+                    p_t.view(-1, p_t.size(-1)),
+                )
+                del log_p_s, p_t, s_logits, t_logits
             loss = l_kl
 
             if args.inter_mse_weight:
@@ -997,9 +1069,13 @@ def main():
                     # Hook-captured states: aligned with
                     # output_hidden_states[1:], one per decoder layer.
                     s_hidden = student_hidden.states
-                    t_hidden_list = teacher_hidden.states
                 else:
                     s_hidden = s_out.hidden_states[1:]
+                if teacher_cache is not None:
+                    t_hidden_list = t_cached_hidden
+                elif use_hook_mse:
+                    t_hidden_list = teacher_hidden.states
+                else:
                     t_hidden_list = t_hidden[1:]
                 l_inter = 0.0
                 for sh, th in zip(s_hidden, t_hidden_list):
@@ -1011,7 +1087,8 @@ def main():
                 # can actually drop these activations during backward.
                 if use_hook_mse:
                     student_hidden.clear()
-                    teacher_hidden.clear()
+                    if teacher_hidden is not None:
+                        teacher_hidden.clear()
 
             # Average micro-step losses so the effective gradient
             # matches a single batch=effective_batch forward.

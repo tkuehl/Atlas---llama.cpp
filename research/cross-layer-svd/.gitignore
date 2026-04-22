@@ -9,7 +9,9 @@ bs_*.json
 *.pth
 *.safetensors
 *.gguf
+*.bin
 caldera_text.txt
 .env
 runs/
 factored_out*/
+caches/
