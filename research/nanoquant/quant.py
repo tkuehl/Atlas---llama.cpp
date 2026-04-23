@@ -70,6 +70,22 @@ def svd_init(W: torch.Tensor, r: int) -> tuple[torch.Tensor, ...]:
 
 
 class BinaryFactoredLinear(nn.Module):
+    """Factored-binary linear with fp32 latent parameters.
+
+    Latent tensors (U_latent, V_latent, s1, s2) are stored in **fp32** so
+    the AdamW step has enough mantissa precision to accumulate small
+    updates (~1e-4) at small magnitudes. Bias stays in the surrounding
+    block's dtype so the residual-stream arithmetic is uniform.
+
+    The forward casts the factor params to the input dtype (bf16 in
+    Phase 2) before the matmul, so activations stay in the model's
+    compute dtype. Autograd handles the cast on the backward path.
+
+    This was the source of the Phase 2 smoke's zero-movement bug: with
+    LB-ADMM producing |U_latent| ≈ 0.04, bf16's relative precision 2^-7
+    gave absolute precision ~3e-4, above the per-step AdamW update ~1e-4.
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -77,24 +93,44 @@ class BinaryFactoredLinear(nn.Module):
         r: int,
         bias: bool = True,
         device=None,
-        dtype=None,
+        dtype=None,  # kept for API compatibility; used only for bias.
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
-        fact = {"device": device, "dtype": dtype}
-        self.U_latent = nn.Parameter(torch.empty(out_features, r, **fact))
-        self.V_latent = nn.Parameter(torch.empty(in_features, r, **fact))
-        self.s1 = nn.Parameter(torch.empty(out_features, **fact))
-        self.s2 = nn.Parameter(torch.empty(in_features, **fact))
+        # Factor params live in fp32 regardless of the surrounding block dtype.
+        f32 = {"device": device, "dtype": torch.float32}
+        self.U_latent = nn.Parameter(torch.empty(out_features, r, **f32))
+        self.V_latent = nn.Parameter(torch.empty(in_features, r, **f32))
+        self.s1 = nn.Parameter(torch.empty(out_features, **f32))
+        self.s2 = nn.Parameter(torch.empty(in_features, **f32))
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, **fact))
+            bf = {"device": device, "dtype": dtype if dtype is not None else torch.float32}
+            self.bias = nn.Parameter(torch.empty(out_features, **bf))
         else:
             self.register_parameter("bias", None)
 
     @classmethod
     def from_linear(cls, lin: nn.Linear, r: int) -> "BinaryFactoredLinear":
+        U_latent, V_latent, s1, s2 = svd_init(lin.weight.data, r)
+        return cls.from_factors(lin, r, U_latent, V_latent, s1, s2)
+
+    @classmethod
+    def from_factors(
+        cls,
+        lin: nn.Linear,
+        r: int,
+        U_latent: torch.Tensor,
+        V_latent: torch.Tensor,
+        s1: torch.Tensor,
+        s2: torch.Tensor,
+    ) -> "BinaryFactoredLinear":
+        """Construct from precomputed factors (e.g. from LB-ADMM).
+
+        Factor params are always stored as fp32 (see class docstring);
+        bias keeps the source linear's dtype.
+        """
         W = lin.weight.data
         d_out, d_in = W.shape
         mod = cls(
@@ -103,27 +139,29 @@ class BinaryFactoredLinear(nn.Module):
             r=r,
             bias=(lin.bias is not None),
             device=W.device,
-            dtype=W.dtype,
+            dtype=W.dtype,  # bias dtype
         )
-        U_latent, V_latent, s1, s2 = svd_init(W, r)
-        tgt_dtype = W.dtype
-        mod.U_latent.data.copy_(U_latent.to(tgt_dtype))
-        mod.V_latent.data.copy_(V_latent.to(tgt_dtype))
-        mod.s1.data.copy_(s1.to(tgt_dtype))
-        mod.s2.data.copy_(s2.to(tgt_dtype))
+        mod.U_latent.data.copy_(U_latent.to(device=W.device, dtype=torch.float32))
+        mod.V_latent.data.copy_(V_latent.to(device=W.device, dtype=torch.float32))
+        mod.s1.data.copy_(s1.to(device=W.device, dtype=torch.float32))
+        mod.s2.data.copy_(s2.to(device=W.device, dtype=torch.float32))
         if lin.bias is not None:
             mod.bias.data.copy_(lin.bias.data)
         return mod
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        U_sign = sign_ste(self.U_latent)  # (d_out, r)
-        V_sign = sign_ste(self.V_latent)  # (d_in, r)
-        z = x * self.s2                    # (..., d_in)
-        z = z @ V_sign                     # (..., r)
-        z = z @ U_sign.T                   # (..., d_out)
-        z = z * self.s1                    # (..., d_out)
+        # Factor params are fp32; cast to the input's dtype so matmul
+        # accumulates in the block's native precision. Autograd handles
+        # the cast on the backward path.
+        cdtype = x.dtype
+        U_sign = sign_ste(self.U_latent.to(cdtype))
+        V_sign = sign_ste(self.V_latent.to(cdtype))
+        z = x * self.s2.to(cdtype)
+        z = z @ V_sign
+        z = z @ U_sign.T
+        z = z * self.s1.to(cdtype)
         if self.bias is not None:
-            z = z + self.bias
+            z = z + self.bias.to(cdtype)
         return z
 
     def extra_repr(self) -> str:
@@ -151,13 +189,18 @@ def quant_params(module: nn.Module):
 
 
 def replace_linears_with_quant(
-    module: nn.Module, r: int, skip_names: tuple[str, ...] = ()
+    module: nn.Module,
+    r: int,
+    skip_names: tuple[str, ...] = (),
+    init_fn=None,
 ) -> list[str]:
     """Recursively swap every nn.Linear under `module` with a BinaryFactoredLinear.
 
-    Returns the list of fully-qualified names that were replaced. Names in
-    `skip_names` (matched as suffixes of the module path) are left as
-    plain Linear.
+    `init_fn`, if given, is called as `init_fn(path, linear) -> (U, V, s1, s2)`
+    and its output replaces the default SVD init. `path` is the module path
+    relative to `module`.
+
+    Returns the list of fully-qualified (relative) names that were replaced.
     """
     replaced: list[str] = []
 
@@ -167,7 +210,12 @@ def replace_linears_with_quant(
             if isinstance(child, nn.Linear) and not any(
                 path.endswith(s) for s in skip_names
             ):
-                setattr(parent, name, BinaryFactoredLinear.from_linear(child, r))
+                if init_fn is None:
+                    new = BinaryFactoredLinear.from_linear(child, r)
+                else:
+                    U, V, s1, s2 = init_fn(path, child)
+                    new = BinaryFactoredLinear.from_factors(child, r, U, V, s1, s2)
+                setattr(parent, name, new)
                 replaced.append(path)
             else:
                 _walk(child, path)

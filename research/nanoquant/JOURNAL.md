@@ -404,3 +404,149 @@ Output saved to `diag_blocks_6_16.log`.
 Phase 2. Start with the K-FAC activation Gramian
 (`E[xx^T]` per linear) collection — that's the prerequisite for every
 other piece of the LB-ADMM machinery.
+
+---
+
+## 2026-04-23 — Phase 2, step 1: paper-faithful LB-ADMM scaffold (WIP, open bug)
+
+Built the paper's LB-ADMM init path end-to-end. Four new files
+(`preconditioner.py`, `admm.py`, plus extensions to `quant.py` and
+`phase1.py`, wired together through `run_phase2.py`). Stopped in a WIP
+state with a reproducible bug and clean diagnosis below.
+
+### Paper source of truth
+
+Re-fetched the paper via WebFetch and pdftotext. Appendix C pinned
+several implementation details that the arXiv HTML abstract omits.
+**Key numbers** that now live in DESIGN defaults or `run_phase2.py`:
+
+- K = 400 ADMM steps per matrix, with a **linear ρ scheduler**
+  (values not specified by the paper; chose 0.1→10 as a starting guess).
+- `γ = 0.2` Ledoit-Wolf for Llama/Qwen, `0.6` for Gemma/Rnj.
+- TuneLatentSTE: lr=1e-5, bs=1, 8 epochs, cosine.
+- TuneFP (Step 1 Error-Prop Mitigation) and TuneScalesKD (Phase 3
+  global KL) are **deferred** — Phase 2 tests ADMM init alone.
+
+Also clarified that **SVID is from OneBit (Xu et al. 2024)**, not
+Pouransari 2020 (the paper cites both, but the algorithmic content
+belongs to OneBit). OneBit's Prop 1 is the definition:
+
+    SVID(M) := sign(M) ⊙ (a b^T)  where  |M| ≈ a b^T
+
+The `a b^T` is a rank-1 SVD of `|M|` — so the full m×r sign pattern is
+preserved while the magnitudes collapse to a rank-1 outer product.
+
+### Algorithm implemented
+
+Paper Eq. 5 / 6 / 24 with scaled dual `Λ = Y/ρ`:
+
+    # U update
+    (V^T V + (ρ+λ)I) · U^T = V^T W̃^T + ρ (Z_U - Λ_U)^T       (Cholesky)
+    # V update: symmetric
+    Z_U = SVID(U + Λ_U)                                       (paper Eq. 26)
+    Λ_U = Λ_U + (U - Z_U)
+
+then magnitude balancing (paper Eq. 7-9) to extract `(s1, s2, U_latent,
+V_latent)` in our stored format. Verified on a random 256×512 weight
+that ADMM at D=I matches SVD init Frobenius quality (0.9924 vs 0.9928);
+with non-trivial `(D_in, D_out)` Frobenius error correctly goes up
+(0.9951) because we're optimizing the activation-weighted norm, not
+plain Frobenius.
+
+### Process fix: use the paper, not local related code
+
+First web-search agent fell back to `research/cross-layer-svd/`'s
+LittleBit work when its WebFetch was denied, and proposed we "port" the
+existing Dual-SVID + ALS code. User pushed back: *"we need to be
+faithful to the nanoquant paper."* The second web-fetch run succeeded
+(WebFetch on the abstract + pdftotext on the downloaded PDF) and gave
+Algorithm 1, Appendix B (ADMM statement + convergence proof), and
+Appendix C (hyperparameters) verbatim. Memorialized as a `feedback`
+memory so future sessions default to the paper over nearby local
+reimplementations.
+
+### Bugs found during build (root-caused)
+
+1. **Windows stdout γ → UnicodeEncodeError** — replaced γ with `gamma`.
+2. **Hook `.cpu()` per-fire — not actually the bottleneck.** Hypothesis
+   was wrong: swapping to on-device fp32 accumulators saved ~5% not 10×.
+   Actual bottleneck is Qwen3-4B backward through seq=2048 with HF
+   gradient checkpointing: ~2 min/sample on the 5080. One-time ~1 hour
+   cost at n=32 calib; cached to disk, so subsequent runs reuse.
+3. **My own over-normalization** — I had `U_latent /= s1[:, None]` at
+   the end of `lb_admm_init` (copied the svd_init pattern). Paper Eq. 9
+   says `U := η · Û`, no such divide. With SVID's rank-1 magnitude
+   structure (every row of Z_U proportional to `(a[i], b[k])`), normalizing
+   by per-row mean-abs pushes every latent entry to |x| ≈ 1, landing
+   exactly on the clipped-STE threshold and killing the gradient. Fixed.
+4. **bf16 latent params kill AdamW updates when init magnitudes are
+   small.** After fixing (3), `|U_latent|` sits near 0.04. bf16's
+   relative precision 2^-7 = 0.008 gives absolute precision ~3e-4 at
+   that magnitude, which is *above* an AdamW step of magnitude 1e-4
+   (lr) × 1 (normalized moment) = 1e-4. Updates round to zero in bf16
+   storage. Fix: store factor params as fp32, cast to the input's dtype
+   in forward. LittleBit's notes warned about this specifically.
+
+### Open bug (WIP, documented so a future session can pick up)
+
+After fix (4), a standalone unit test with a single linear + fake
+target confirms AdamW on fp32 latents updates params (loss 1.0071 →
+1.0045, `|U_latent|` changes by 0.002 over 20 steps).
+
+But the **end-to-end Phase 2 smoke still reports `final_mse == init_mse`
+to 4 decimals on every block**, and PPL = inf. So something is
+different between the unit test and the real block-by-block training
+loop. Hypotheses to test next session (in order):
+
+1. bytecode cache — already confirmed no stale `__pycache__` was
+   surviving, but worth a hard re-check.
+2. `quantize_model_phase1` — is `quant_params(block)` actually yielding
+   the fp32 params after `replace_linears_with_quant` with the init_fn
+   path? Add an explicit `assert U_latent.dtype == torch.float32` at
+   the top of `train_block`.
+3. Silent skip: if the MSE computation returns a value that happens to
+   be reported as finite but the backward pass produces NaN grads that
+   AdamW handles by leaving params unchanged? The `not torch.isfinite(loss)`
+   guard would have to count it; add a `bad=N` display check —
+   probably already fine since `bad=0` is shown, but verify.
+4. The `block.to(device)` after `replace_linears_with_quant` may be
+   implicitly casting fp32 factor params to the block's bf16 dtype.
+   Check with `print([p.dtype for p in quant_params(block)])` after
+   `.to(device)`. If bf16, skip `.to(device)` or use `.to(device,
+   dtype=None)` with per-param overrides.
+5. The training loop's `x.to(dtype=target_dtype)` where `target_dtype`
+   is taken from `next(p for p in block.parameters()).dtype` — that
+   parameter is RMSNorm's bf16 weight, so the forward is bf16, which is
+   fine. But if during `_eval_block_mse` we also cast the block inputs
+   to bf16 while the factor params are fp32, the mixed-type backward
+   may drop gradients. Check explicitly.
+
+### Files landed (WIP)
+
+- [preconditioner.py](preconditioner.py) — D_in / D_out collection via
+  forward + backward hooks, percentile-clipped, Ledoit-Wolf shrunk.
+- [admm.py](admm.py) — SVID operator, LB-ADMM K-iteration loop,
+  magnitude-balanced scale extraction.
+- [quant.py](quant.py) — added `from_factors` + fp32-latent storage,
+  `replace_linears_with_quant(init_fn=…)` callback.
+- [phase1.py](phase1.py) — `init_fn_factory` parameter for
+  `quantize_model_phase1` so Phase 2 reuses the same STE loop.
+- [run_phase2.py](run_phase2.py) — end-to-end CLI.
+- [diag_block_linears.py](diag_block_linears.py) — already landed in
+  the prior session's diagnostic (kept as-is).
+
+Preconditioner cache at n=4 is persisted under
+`cache/qwen-qwen3-4b/n4_L2048_seed0/preconditioners.pt`. Don't rebuild
+on smoke; it's a 520 s cost.
+
+### Next
+
+1. Fix the STE-no-move bug (item 4 in the WIP list is my leading
+   hypothesis: `block.to(device)` silently downcasting fp32 factor
+   params). Add the assert, run the smoke, confirm.
+2. Once movement shows up at n=4 (even if it produces a bad PPL because
+   preconditioner is too noisy), scale up to n=32. Full run: ~60 min
+   preconditioner + ~15 min phase2 + eval.
+3. Measure against Phase 1's floor of PPL 29,668 and see if the
+   activation-weighted init closes the block-6/16 gap the Phase 1
+   diagnostic flagged.

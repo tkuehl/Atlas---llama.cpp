@@ -135,7 +135,16 @@ def quantize_model_phase1(
     lr: float,
     device,
     status_file: Path | None = None,
+    init_fn_factory=None,
 ) -> list[BlockStats]:
+    """Block-by-block quantize + STE refine.
+
+    `init_fn_factory`, if given, is called as
+        init_fn_factory(block_idx, block) -> init_fn
+    where init_fn follows the `replace_linears_with_quant` contract
+    (path, linear) -> (U, V, s1, s2). Default is None → plain SVD init
+    (Phase 1 behaviour).
+    """
     n_blocks = len(model.model.layers)
     if n_blocks != cache.n_blocks:
         raise ValueError(
@@ -146,7 +155,8 @@ def quantize_model_phase1(
     stats: list[BlockStats] = []
     for b in range(n_blocks):
         block = model.model.layers[b]
-        replaced = replace_linears_with_quant(block, r=r)
+        init_fn = None if init_fn_factory is None else init_fn_factory(b, block)
+        replaced = replace_linears_with_quant(block, r=r, init_fn=init_fn)
         block.to(device)
         if not replaced:
             print(f"[block {b:2d}] no Linears found — skipping")
