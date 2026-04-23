@@ -665,3 +665,144 @@ budget**, just from LB-ADMM init + correctly-flowing STE.
    diagnostic flagged block 6/16 as activation-space problems; at
    n=32 LB-ADMM should finally have enough preconditioner signal to
    close that gap.
+
+---
+
+## 2026-04-23 — Phase 2, step 3: full run — LB-ADMM alone LOSES to SVD + STE
+
+### Headline
+
+- **Phase 2 (LB-ADMM + STE): PPL = 277,154** (nll 12.53)
+- Phase 1 (SVD + STE):    PPL = 29,669 (nll 10.30)
+- **Phase 2 is 9.3× worse than Phase 1** on the same budget.
+
+Results entry: `2026-04-23T18:42:58Z-qwen-qwen3-4b-phase2-lbadmm-ste`,
+tagged on `d1e5e2f7b`. Hyperparameters: `r=2, n_calib=32, K=400,
+ρ: 0.1→10 linear, λ=1e-3, γ=0.2, lr=1e-5, 500 steps/block, bf16 compute
++ fp32 latents`. Wall: cache cached, precond cached (from earlier run),
+Phase 2 ADMM+STE 2386s, eval 90s. Effectively 40 min once caches were
+warm (1 hr cold with precond rebuild).
+
+### Per-block behaviour — bimodal
+
+LB-ADMM init is catastrophically varied at the Frobenius block-MSE
+level:
+
+- **Early-mid blocks 0–15**: inits range 0.02–13 (vs Phase 1's 0.02–0.14).
+  Some start worse than Phase 1, some better. STE closes most of the
+  gap: block 1 went init 12.51 → final 0.089 (140×), block 20 went
+  106.12 → 0.18 (588×), block 30 went 674.24 → 7.37 (91×).
+- **Blocks 6, 16 (the Phase 1 pathological ones)**: init_mse 13.79 and
+  10.04; final_mse 13.76 and 9.37. *Barely moved* — same failure
+  pattern as Phase 1 SVD init, just landing at slightly different bad
+  values. The activation-weighted objective at our hyperparameters
+  did **not** close the gap the Phase 1 diagnostic flagged.
+- **Late blocks 30–35**: Phase 2 finals 7.4, 3.2, 4.4, 9.9, 15.4,
+  231.8. Phase 1 finals 2.8, 3.2, 4.6, 5.8, 20.8, 41.0. Phase 2 is
+  roughly equal in the middle of this range but **5–6× worse on
+  block 35** (the last block, feeding directly into the LM head).
+- **Mean block final_mse: 8.51 vs Phase 1's 3.05** — 2.8× worse on
+  average.
+
+### Why LB-ADMM loses here
+
+The Phase 1 diagnostic established that block 6/16 are activation-space
+problems: input activations concentrate on singular directions rank-2
+SVD doesn't preserve. The expectation was that LB-ADMM's K-FAC-weighted
+objective (Eq. 2) would preferentially preserve the activation-aligned
+directions and close the gap. It did **not** on these two blocks,
+within our budget.
+
+Specific reasons this run under-performs Phase 1:
+
+1. **LB-ADMM optimizes activation-weighted Frobenius, not
+   plain Frobenius.** Init block-MSE (our Phase 1 metric) is *not*
+   what LB-ADMM is targeting. Its higher block-init-MSE (mean 268 vs
+   Phase 1's 6.5) is partly expected — the algorithm is preserving
+   what matters for activation reconstruction, not what matters for
+   a Frobenius diff on cached teacher outputs.
+
+2. **We ran only Step 2-2 + Step 2-3 of Algorithm 1** — no
+   **TuneFP** (Step 1, error propagation mitigation) and no
+   **TuneScalesKD** (Phase 3, global logit-KL fine-tune). The paper's
+   Table 5 ablation ("LB-ADMM > Dual-SVID init") is measured after
+   the *full* pipeline. Isolated init comparison isn't what the
+   paper claims to win. **This replication tests what we built; it
+   doesn't disprove the paper's headline.**
+
+3. **lr=1e-5 × 500 steps** (paper's TuneLatentSTE values, scaled for
+   a 500-step budget) produces less parameter movement than Phase 1's
+   lr=1e-4 × 500 steps. At bf16 forward + fp32 latent storage the
+   signal IS making it through (confirmed in step-2 diagnostic), but
+   the total update budget is ~10× smaller. If the paper's *true*
+   recipe is 8 epochs × 128 samples = ~1024 × 8 = 8192 steps, we're
+   at 500 (6% of their budget).
+
+### What LB-ADMM *did* help
+
+Several non-pathological blocks got dramatic STE reductions from their
+high inits (see 140–588× numbers above). The algorithm is doing
+meaningful work — just not enough of it, and not on the blocks that
+most need help. On clean blocks 7–14 Phase 2 final MSEs are nearly
+identical to Phase 1's.
+
+### Implementation-fix bugs caught and resolved
+
+Four bugs discovered and fixed before producing this number:
+
+1. **D_in / D_out unnormalized** → λ-ridge dominated ADMM, U,V collapse
+   to ~1e-8, W_eff ~1e-31, backward underflows to zero. Fixed by
+   normalizing each to mean=1 inside `lb_admm_init`. (Previous entry.)
+2. **fp32 latent params + bf16 compute dtype inferred from first
+   block param** — after factor params moved to fp32, the
+   training-loop `target_dtype = next(p for p in block.parameters()).dtype`
+   was picking U_latent's fp32, forcing the *entire block forward*
+   (attention, MLP, norm) into fp32. That disabled Qwen3's SDPA
+   fast-path and made block training **~100× slower** (11 s/step
+   vs 0.06 s/step). Extrapolated full run would have been ~20
+   hours. Fixed in `phase1.py`: pick compute dtype from the first
+   NON-quant-param (RMSNorm bf16 weight), not the first param.
+3. **Unicode γ, Δ** — second round on Windows stdout. Replaced with
+   ASCII.
+4. **Preconditioner takes ~2 min/sample** — this is just physical
+   cost of Qwen3-4B backward at seq=2048 with gradient checkpointing.
+   n=32 takes ~60 min. One-time, cached to disk.
+
+### What this means for the replication
+
+Phase 2 as *just the paper's Algorithm 1 Step 2-2 + Step 2-3* is not
+a win on Qwen3-4B r=2 at our budget. The natural next steps:
+
+1. **Add TuneFP (Step 1).** The paper explicitly adjusts the FP
+   weights of the current block *before* quantization, to absorb
+   quantization error accumulated in preceding blocks. This might
+   specifically address the late-block explosion we see (block 35
+   Phase 2 final 231 vs Phase 1 41).
+
+2. **Increase LR or step budget.** Paper lr=1e-5 × 8 epochs × 128
+   samples is 8192 steps; we did 500. Try lr=1e-4 + 500 steps (match
+   Phase 1 total movement), or lr=1e-5 + 2000 steps. The latter is
+   closer to the paper's recipe.
+
+3. **Ablate the four Phase 2 hyperparameters we guessed at.**
+   Specifically: ρ schedule (paper doesn't specify start/end), λ (not
+   specified), K=400 (confirmed from Appendix C but on H100 — maybe
+   too many on our smaller budget). Narrow sweep on a single block
+   with instrumentation.
+
+4. **Implement TuneScalesKD (Phase 3).** Freeze binary signs, fit
+   s1/s2 end-to-end against FP16 logits via KL. Paper says this is
+   a late-stage optimizer that closes any remaining gap from
+   fixed-sign approximation.
+
+Path forward recommended: **TuneFP next**, because (a) it directly
+addresses the late-block compounding error signature we see in the
+data, and (b) it's the only Step-1 contribution we haven't
+implemented, so it isolates a clean algorithmic variable.
+
+### Memory to save
+
+Added `feedback` memory earlier about paper-replication discipline;
+this entry reinforces it with a datapoint. LB-ADMM's claimed benefit
+over Dual-SVID in Table 5 is measured with the full pipeline; do
+not assume any single paper step is a win in isolation.

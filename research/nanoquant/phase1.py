@@ -94,9 +94,20 @@ def train_block(
 
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0, betas=(0.9, 0.95))
 
-    # Cache is stored as fp16 for disk space; cast to whatever the block
-    # parameters use so matmul dtypes match (the model may be bf16).
-    target_dtype = next(p for p in block.parameters()).dtype
+    # Cache is stored as fp16 for disk space; the block's compute dtype
+    # is the dtype of NON-quant params (RMSNorm weights, bias). We must
+    # not use quant-param dtype (fp32 since Phase 2's latent fix), because
+    # casting the block's input to fp32 makes attention fall off the
+    # flash-attention / SDPA fast path — Phase 2 full run was ~90× slower
+    # per step than it should be before this. Take the first non-quant
+    # parameter's dtype instead.
+    from quant import BinaryFactoredLinear
+    quant_param_ids = {id(p) for p in quant_params(block)}
+    compute_dtype = next(
+        (p.dtype for p in block.parameters() if id(p) not in quant_param_ids),
+        torch.float32,
+    )
+    target_dtype = compute_dtype
 
     init_mse = _eval_block_mse(block, X, Z, aux_kwargs, device, target_dtype)
     block.train()

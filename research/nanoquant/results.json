@@ -82,6 +82,60 @@
         "torch": "2.11.0+cu130"
       },
       "notes": "Phase 1 floor: SVD init + clipped-STE only, r=2, bf16"
+    },
+    {
+      "id": "2026-04-23T18:42:58Z-qwen-qwen3-4b-phase2-lbadmm-ste",
+      "timestamp_utc": "2026-04-23T18:42:58Z",
+      "git": {
+        "commit": "d1e5e2f7b9f2c4a8c9b13c41a5238b5aa7b1ed6f",
+        "dirty": true,
+        "branch": "master"
+      },
+      "model": {
+        "hf_id": "Qwen/Qwen3-4B",
+        "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+        "dtype": "bfloat16"
+      },
+      "method": {
+        "name": "phase2-lbadmm-ste",
+        "params": {
+          "r": 2,
+          "admm_K": 400,
+          "rho_start": 0.1,
+          "rho_end": 10.0,
+          "lam": 0.001,
+          "gamma": 0.2,
+          "percentile": 0.99,
+          "steps_per_block": 500,
+          "lr": 1e-05,
+          "init": "lb-admm",
+          "ste": "clipped-identity",
+          "optimizer": "adamw",
+          "weight_decay": 0.0,
+          "n_calib": 32,
+          "calib_seq_len": 2048,
+          "calib_seed": 0,
+          "mean_block_init_mse": 267.74269322781925,
+          "mean_block_final_mse": 8.507150665675807,
+          "phase2_wall_seconds": 2385.831419467926
+        }
+      },
+      "eval": {
+        "dataset": "wikitext-2-raw-v1",
+        "split": "test",
+        "seq_len": 2048,
+        "stride": 2048,
+        "num_tokens": 296960,
+        "num_windows": 145,
+        "metric": "ppl",
+        "value": 277153.75,
+        "nll_mean": 12.532327586206897
+      },
+      "hardware": {
+        "gpu": "NVIDIA GeForce RTX 5080 Laptop GPU",
+        "torch": "2.11.0+cu130"
+      },
+      "notes": "Phase 2: LB-ADMM + STE, paper defaults, n=32, K=400, D normalized, bf16 compute"
     }
   ]
 }
