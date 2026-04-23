@@ -336,3 +336,71 @@ catastrophe. This is the expected Phase 1 signature.
 4. (Optional, cheap) Re-run Phase 1 at `r=4` to confirm the brief's
    intuition that rank matters here — should drop PPL substantially
    just from the extra rank, independent of init quality.
+
+---
+
+## 2026-04-23 — Phase 1, step 3: per-linear diagnostic reframes the story
+
+Ran `diag_block_linears.py` across blocks 5–7 and 15–17 (the suspect
+pair and their neighbors) to test the hypothesis that **one specific
+linear** in blocks 6 and 16 was responsible for the ~10× init-MSE gap
+seen in Phase 1.
+
+**Hypothesis falsified.** The per-linear table is essentially flat:
+
+- Rank-2 signed-SVD reconstruction error is 98.8%–99.9% on **every
+  linear in every block**. The numbers look the same in block 6 as
+  in blocks 5 and 7.
+- Top-2 singular energy fraction is 0.003–0.046 everywhere — all
+  Qwen3-4B linears have roughly flat singular spectra past the top
+  handful of components. Rank-2 captures almost nothing of the
+  Frobenius energy; this is uniform across blocks.
+- Signing cost (err_signed − err_trunc) is 0.0005–0.008 — tiny and
+  also uniform. Signing the rank-2 factors adds <1% relative error
+  on top of truncation.
+- Block 6's worst linear (`k_proj`, signE 0.9906) vs block 5's
+  counterpart (signE 0.9881) differs by 0.3%, nowhere near enough to
+  explain a 100× block-level MSE gap.
+
+So: **the Phase 1 block-6/16 pathology is not a weight-space
+phenomenon.** It's activation-space.
+
+### Reframe
+
+Rank-2 SVD preserves the top-2 singular directions of `W`. What makes
+the block fail isn't how much of `W` is reconstructed — it's how much
+of the **input activation energy** falls on those preserved directions.
+`block_output_error ≈ (W − Ŵ) · x`, so a block with inputs concentrated
+on singular directions 3+ will suffer catastrophically even if `W − Ŵ`
+looks identical in Frobenius terms to a neighbor's.
+
+Blocks 6 and 16 are presumably the layers where Qwen3-4B's activations
+align with singular directions not preserved by rank-2 truncation.
+This is the same phenomenon the cross-layer-svd §13.2 activation-
+weighted experiment documented: **Frobenius-optimal low-rank ≠
+activation-optimal low-rank**.
+
+### What this implies for Phase 2
+
+The paper's Phase 2 is K-FAC-preconditioned LB-ADMM. Re-expressing
+that: it solves `min ||X·(W − Ŵ)^T||_F²` — the activation-weighted
+Frobenius objective — which is precisely the thing the above
+diagnostic says we need. K-FAC shrinks the empirical `E[xx^T]` with
+Ledoit-Wolf; ADMM handles the non-convex `{±1}` constraint.
+
+If LB-ADMM closes the block-6/16 gap specifically (bringing their
+init MSE within the same band as neighbors), that's the single
+cleanest Phase-2-value-prop story.
+
+### Artifact
+
+[`diag_block_linears.py`](diag_block_linears.py) — the diagnostic
+script. `err_trunc` / `err_signed` / `signing_cost` per-linear, plus
+`top_r_energy` and `cond_r` for spectrum characterization.
+Output saved to `diag_blocks_6_16.log`.
+
+### Next
+
+Phase 2. Start with the K-FAC activation Gramian
+(`E[xx^T]` per linear) collection — that's the prerequisite for every
+other piece of the LB-ADMM machinery.
