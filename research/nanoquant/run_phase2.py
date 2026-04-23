@@ -36,6 +36,7 @@ from activations import Cache, build_cache
 from admm import lb_admm_init
 from data import eval_token_stream
 from phase1 import quantize_model_phase1
+from phase2 import quantize_model_with_tunefp
 from ppl import sliding_window_ppl
 from preconditioner import (
     PRECOND_FILE,
@@ -91,6 +92,15 @@ def main() -> None:
         default=0,
         help="emit detailed dtype/grad/delta logs for the first N blocks",
     )
+    ap.add_argument(
+        "--tune-fp-steps",
+        type=int,
+        default=0,
+        help="TuneFP (Algorithm 1 Step 1) steps per block. 0 = skip TuneFP "
+             "and use cached teacher-to-teacher (X, Y) pairs as in phase1.py.",
+    )
+    ap.add_argument("--tune-fp-lr", type=float, default=1e-4)
+    ap.add_argument("--tune-fp-batch", type=int, default=4)
     ap.add_argument("--eval-seq-len", type=int, default=2048)
     ap.add_argument("--notes", default=None)
     args = ap.parse_args()
@@ -203,17 +213,48 @@ def main() -> None:
         flush=True,
     )
     t0 = time.time()
-    block_stats = quantize_model_phase1(
-        model,
-        cache=cache,
-        r=args.rank,
-        steps_per_block=args.steps,
-        lr=args.lr,
-        device=args.device,
-        status_file=status_file,
-        init_fn_factory=init_fn_factory,
-        verbose_first_blocks=args.verbose_blocks,
-    )
+    if args.tune_fp_steps > 0:
+        print(
+            f"[phase2] using TuneFP pipeline: tune_fp_steps={args.tune_fp_steps} "
+            f"tune_fp_lr={args.tune_fp_lr} tune_fp_batch={args.tune_fp_batch}",
+            flush=True,
+        )
+        phase2_block_stats = quantize_model_with_tunefp(
+            model,
+            cache=cache,
+            r=args.rank,
+            steps_per_block=args.steps,
+            lr=args.lr,
+            device=args.device,
+            init_fn_factory=init_fn_factory,
+            tune_fp_steps=args.tune_fp_steps,
+            tune_fp_lr=args.tune_fp_lr,
+            tune_fp_batch=args.tune_fp_batch,
+            status_file=status_file,
+            verbose_first_blocks=args.verbose_blocks,
+        )
+        # Flatten to the same shape quantize_model_phase1 returned for
+        # downstream accounting.
+        block_stats = [s.ste for s in phase2_block_stats]
+        # Also surface mean TuneFP delta for the results log.
+        tunefp_finals = [s.tune_fp.final_loss for s in phase2_block_stats if s.tune_fp is not None]
+        tunefp_inits = [s.tune_fp.init_loss for s in phase2_block_stats if s.tune_fp is not None]
+        mean_tunefp_init = sum(tunefp_inits) / max(len(tunefp_inits), 1) if tunefp_inits else None
+        mean_tunefp_final = sum(tunefp_finals) / max(len(tunefp_finals), 1) if tunefp_finals else None
+    else:
+        block_stats = quantize_model_phase1(
+            model,
+            cache=cache,
+            r=args.rank,
+            steps_per_block=args.steps,
+            lr=args.lr,
+            device=args.device,
+            status_file=status_file,
+            init_fn_factory=init_fn_factory,
+            verbose_first_blocks=args.verbose_blocks,
+        )
+        mean_tunefp_init = None
+        mean_tunefp_final = None
     phase2_secs = time.time() - t0
     print(
         f"[phase2] done in {phase2_secs:.1f}s "
@@ -248,32 +289,43 @@ def main() -> None:
     )
     revision = getattr(model.config, "_commit_hash", None)
 
+    method_name = "phase2-tunefp-lbadmm-ste" if args.tune_fp_steps > 0 else "phase2-lbadmm-ste"
+    method_params = {
+        "r": args.rank,
+        "admm_K": args.admm_K,
+        "rho_start": args.rho_start,
+        "rho_end": args.rho_end,
+        "lam": args.lam,
+        "gamma": args.gamma,
+        "percentile": args.percentile,
+        "steps_per_block": args.steps,
+        "lr": args.lr,
+        "init": "lb-admm",
+        "ste": "clipped-identity",
+        "optimizer": "adamw",
+        "weight_decay": 0.0,
+        "n_calib": args.n_calib,
+        "calib_seq_len": args.seq_len,
+        "calib_seed": args.seed,
+        "mean_block_init_mse": mean_init,
+        "mean_block_final_mse": mean_final,
+        "phase2_wall_seconds": phase2_secs,
+    }
+    if args.tune_fp_steps > 0:
+        method_params.update({
+            "tune_fp_steps": args.tune_fp_steps,
+            "tune_fp_lr": args.tune_fp_lr,
+            "tune_fp_batch": args.tune_fp_batch,
+            "mean_tunefp_init_loss": mean_tunefp_init,
+            "mean_tunefp_final_loss": mean_tunefp_final,
+        })
+
     entry = append_entry(
         model_hf_id=args.model,
         model_revision=revision,
         model_dtype=args.dtype,
-        method_name="phase2-lbadmm-ste",
-        method_params={
-            "r": args.rank,
-            "admm_K": args.admm_K,
-            "rho_start": args.rho_start,
-            "rho_end": args.rho_end,
-            "lam": args.lam,
-            "gamma": args.gamma,
-            "percentile": args.percentile,
-            "steps_per_block": args.steps,
-            "lr": args.lr,
-            "init": "lb-admm",
-            "ste": "clipped-identity",
-            "optimizer": "adamw",
-            "weight_decay": 0.0,
-            "n_calib": args.n_calib,
-            "calib_seq_len": args.seq_len,
-            "calib_seed": args.seed,
-            "mean_block_init_mse": mean_init,
-            "mean_block_final_mse": mean_final,
-            "phase2_wall_seconds": phase2_secs,
-        },
+        method_name=method_name,
+        method_params=method_params,
         eval_info={
             "dataset": "wikitext-2-raw-v1",
             "split": "test",

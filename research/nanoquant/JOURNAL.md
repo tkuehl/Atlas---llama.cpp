@@ -919,3 +919,145 @@ quantization noise).
 - `runs/blocks_sweep.json` — the 18-row data dump from this sweep.
 - Phase 2 @ lr=1e-4 entry in `results.json` (id
   `2026-04-23T19:21:45Z-qwen-qwen3-4b-phase2-lbadmm-ste`).
+
+---
+
+## 2026-04-23 — Phase 2, step 5: TuneFP implemented — surprisingly makes PPL 8× WORSE
+
+Built TuneFP (Algorithm 1 Step 1) + student-input chaining for the STE
+step, per paper spec. Clean implementation, unit tests pass, full run
+finished. Result:
+
+### Headline
+
+- **Phase 2 + TuneFP (n=32, K=400, lr=1e-4, tune_fp=200 steps): PPL 1,950,548**
+- Phase 2 no TuneFP (same lr=1e-4):                              PPL   249,378
+- Phase 2 no TuneFP (paper's lr=1e-5):                           PPL   277,154
+- Phase 1 (SVD + STE, lr=1e-4):                                  PPL    29,669
+- FP16 baseline:                                                 PPL        14
+
+**TuneFP made PPL 7.8× WORSE than no-TuneFP, 66× worse than Phase 1.**
+Results entry `2026-04-23T21:31:01Z-qwen-qwen3-4b-phase2-tunefp-lbadmm-ste`
+on `bc68acf9f`. Wall 93 min (TuneFP is expensive — 200 step full-block
+backward ×36 blocks).
+
+### The paradox
+
+Block 35 **final MSE = 9.64** — best we've ever measured (Phase 1: 41,
+Phase 2 no-TuneFP: 64). The LAST block is dramatically better. But PPL
+is 8× worse.
+
+Why? Because the *mean* block final MSE is ≈ 18 (vs 3.2 for Phase 2
+no-TuneFP). The middle blocks are the issue.
+
+### Error floor phenomenon
+
+- Blocks 7–15 all land at STE final MSE ≈ **11.9** (± 0.1).
+- Blocks 17–29 all land at STE final MSE ≈ **23–35**.
+- Block 35 drops to 9.6 because the LM head is the final target, and
+  STE can always fit the final layer well.
+
+The floors are NOT random — they're the **irreducible distance**
+between what the teacher block *would* produce on the student's drifted
+input and the cached teacher-on-teacher target. No per-block training
+can drive this below zero.
+
+### Why TuneFP hurt at our hyperparameters
+
+Two mismatched objectives:
+
+1. **Phase 1 / Phase 2 no-TuneFP** use cached `(X_teacher, Y_teacher)`
+   pairs: train each block to reproduce teacher behavior on clean
+   input. Easy objective → each block's individual quality is high
+   (final MSE 0.1–2). At deploy time, errors compound but each block
+   is individually well-conditioned.
+
+2. **Phase 2 with TuneFP** uses `(X_student, Y_teacher)`: train each
+   block to produce teacher output when fed *realistic drifted input*.
+   Hard objective → each block's final MSE reflects the upstream
+   noise floor (11–35). At deploy time, no compositional advantage
+   because the "training distribution" already baked in noise the
+   block can't correct.
+
+The irreducible-floor interpretation: for training signal
+`‖block(X_student) − Y_teacher‖²`, the optimum is capped at
+`‖teacher_block(X_student) − teacher_block(X_teacher)‖²`. No
+per-block learning can get below this. TuneFP doesn't change the
+floor — it just moves the FP weights around within the floor.
+
+### What WORKED in TuneFP
+
+To be clear, TuneFP itself does the work the paper claims. Looking at
+the per-block TuneFP loss reductions:
+
+- Block 2: 231 → 0.05 (4600× absorption).
+- Block 9: 192 → 11.9 (16× absorption).
+- Block 17: 271 → 22.5 (12×).
+- Block 30: 4164 → 39.8 (104×).
+- Block 35: 9959 → 9.6 (**1040× absorption**, best measured).
+
+TuneFP is genuinely compensating for upstream quantization error. The
+issue is downstream: LB-ADMM quantization of the TuneFP-tuned FP
+weights reintroduces error, and the subsequent blocks' STE (on the
+noisy student input path) can't push below the floor.
+
+### Hypotheses for why the paper's Table 2 claims this works
+
+1. **Paper uses lr=1e-5 for TuneLatentSTE × 8 epochs = ~1024 steps**
+   per block at n=128, ~32× more signal than our 500 steps. That
+   might be enough to drive STE below the measured floors.
+2. **Paper has `weighted MSE` in block reconstruction** (Appendix C
+   mentions "weighted MSE function, utilized in previous quantization
+   works"). We use plain MSE. The weighting may explicitly
+   down-weight the compounded-noise directions.
+3. **Paper's TuneFP batch size = 4** (ours matches) but with longer
+   training. More absorption, less LB-ADMM reintroduction.
+4. **Global TuneScalesKD (Phase 3)** is the final compensator that
+   fixes the residual errors after all the block-wise work. We
+   haven't implemented this. Possibly the main fix.
+
+### Where to go next (ordered by likely impact)
+
+1. **Implement TuneScalesKD (Phase 3)** — the paper's end-stage global
+   KL fine-tune. Freeze binary signs, tune only scales s1 / s2 across
+   the whole model against FP logits via KL. This is the only
+   component of Algorithm 1 we haven't built, and it directly targets
+   compositional error rather than per-block. Expected biggest
+   single-step win.
+2. **If TuneScalesKD doesn't close the gap**, try paper's lr=1e-5
+   with more steps (1000–2000) for both TuneFP and STE — matches
+   paper's effective budget more closely.
+3. **Add weighted MSE** per Appendix C mention. Implementation
+   unclear from paper; probably Hessian-diagonal-weighted from the
+   same K-FAC preconditioners.
+
+### Concrete honest takeaways
+
+- TuneFP as **implemented** (paper-faithful to my reading of
+  Algorithm 1 + Appendix C) underperforms the simpler Phase 2
+  pipeline at our constrained budget. Not a critique of the paper —
+  at their 1024-step-per-block, n=128, 8-epoch-cosine-LR budget on
+  an H100, it may well work. At our budget it doesn't.
+- The "student-input chain" training approach creates a noise floor
+  that's absent in pure teacher-forcing. Any comparison of
+  LB-ADMM+STE variants must hold this constant.
+- Per-block MSE is MISLEADING as a proxy for PPL when measured on
+  different input distributions. Phase 2 no-TuneFP has low MSEs but
+  noisy deployment; Phase 2 with TuneFP has high MSEs (reflecting
+  realistic input) but still worse deployment. PPL is the only
+  reliable final metric.
+
+### Files landed this step
+
+- `tune_fp.py` — TuneFP training loop, fully-trainable block params,
+  cosine LR schedule, batch-sampled steps.
+- `phase2.py` — `quantize_model_with_tunefp` orchestrator chaining
+  TuneFP → LB-ADMM init → STE → forward update per block.
+- `run_phase2.py` — new flags: `--tune-fp-steps`, `--tune-fp-lr`,
+  `--tune-fp-batch`. Calls `phase2.quantize_model_with_tunefp` when
+  `tune_fp_steps > 0`, else falls back to `phase1.quantize_model_phase1`.
+- Results entry id `2026-04-23T21:31:01Z-qwen-qwen3-4b-phase2-tunefp-lbadmm-ste`.
+
+### Next
+
+Implement TuneScalesKD (Phase 3) per paper spec.
