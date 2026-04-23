@@ -1,0 +1,21 @@
+# Phase 0 — baselines + eval only.
+# Phase 1+ gets scipy and scikit-learn for free as lm-eval transitive deps.
+#
+# Torch constraint: RTX 5080 (Blackwell, sm_120) requires a torch wheel built
+# against CUDA 12.8 or 13.0. cu126 wheels omit sm_120 kernels and will fail at
+# runtime with "no kernel image is available for execution on the device".
+# Verified working on 2026-04-23:
+#   pip install torch==2.11.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+#   pip install -r requirements.txt
+
+transformers>=4.46
+accelerate>=1.2
+datasets>=3.0
+safetensors>=0.4
+sentencepiece>=0.2
+numpy>=1.26
+tqdm>=4.66
+
+# Eval harness — pinned to a specific release so numbers are comparable across runs.
+# Record the resolved commit SHA in JOURNAL.md on first use.
+lm-eval>=0.4.5

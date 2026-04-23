@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Model weights and caches — do not commit
+models/
+hf_cache/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+
+# Calibration activations (large, regenerable)
+activations/
+*.npz
+*.npy
+
+# Eval outputs, logs
+runs/
+outputs/
+logs/
+wandb/
+*.log
+
+# Notebook checkpoints
+.ipynb_checkpoints/

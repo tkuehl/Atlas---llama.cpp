@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "2026-04-23T13:44:00Z-qwen-qwen3-4b-fp16-baseline",
+      "timestamp_utc": "2026-04-23T13:44:00Z",
+      "git": {
+        "commit": "408be3f72b154d58f705ac528d385f5d46bcc8e1",
+        "dirty": true,
+        "branch": "master"
+      },
+      "model": {
+        "hf_id": "Qwen/Qwen3-4B",
+        "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+        "dtype": "float16"
+      },
+      "method": {
+        "name": "fp16-baseline",
+        "params": {}
+      },
+      "eval": {
+        "dataset": "wikitext-2-raw-v1",
+        "split": "test",
+        "seq_len": 2048,
+        "stride": 2048,
+        "num_tokens": 296960,
+        "num_windows": 145,
+        "metric": "ppl",
+        "value": 13.643564224243164,
+        "nll_mean": 2.613267780172414
+      },
+      "hardware": {
+        "gpu": "NVIDIA GeForce RTX 5080 Laptop GPU",
+        "torch": "2.11.0+cu130"
+      },
+      "notes": null
+    }
+  ]
+}
