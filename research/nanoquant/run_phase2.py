@@ -44,6 +44,7 @@ from preconditioner import (
     load_preconditioners,
 )
 from results import append_entry
+from tune_scales_kd import tune_scales_kd
 
 
 HERE = Path(__file__).parent
@@ -101,6 +102,23 @@ def main() -> None:
     )
     ap.add_argument("--tune-fp-lr", type=float, default=1e-4)
     ap.add_argument("--tune-fp-batch", type=int, default=4)
+    ap.add_argument(
+        "--tune-scales-steps",
+        type=int,
+        default=0,
+        help="TuneScalesKD (Algorithm 1 Phase 3) steps. 0 = skip. "
+             "Runs AFTER block-wise quantization. Freezes binary signs, "
+             "KL-fine-tunes only s1/s2 end-to-end against a fresh FP teacher.",
+    )
+    ap.add_argument("--tune-scales-lr", type=float, default=1e-6)
+    ap.add_argument("--tune-scales-batch", type=int, default=1)
+    ap.add_argument(
+        "--tune-scales-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature scaling for KL (Hinton distillation). "
+             "T>1 flattens distributions, making low-LR optimization easier.",
+    )
     ap.add_argument("--eval-seq-len", type=int, default=2048)
     ap.add_argument("--notes", default=None)
     args = ap.parse_args()
@@ -262,6 +280,50 @@ def main() -> None:
         flush=True,
     )
 
+    # --- Phase 3 (optional): TuneScalesKD — global scale fine-tune ---
+    tune_scales_stats = None
+    if args.tune_scales_steps > 0:
+        print(
+            f"[phase3] TuneScalesKD: {args.tune_scales_steps} steps, "
+            f"lr={args.tune_scales_lr:g}, batch={args.tune_scales_batch}",
+            flush=True,
+        )
+        # Fresh FP teacher alongside the quantized student. After block-wise
+        # factorization the student's VRAM footprint drops (big Linears
+        # replaced with small fp32 factor params), so both fit on the 5080.
+        print(f"[phase3] loading teacher model: {args.model} ({args.dtype})", flush=True)
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype=torch_dtype,
+            device_map=args.device,
+        )
+        teacher_model.eval()
+
+        t0_scales = time.time()
+        tune_scales_stats = tune_scales_kd(
+            student_model=model,
+            teacher_model=teacher_model,
+            tokenizer=tok,
+            n_samples=args.n_calib,
+            seq_len=args.seq_len,
+            seed=args.seed,
+            steps=args.tune_scales_steps,
+            lr=args.tune_scales_lr,
+            device=args.device,
+            batch_size=args.tune_scales_batch,
+            temperature=args.tune_scales_temperature,
+        )
+        print(
+            f"[phase3] done in {time.time() - t0_scales:.1f}s, "
+            f"init_kl={tune_scales_stats.init_loss:.5f} -> "
+            f"final_kl={tune_scales_stats.final_loss:.5f} "
+            f"(bad_steps={tune_scales_stats.bad_steps})",
+            flush=True,
+        )
+        # Free teacher model before eval (student forward needs VRAM).
+        del teacher_model
+        torch.cuda.empty_cache()
+
     # --- Eval ---
     print("[eval] tokenizing WikiText-2 test split", flush=True)
     stream = eval_token_stream(tok)
@@ -289,7 +351,13 @@ def main() -> None:
     )
     revision = getattr(model.config, "_commit_hash", None)
 
-    method_name = "phase2-tunefp-lbadmm-ste" if args.tune_fp_steps > 0 else "phase2-lbadmm-ste"
+    method_name_parts = ["phase2"]
+    if args.tune_fp_steps > 0:
+        method_name_parts.append("tunefp")
+    method_name_parts.extend(["lbadmm", "ste"])
+    if args.tune_scales_steps > 0:
+        method_name_parts.append("kd")
+    method_name = "-".join(method_name_parts)
     method_params = {
         "r": args.rank,
         "admm_K": args.admm_K,
@@ -318,6 +386,18 @@ def main() -> None:
             "tune_fp_batch": args.tune_fp_batch,
             "mean_tunefp_init_loss": mean_tunefp_init,
             "mean_tunefp_final_loss": mean_tunefp_final,
+        })
+    if args.tune_scales_steps > 0 and tune_scales_stats is not None:
+        method_params.update({
+            "tune_scales_steps": args.tune_scales_steps,
+            "tune_scales_lr": args.tune_scales_lr,
+            "tune_scales_batch": args.tune_scales_batch,
+            "tune_scales_temperature": args.tune_scales_temperature,
+            "tune_scales_init_kl": tune_scales_stats.init_loss,
+            "tune_scales_final_kl": tune_scales_stats.final_loss,
+            "tune_scales_steps_taken": tune_scales_stats.steps_taken,
+            "tune_scales_bad_steps": tune_scales_stats.bad_steps,
+            "n_scale_params": tune_scales_stats.n_scale_params,
         })
 
     entry = append_entry(
