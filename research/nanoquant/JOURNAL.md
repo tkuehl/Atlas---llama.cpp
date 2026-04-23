@@ -806,3 +806,116 @@ Added `feedback` memory earlier about paper-replication discipline;
 this entry reinforces it with a datapoint. LB-ADMM's claimed benefit
 over Dual-SVID in Table 5 is measured with the full pipeline; do
 not assume any single paper step is a win in isolation.
+
+---
+
+## 2026-04-23 — Phase 2, step 4: LR ablation + blocks 6/16 sweep — hyperparameters have hit diminishing returns
+
+Two experiments, both cheap, designed to pin down what the 9× PPL gap
+between Phase 2 (LB-ADMM+STE) and Phase 1 (SVD+STE) actually comes from.
+
+### Experiment 1: LR ablation (`lr=1e-5` → `lr=1e-4`)
+
+Same Phase 2 config otherwise. Results entry
+`2026-04-23T19:21:45Z-qwen-qwen3-4b-phase2-lbadmm-ste` on `2b771f545`:
+
+| metric | lr=1e-5 | lr=1e-4 | Phase 1 SVD |
+|---|---:|---:|---:|
+| PPL | 277,154 | **249,378** | 29,669 |
+| mean block final MSE | 8.51 | ~3.24 | 3.05 |
+| block 6 final | 13.76 (stuck) | **9.90** | 13.69 (stuck) |
+| block 16 final | 9.37 (stuck) | **7.23** | 9.14 (stuck) |
+| block 35 final | 231.8 | 64.5 | 41.0 |
+
+**Block-level MSE at `lr=1e-4` now matches Phase 1 on most blocks** —
+the previously-stuck blocks 6 and 16 moved 28% and 21% respectively,
+and blocks 30–34 converged to Phase 1's range. But **PPL only dropped
+10%** (277K → 249K), still 8× above Phase 1.
+
+The per-block average converging to Phase 1's while PPL stays 8× worse
+means the PPL gap **is not an aggregate block-MSE problem** — it's
+dominated by specific blocks whose error compounds through the
+residual stream. Specifically block 35 (last block, feeds LM head
+after final norm): 64 in Phase 2@1e-4 vs 41 in Phase 1 (1.57× worse
+block-MSE, but massive PPL leverage).
+
+Conclusion: **the LR ceiling for closing the Phase 2 gap is very low.**
+Further LR tuning wouldn't meaningfully help. The remaining gap is
+structural.
+
+### Experiment 2: `(K, λ)` sweep on blocks 6 and 16
+
+Nine combos each — `K ∈ {100, 400, 1000} × λ ∈ {1e-4, 1e-3, 1e-2}` —
+with instrumented `lb_admm_init` recording primal/dual residuals,
+latent magnitudes, Frobenius rel-err, and activation-weighted rel-err.
+Script: `diag_blocks_sweep.py`, output `runs/blocks_sweep.json`.
+
+**Block 6 best init_mse: 13.26 at K=1000, λ=1e-3** (our default was
+15.93 at K=400 λ=1e-3; Phase 1 SVD was 13.79). LB-ADMM *can* beat SVD
+on this block's init but by only 4%.
+
+**Block 16 best init_mse: 9.97 at K=100, any λ** (our default 10.01
+at K=400 λ=1e-3; Phase 1 SVD was 9.14). **Phase 1 SVD actually wins
+on block 16 init.** LB-ADMM's activation-weighted objective doesn't
+translate to better Frobenius block-MSE here.
+
+Key patterns across the 18 combos:
+
+1. **K=100 beats K=400 beats K=1000** on activation-weighted rel-err
+   for most combos. ADMM overshoots with more iterations — primal
+   residuals on V are already 0.1–0.5 at K=100 and don't tighten.
+2. **K=1000 + small λ diverges** on block 16 (init_mse = 863 at
+   K=1000, λ=1e-4). Confirms instability at high iterations.
+3. **All 18 combos have `frob_rel ≥ 1.0`** — the quantized weight is
+   farther from the original than zero is, in Frobenius. Rank-2 signed
+   binary is **architecturally insufficient** to represent these two
+   specific weight matrices regardless of LB-ADMM hyperparameters.
+4. **Per-block optima diverge**: block 6 wants K=1000, block 16 wants
+   K=100. No single (K, λ) is universally optimal.
+5. **Activation-weighted rel-err IS meaningfully lower than Frobenius
+   rel-err** on the best combos (act_rel 0.80 vs frob_rel 0.996 on
+   block 6 at K=100 λ=1e-4). The algorithm is doing its job on its own
+   objective; the Frobenius metric just doesn't reward that.
+
+### Combined conclusion
+
+Hyperparameter tuning on LB-ADMM has hit diminishing returns:
+
+- **LR** cap: `lr=1e-4` brings per-block MSE to parity with Phase 1
+  but leaves an 8× PPL gap. Further LR won't help.
+- **K, λ**: per-block best init gains are 4–5% over defaults. Maybe
+  ~5% PPL improvement achievable with per-block adaptive settings.
+  Not the main lever.
+- **rank r**: out of scope here but the larger lever (r=4 vs r=2 is
+  the obvious direction).
+
+**The dominant remaining lever is the paper's Step 1, TuneFP** (error
+propagation mitigation): adjust the FP weights of the current block
+*before* quantization, to absorb error accumulated from preceding
+quantized blocks. This directly targets the late-block compounding
+error signature we see (block 35 is the PPL killer, and its input is
+the residual-stream output of 34 preceding blocks of accumulated
+quantization noise).
+
+### Next
+
+1. Build TuneFP (Algorithm 1 Step 1). Inputs per block: the block's
+   original FP weights + cached teacher input + **actual current
+   student input** (output of preceding already-quantized blocks). FP
+   weights get fine-tuned (~50–100 AdamW steps at lr=1e-4, per paper's
+   TuneFP defaults) to make the FP block produce the teacher's output
+   *given* the student input. This absorbs upstream quantization error
+   into the FP weights *before* we then quantize them with LB-ADMM.
+2. Re-run Phase 2 with TuneFP + LB-ADMM + STE. Expected dominant
+   effect on block 35 (currently 64× vs Phase 1's 41×, where the
+   compounding error concentrates).
+3. Only then revisit per-block (K, λ) adaptation — it's a second-order
+   optimization that only matters if TuneFP closes the big gap first.
+
+### Artifacts
+
+- `diag_blocks_sweep.py` — reusable per-block `(K, λ, ρ)` sweep with
+  instrumented ADMM residuals.
+- `runs/blocks_sweep.json` — the 18-row data dump from this sweep.
+- Phase 2 @ lr=1e-4 entry in `results.json` (id
+  `2026-04-23T19:21:45Z-qwen-qwen3-4b-phase2-lbadmm-ste`).
