@@ -16,6 +16,7 @@ hf_cache/
 
 # Calibration activations (large, regenerable)
 activations/
+cache/
 *.npz
 *.npy
 

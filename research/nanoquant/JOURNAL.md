@@ -149,3 +149,92 @@ result lands on a clean SHA.
   advertised BiLLM-beating gap as a sanity check on the eval harness.
 - Commit the Phase 0 harness (data/ppl/results/run_baseline) and the first
   Qwen3-4B entry in one commit so the baseline result has a clean SHA.
+
+---
+
+## 2026-04-23 — Phase 1, step 1: STE skeleton up, two bugs preempted (one didn't)
+
+### Layout
+
+Four more files under `research/nanoquant/`:
+
+- `quant.py` — `BinaryFactoredLinear` (SVD init + clipped-STE forward) and
+  `replace_linears_with_quant` / `quant_params` helpers. STE is clipped
+  identity (grad = 1 for `|x| < 1`, else 0), applied via a custom
+  `torch.autograd.Function`. Forward never materializes the effective
+  weight — cost is `O((d_in + d_out) · r)` per batch-element.
+- `activations.py` — builds a per-boundary teacher activation cache on
+  disk. Captures aux kwargs (rotary `position_embeddings`, attention mask)
+  via a `with_kwargs=True` forward-pre-hook on layer 0 so block-wise
+  training can reconstruct the forward without threading them manually.
+  Cache stored as fp16 regardless of model dtype (training casts on load).
+- `phase1.py` — block-by-block quantize → freeze-non-quant-params →
+  AdamW (lr=1e-4, wd=0, betas=(0.9, 0.95)) → per-step MSE against cached
+  teacher output. Writes a status file after every block so a crash is
+  recoverable.
+- `run_phase1.py` — CLI, wires the pieces together, appends to
+  `results.json` as `method.name = "phase1-ste-svd-init"`.
+
+### Two bugs I preempted from cross-layer-svd's 2026-04-22 lessons
+
+The new memory notes cross-layer-svd's Stage 4 gotchas and I took them
+seriously when writing the code, so two of those four bugs never got to
+ship:
+
+1. **Only train quant params.** `phase1.py` explicitly freezes the whole
+   block, then unfreezes only what `quant_params()` yields. RMSNorm
+   weights are not touched. No silent normalization drift.
+2. **AdamW `weight_decay=0.0`.** Scale vectors `s1, s2` stay free to grow.
+3. (Line-buffered stdout and per-block status files are both in
+   `run_phase1.py` from the start.)
+
+### One bug I didn't preempt — fp16 overflow in the binary forward
+
+Smoke at `n_calib=4, steps=10` produced `final_mse=nan` on every block
+and `init_mse=inf` on blocks 6 and 16. Cause: Qwen3-4B ships as fp16
+(range ±65504), but the rank-2 sign-approx of some linear weights
+produces activation outliers that overflow that range inside the
+attention/MLP forward — specifically on blocks 6 and 16, before any
+training step. Other blocks overflowed only after a few AdamW steps.
+
+**Fix:** default `--dtype` is now `bfloat16` (fp32-like range, fine
+precision for this purpose). Also cast MSE computation to fp32 on both
+train and eval paths for safety, and added a `not torch.isfinite(loss)`
+guard in the STE loop that skips bad steps and counts them. bf16 alone
+was enough to fix it on this smoke, but the guards stay as cheap
+insurance.
+
+This is worth remembering: the fp32 guidance in LittleBit's notes
+("keep factored-binary latent params in fp32 because `tanh(tau·x)`
+precision near zero matters for SmoothSign") is one axis; the separate
+axis is that the **forward** through a signed rank-r approximation can
+blow fp16's range on some layers, regardless of STE flavor. On Qwen3-4B
+r=2 this hits at least two of 36 blocks at SVD init.
+
+### Smoke result — pipeline works, PPL catastrophic (expected)
+
+`n_calib=4, steps=20/block, r=2, bf16` on Qwen3-4B:
+
+- Runtime: cache 15s, phase1 157s (4.4s/block), eval 85s. Total ~5 min.
+- No NaN, no inf, no bad steps on any block.
+- Per-block MSE trajectory climbs with depth (residual stream grows):
+  block 0 = 0.026, block 5 = 0.062, block 17 = 0.11, block 30 = 3.5,
+  block 35 = 151 → 144 after 20 STE steps.
+- Two pathological blocks: 6 (init 13.75) and 16 (init 9.53) —
+  ~100× worse than neighbors. SVD rank-2 sign-approx is catastrophic
+  for some specific linear(s) in those blocks. Not diagnosed further;
+  Phase 2's Dual-SVID / LB-ADMM init may or may not fix it.
+- **PPL = 143,754,976** (≈1.4 × 10⁸). The research brief projected 10⁴
+  to 10⁶ for Phase 1; we're above that, because at only 20 steps with
+  `n_calib=4` STE barely moves the init (block 35: 151 → 144, ~5%).
+- `results.json` entry skipped (`--no-log`) so the smoke doesn't pollute
+  the reference log.
+
+### Next
+
+1. Commit the Phase 1 harness on a clean SHA so the real run's entry is
+   tagged cleanly.
+2. Full Phase 1 run: `steps=500`, `n_calib=32`, `r=2`, bf16. Expected
+   runtime ~25–30 min.
+3. Log the result, journal the trajectory. Accept that the number will
+   be big — it's the Phase 1 floor.
