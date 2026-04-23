@@ -550,3 +550,118 @@ on smoke; it's a 520 s cost.
 3. Measure against Phase 1's floor of PPL 29,668 and see if the
    activation-weighted init closes the block-6/16 gap the Phase 1
    diagnostic flagged.
+
+---
+
+## 2026-04-23 — Phase 2, step 2: root-caused (D scaling) — smoke produces real gradients
+
+Earlier WIP hypotheses 1–5 were all wrong. The actual bug came from a
+scale the paper never writes down:
+
+**`D_in` and `D_out` need to be normalized to mean=1 before ADMM, or
+the λ ridge regularizer dominates the optimum and drives U, V to zero.**
+
+### Trace
+
+Wrote `diag_phase2_grad.py` — a focused single-block diagnostic that
+replicates the full Phase 2 pipeline (model load, cache load, LB-ADMM
+replace, forward+backward) with `retain_grad()` on every intermediate
+inside `BinaryFactoredLinear.forward`. Output pinned the failure:
+
+- Forward graph intact (`loss.grad_fn = MseLossBackward0`, `y.requires_grad = True`).
+- `loss = 0.025` (nonzero).
+- `loss.backward()` runs without error.
+- **Every param.grad and every retained intermediate grad = exactly 0.**
+
+That pattern only happens if the loss's *numerical* dependence on the
+params is below the precision floor of the arithmetic path. Two more
+prints identified what was small:
+
+    q_proj D_in: mean=0.023
+    q_proj D_out: mean=1.05e-4        ← 200× smaller than D_in
+    W_eff = s1·(sign·sign)·s2: mean=2.2e-31  ← essentially zero
+
+Compare to a healthy, unquantized layer's W: mean 0.017.
+
+### Why
+
+Paper Eq. 15 uses `W̃ = D_out · W · D_in`. My `preconditioner.py` built
+`D_out` from RMS of per-output-channel cross-entropy gradient — and on
+a mean-normalized CE loss over 4 × 2048 tokens, those gradients are
+~10⁻⁴. `D_in` is activation RMS, ~10⁻². Both are fine as *relative*
+importance signals, but their absolute magnitudes differ by 200× and
+the product `D_out · D_in ≈ 2×10⁻⁶` scales W down by six orders of
+magnitude.
+
+The ADMM objective is
+
+    min ½‖W̃ − UV^T‖² + (λ/2)(‖U‖² + ‖V‖²)
+
+At the optimum (gradient = 0):
+
+    U ≈ W̃·V / (V^T V + λ·I)
+
+When `‖W̃‖` is tiny and `V^T V` is also tiny (because `V` shrank to
+match `W̃`), the `λ·I` term (λ = 1e-3) dominates the denominator and
+drives `U` to ≈ `W̃·V / λ` ≈ `10⁻⁸ · 10⁻⁴ / 10⁻³` = `10⁻⁹`. The
+factored-binary effective weight is then `s1 · s2 · sign-product`
+with s1, s2 ≈ `10⁻⁸`, giving W_eff ≈ `10⁻³¹` — a weight matrix
+numerically indistinguishable from zero.
+
+With W_eff ≈ 0, q_proj output is zero, attention softmax is uniform,
+gradient through a uniform softmax shrinks by ~`1/seq_len²` = `1/4M`
+per layer, and the chain underflows to zero at fp32 precision for
+every intermediate.
+
+### Fix
+
+`admm.py` now normalizes both preconditioners to mean=1 before ADMM:
+
+    D_in  = D_in  / D_in.mean()
+    D_out = D_out / D_out.mean()
+
+This preserves the relative channel-importance ratios (the actual
+content of K-FAC preconditioning) while keeping `W̃` at the same
+scale as `W` so `λ=1e-3` can't dominate. Only 3 lines; the fix is
+structural, not a workaround.
+
+### Instrumentation
+
+Also added `--verbose-blocks N` to `run_phase2.py` (and a `verbose`
+flag to `train_block`), which logs for each of the first N blocks:
+
+- Number of trainables, their dtypes, first-param shape and mean-abs.
+- Step-0 loss and grad norms for the first 6 trainables.
+- Post-training `max_abs_delta` and how many of the trainables moved.
+
+Plus `diag_phase2_grad.py` stays in the tree as a reusable
+gradient-flow probe for future debugging.
+
+### Smoke result (n=4, steps=20, K=50, lr=1e-4, fixed)
+
+- `|U_latent| mean = 0.020` (was 1.6×10⁻⁸ before fix).
+- Grad norms per param: 10⁻⁵ to 10⁻³ — healthy.
+- **All 28 trainables per block move** (`max_abs_delta ≈ 2×10⁻³`,
+  `bad_steps = 0`).
+- Block 0: 0.0257 → 0.0247. Block 1: 0.0184 → 0.0162. Block 35:
+  137.5 → 117.9. STE actually reduces MSE now.
+- Blocks 6 and 16 still pathological (init 13.77 and 9.76) but STE
+  moves them ~0.05%. Preconditioner at n=4 doesn't have enough signal
+  to fix them — deferred to n=32+.
+- **PPL = 1,376,899** (1.4×10⁶), nll_mean 14.14.
+
+For reference: Phase 1 smoke at the same `(n=4, steps=20)` was PPL
+143,754,976 (1.4×10⁸). **Phase 2 smoke is 100× better on the same
+budget**, just from LB-ADMM init + correctly-flowing STE.
+
+### Next
+
+1. Commit the fix + instrumentation on a clean SHA.
+2. Full Phase 2 run: `n_calib=32`, `K=400` ADMM, `lr=1e-5`, `steps=500`
+   (paper defaults). Expected wall: preconditioner ~60 min (backward
+   through 4B at seq=2048 with gradient checkpointing) + Phase 2 ADMM
+   + STE ~30 min + eval 2 min. Total ~90–100 min.
+3. Compare against Phase 1's floor of PPL 29,668. The Phase 1
+   diagnostic flagged block 6/16 as activation-space problems; at
+   n=32 LB-ADMM should finally have enough preconditioner signal to
+   close that gap.

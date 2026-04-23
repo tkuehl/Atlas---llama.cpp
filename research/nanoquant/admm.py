@@ -94,6 +94,17 @@ def lb_admm_init(
     D_in = D_in.to(device=device, dtype=torch.float32).clamp(min=eps_diag)
     D_out = D_out.to(device=device, dtype=torch.float32).clamp(min=eps_diag)
 
+    # Normalize D_in and D_out to mean=1 so that only their RELATIVE
+    # channel-importance matters. Without this, D_out with raw gradient-RMS
+    # magnitudes (can be 1e-4 on a standard CE-normalized loss) shrinks
+    # W̃ so far below λ that the ridge term dominates ADMM's optimum and
+    # drives U, V to near-zero — which then gives an effective binary
+    # weight of magnitude 10^-30 and zero gradient downstream. The
+    # normalization preserves the preconditioning structure (channel
+    # importance ratios) while keeping W̃ at the same scale as W.
+    D_in = D_in / D_in.mean().clamp(min=eps_diag)
+    D_out = D_out / D_out.mean().clamp(min=eps_diag)
+
     # Preconditioned target W̃ = D_out · W · D_in (paper Eq. 15)
     W_target = D_out.unsqueeze(1) * W_f * D_in.unsqueeze(0)
 

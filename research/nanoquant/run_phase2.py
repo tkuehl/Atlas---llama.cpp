@@ -85,6 +85,12 @@ def main() -> None:
     ap.add_argument("--rebuild-cache", action="store_true")
     ap.add_argument("--rebuild-precond", action="store_true")
     ap.add_argument("--no-log", action="store_true")
+    ap.add_argument(
+        "--verbose-blocks",
+        type=int,
+        default=0,
+        help="emit detailed dtype/grad/delta logs for the first N blocks",
+    )
     ap.add_argument("--eval-seq-len", type=int, default=2048)
     ap.add_argument("--notes", default=None)
     args = ap.parse_args()
@@ -206,6 +212,7 @@ def main() -> None:
         device=args.device,
         status_file=status_file,
         init_fn_factory=init_fn_factory,
+        verbose_first_blocks=args.verbose_blocks,
     )
     phase2_secs = time.time() - t0
     print(

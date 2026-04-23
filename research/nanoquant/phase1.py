@@ -71,6 +71,7 @@ def train_block(
     lr: float,
     device,
     block_idx: int,
+    verbose: bool = False,
 ) -> BlockStats:
     # Freeze everything, then unfreeze only the quant parameters.
     for p in block.parameters():
@@ -82,6 +83,15 @@ def train_block(
     if not trainable:
         raise RuntimeError(f"block {block_idx} has no quantized parameters")
 
+    if verbose:
+        dtypes = {str(p.dtype) for p in trainable}
+        first = trainable[0]
+        print(
+            f"  [dbg b{block_idx}] {len(trainable)} trainables, dtypes={dtypes}, "
+            f"first.shape={tuple(first.shape)} |first|mean={first.detach().abs().mean().item():.4g}",
+            flush=True,
+        )
+
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0, betas=(0.9, 0.95))
 
     # Cache is stored as fp16 for disk space; cast to whatever the block
@@ -91,6 +101,10 @@ def train_block(
     init_mse = _eval_block_mse(block, X, Z, aux_kwargs, device, target_dtype)
     block.train()
     n_samples = X.shape[0]
+
+    # Snapshot a fixed subset of trainables so we can report max|delta| at end.
+    if verbose:
+        snap = [p.detach().clone() for p in trainable]
 
     pbar = tqdm(range(steps), desc=f"block {block_idx:2d}", leave=False)
     bad_steps = 0
@@ -111,10 +125,38 @@ def train_block(
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
+
+        if verbose and step == 0:
+            grad_norms = [
+                (p.grad.norm().item() if p.grad is not None else None)
+                for p in trainable[:6]
+            ]
+            grad_dtypes = [
+                (str(p.grad.dtype) if p.grad is not None else None)
+                for p in trainable[:6]
+            ]
+            print(
+                f"  [dbg b{block_idx}] step 0: loss={loss.item():.6f} "
+                f"grad_norms(first 6)={grad_norms} dtypes={grad_dtypes}",
+                flush=True,
+            )
+
         opt.step()
 
         if step % log_every == 0 or step == steps - 1:
             pbar.set_postfix(mse=f"{loss.item():.4f}", bad=bad_steps)
+
+    if verbose:
+        deltas = [
+            (p.detach() - s).abs().max().item() for p, s in zip(trainable, snap)
+        ]
+        max_d = max(deltas)
+        any_moved = sum(1 for d in deltas if d > 0)
+        print(
+            f"  [dbg b{block_idx}] post-train: max_abs_delta={max_d:.6g} "
+            f"({any_moved}/{len(deltas)} params moved, bad_steps={bad_steps})",
+            flush=True,
+        )
 
     final_mse = _eval_block_mse(block, X, Z, aux_kwargs, device, target_dtype)
     return BlockStats(
@@ -136,6 +178,7 @@ def quantize_model_phase1(
     device,
     status_file: Path | None = None,
     init_fn_factory=None,
+    verbose_first_blocks: int = 0,
 ) -> list[BlockStats]:
     """Block-by-block quantize + STE refine.
 
@@ -174,6 +217,7 @@ def quantize_model_phase1(
             lr=lr,
             device=device,
             block_idx=b,
+            verbose=(b < verbose_first_blocks),
         )
         stats.append(s)
         print(
