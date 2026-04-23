@@ -238,3 +238,101 @@ r=2 this hits at least two of 36 blocks at SVD init.
    runtime ~25–30 min.
 3. Log the result, journal the trajectory. Accept that the number will
    be big — it's the Phase 1 floor.
+
+---
+
+## 2026-04-23 — Phase 1, step 2: floor is 29,668 PPL
+
+### Headline
+
+Qwen3-4B, bf16, `r=2`, `n_calib=32`, `steps=500`/block, plain-SVD init,
+clipped-identity STE, AdamW(lr=1e-4, wd=0, betas=(0.9, 0.95)), pure
+teacher input per block. One linear's output is a single `diag(s1) ·
+sign(U) · sign(V)^T · diag(s2)` product, `U, V ∈ ℝ^{d × 2}`.
+
+- **Qwen3-4B Phase 1 WikiText-2 PPL = 29,668.6** (nll_mean 10.30)
+- vs FP16 baseline 13.64 → **2174× worse**
+- Mean block init MSE 6.50 → final 3.05 (53% reduction averaged across
+  36 blocks). Per-block behavior highly non-uniform.
+- Wall: cache 56s, phase1 813s (22.6s/block), eval 85s. End-to-end ~16 min.
+- Entry id `2026-04-23T14:37:02Z-qwen-qwen3-4b-phase1-ste-svd-init`
+  tagged on `f51681384` (clean harness commit; results append made it
+  dirty, a later journal commit re-cleans).
+
+### Per-block trajectories — the diagnosis
+
+Grouping the 36 blocks by behavior at 500 STE steps:
+
+1. **Modest STE wins, small starting MSE** (~0 .02–0.2 init; final within
+   20–50% of init). Blocks 0–5, 7–15, 17–23. STE is effective but the
+   residual-stream context just doesn't require much correction —
+   rank-2 sign-approx is already "close enough" for these blocks.
+2. **Catastrophic init, STE nearly useless** at 500 steps. Block 6: init
+   13.81 → final 13.70 (0.8% reduction). Block 16: init 9.66 → final
+   9.14 (5.4% reduction). 10–100× worse than neighbors and STE can't
+   climb out. These are the clear failure cases.
+3. **Large init, but STE does meaningful work.** Late blocks where
+   residual stream grows. Block 24: 0.85 → 0.65 (24%). Block 30:
+   3.54 → 2.83 (20%). Block 34: 29.93 → 20.80 (31%). Block 35:
+   151.57 → **41.02 (73% reduction)**. The depth-bias reduces but
+   doesn't disappear.
+
+Blocks 6 and 16 are the interesting failures. Same story as the
+smoke (though smoke had only 20 steps of STE, so the question was
+whether more training helps — it doesn't). Some linear in those
+blocks has a singular-value spectrum where rank-2 captures essentially
+none of the energy, and signing the factors destroys what little is
+there. Flagging as a Phase 2 target — if LB-ADMM fixes blocks 6/16
+cleanly, that alone validates the paper's algorithmic choice.
+
+### Calibration against the research brief
+
+The 2026-04-23 brief projected "post-init PPL 10⁴–10⁶, STE-refined low
+thousands." We landed at 10⁴ — specifically, above the low-thousands
+band but the right order of magnitude. Sources of pessimism vs the
+brief:
+
+- `r=2` not `r=4` (minimum chosen deliberately per DESIGN §5 primary).
+- `n_calib=32` not 128 (tradeoff for iteration speed; we can scale up
+  without changing code).
+- Plain SVD, not Dual-SVID (Phase 1's point — measure this floor).
+- No error propagation, no global scale opt.
+
+The brief also projected a 10× init→refined improvement as the success
+bar for "scaffold works." We got: mean block final MSE is 47% of init
+on average (53% reduction), and final PPL 30K is consistent with STE
+having moved something real per-block but not enough in aggregate
+because the residual stream compounds — per-block 53% → end-to-end
+catastrophe. This is the expected Phase 1 signature.
+
+### Infrastructure lessons
+
+1. **bf16 is the right default** for the forward. fp16 overflows on
+   blocks 6/16 at SVD init (we saw `init_mse=inf` directly in the
+   earlier smoke). Committed harness hardcodes `--dtype bfloat16`.
+2. **Cache-build chunk_size=2 fits fine on the 5080** at n=32 seq=2048
+   (hidden-states peak ~8 GB VRAM).
+3. **Activation cache is ~13 GB on disk** at n=32 (37 boundaries × 335 MB).
+   Fine on NVMe. Scaling to n=128 would be ~52 GB — order of magnitude
+   for a full reproduction. Budget for it.
+4. **22.6s/block is dominated by the 500 STE steps at ~25 it/s** (~20s)
+   plus ~2s for SVD init of 7 linears and MSE eval. SVD at r=2 on a
+   9728×2560 matrix is quick.
+5. **Training loss display**: log every `steps // 20` (so 25 times per
+   block at 500 steps) feels right — enough resolution to spot
+   divergence, not so much the display is all tqdm overhead.
+
+### Next
+
+1. Commit the results.json entry + this journal on a new SHA.
+2. Sanity-check whether the blocks-6/16 pathology is specific to one
+   linear type (q, k, v, o, gate, up, or down). Cheap diagnostic —
+   re-run SVD init on just those blocks and measure per-linear
+   reconstruction error.
+3. Phase 2 vein: implement LB-ADMM init. That's where K-FAC + ADMM +
+   SVID come in — the paper's actual contribution. The PPL target is
+   roughly "close the gap between Phase 1 (30K) and Phase 3 with full
+   pipeline (paper says 25 at 8B, so ~30–50 at 4B if it scales)."
+4. (Optional, cheap) Re-run Phase 1 at `r=4` to confirm the brief's
+   intuition that rank matters here — should drop PPL substantially
+   just from the extra rank, independent of init quality.

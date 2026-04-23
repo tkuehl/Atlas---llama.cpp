@@ -34,6 +34,54 @@
         "torch": "2.11.0+cu130"
       },
       "notes": null
+    },
+    {
+      "id": "2026-04-23T14:37:02Z-qwen-qwen3-4b-phase1-ste-svd-init",
+      "timestamp_utc": "2026-04-23T14:37:02Z",
+      "git": {
+        "commit": "f516813849118043db9965cd36afe13fc472ba29",
+        "dirty": true,
+        "branch": "master"
+      },
+      "model": {
+        "hf_id": "Qwen/Qwen3-4B",
+        "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+        "dtype": "bfloat16"
+      },
+      "method": {
+        "name": "phase1-ste-svd-init",
+        "params": {
+          "r": 2,
+          "steps_per_block": 500,
+          "lr": 0.0001,
+          "init": "svd",
+          "ste": "clipped-identity",
+          "optimizer": "adamw",
+          "weight_decay": 0.0,
+          "n_calib": 32,
+          "calib_seq_len": 2048,
+          "calib_seed": 0,
+          "mean_block_init_mse": 6.504349899038465,
+          "mean_block_final_mse": 3.04711389551974,
+          "phase1_wall_seconds": 813.3007996082306
+        }
+      },
+      "eval": {
+        "dataset": "wikitext-2-raw-v1",
+        "split": "test",
+        "seq_len": 2048,
+        "stride": 2048,
+        "num_tokens": 296960,
+        "num_windows": 145,
+        "metric": "ppl",
+        "value": 29668.611328125,
+        "nll_mean": 10.297844827586207
+      },
+      "hardware": {
+        "gpu": "NVIDIA GeForce RTX 5080 Laptop GPU",
+        "torch": "2.11.0+cu130"
+      },
+      "notes": "Phase 1 floor: SVD init + clipped-STE only, r=2, bf16"
     }
   ]
 }
