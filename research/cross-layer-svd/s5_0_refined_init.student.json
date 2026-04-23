@@ -1,0 +1,12 @@
+{
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "rank": 512,
+    "iters": 15,
+    "gramians": "qwen05b_gramians.pt"
+  },
+  "teacher_ppl": 12.26,
+  "student_ppl": 500360.90318476903,
+  "ppl_ratio": 40812.47171164511,
+  "build_seconds": 230.46555709838867
+}

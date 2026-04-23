@@ -1,0 +1,48 @@
+[mr-build] loading teacher Qwen/Qwen2.5-0.5B
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 18475.99it/s]
+[mr-build]   teacher loaded in 2.3s
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 15792.01it/s]
+[mr-build] num_blocks=24 rank=512 K=1
+[mr-build]   block 0/23 done in 8.5s
+[mr-build]   block 1/23 done in 8.1s
+[mr-build]   block 2/23 done in 8.8s
+[mr-build]   block 3/23 done in 8.2s
+[mr-build]   block 4/23 done in 8.6s
+[mr-build]   block 5/23 done in 8.6s
+[mr-build]   block 6/23 done in 8.2s
+[mr-build]   block 7/23 done in 8.4s
+[mr-build]   block 8/23 done in 8.3s
+[mr-build]   block 9/23 done in 8.3s
+[mr-build]   block 10/23 done in 8.6s
+[mr-build]   block 11/23 done in 8.5s
+[mr-build]   block 12/23 done in 8.6s
+[mr-build]   block 13/23 done in 8.4s
+[mr-build]   block 14/23 done in 8.5s
+[mr-build]   block 15/23 done in 8.7s
+[mr-build]   block 16/23 done in 8.5s
+[mr-build]   block 17/23 done in 8.8s
+[mr-build]   block 18/23 done in 8.8s
+[mr-build]   block 19/23 done in 8.7s
+[mr-build]   block 20/23 done in 8.2s
+[mr-build]   block 21/23 done in 8.3s
+[mr-build]   block 22/23 done in 8.5s
+[mr-build]   block 23/23 done in 8.6s
+[mr-build] total build: 203.8s  (avg 8.5s/block)
+[mr-build] parameter budget breakdown (across all blocks):
+[mr-build]         U_fp:    153354240  (38.38%)
+[mr-build]         V_fp:    109314048  (27.36%)
+[mr-build]        U_mag:       304128  ( 0.08%)
+[mr-build]      V_mag_u:        67584  ( 0.02%)
+[mr-build]      V_mag_g:       245760  ( 0.06%)
+[mr-build]     V_mag_lv:        67584  ( 0.02%)
+[mr-build]         bias:        27648  ( 0.01%)
+[mr-build]        other:    136178560  (34.08%)
+[mr-build]        total:    399559552
+[mr-build] saving state_dict -> s6_1_mr_K1_sanity.student.pt
+[bench] teacher PPL cache hit: Qwen/Qwen2.5-0.5B @ seq=2048,tokens=25000,wikitext-2-raw-v1-test = 12.260
+[mr-build] eval student PPL at init (K=1)...
+Token indices sequence length is longer than the specified maximum sequence length for this model (298938 > 131072). Running this sequence through the model will result in indexing errors
+[mr-build]   student PPL = 379980.006 (30993.48x teacher, 6.2s)
+[mr-build] saved s6_1_mr_K1_sanity.student.json

@@ -1,0 +1,93 @@
+[mr-build] loading teacher Qwen/Qwen2.5-0.5B
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 17434.68it/s]
+[mr-build]   teacher loaded in 2.2s
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 18084.81it/s]
+[mr-build] num_blocks=24 rank=512 K=2
+[mr-build] pre-conversion probe on block 12:
+[mr-build]   self_attn.q_proj: shape=(896, 896)  ||W||_F=19.5762
+[mr-build]   self_attn.k_proj: shape=(128, 896)  ||W||_F=8.0552
+[mr-build]   self_attn.v_proj: shape=(128, 896)  ||W||_F=6.4949
+[mr-build]   self_attn.o_proj: shape=(896, 896)  ||W||_F=16.3623
+[mr-build]   mlp.gate_proj: shape=(4864, 896)  ||W||_F=42.5328
+[mr-build]   mlp.up_proj: shape=(4864, 896)  ||W||_F=40.7087
+[mr-build]   mlp.down_proj: shape=(896, 4864)  ||W||_F=38.7591
+[mr-build] === block 0/23 ===
+[mr-build] === block 1/23 ===
+[mr-build] === block 2/23 ===
+[mr-build] === block 3/23 ===
+[mr-build] === block 4/23 ===
+[mr-build] === block 5/23 ===
+[mr-build] === block 6/23 ===
+[mr-build] === block 7/23 ===
+[mr-build] === block 8/23 ===
+[mr-build] === block 9/23 ===
+[mr-build] === block 10/23 ===
+[mr-build] === block 11/23 ===
+[mr-build] === block 12/23 ===
+  [mrblk] converting 7 linears to LittleBit-MultiRank r=512 K=2:
+[mrlin] from_linear shape=(896, 896) r=512 K=2  ||W||_F=19.5762
+[mrlin]   reconstruction Frobenius rel-err = 0.7784  (r_eff=512, K_eff=2)
+[mrlin] init d_in=896 d_out=896 r=512 K=2 bias=True shadow_dtype=torch.float32
+  [mrblk]   self_attn.q_proj: (896, 896) r=512 K=2
+[mrlin] from_linear shape=(128, 896) r=512 K=2  ||W||_F=8.0552
+[mrlin]   reconstruction Frobenius rel-err = 0.7706  (r_eff=128, K_eff=2)
+[mrlin] init d_in=896 d_out=128 r=128 K=2 bias=True shadow_dtype=torch.float32
+  [mrblk]   self_attn.k_proj: (896, 128) r=128 K=2
+[mrlin] from_linear shape=(128, 896) r=512 K=2  ||W||_F=6.4949
+[mrlin]   reconstruction Frobenius rel-err = 0.7709  (r_eff=128, K_eff=2)
+[mrlin] init d_in=896 d_out=128 r=128 K=2 bias=True shadow_dtype=torch.float32
+  [mrblk]   self_attn.v_proj: (896, 128) r=128 K=2
+[mrlin] from_linear shape=(896, 896) r=512 K=2  ||W||_F=16.3623
+[mrlin]   reconstruction Frobenius rel-err = 0.7820  (r_eff=512, K_eff=2)
+[mrlin] init d_in=896 d_out=896 r=512 K=2 bias=False shadow_dtype=torch.float32
+  [mrblk]   self_attn.o_proj: (896, 896) r=512 K=2
+[mrlin] from_linear shape=(4864, 896) r=512 K=2  ||W||_F=42.5328
+[mrlin]   reconstruction Frobenius rel-err = 0.8144  (r_eff=512, K_eff=2)
+[mrlin] init d_in=896 d_out=4864 r=512 K=2 bias=False shadow_dtype=torch.float32
+  [mrblk]   mlp.gate_proj: (896, 4864) r=512 K=2
+[mrlin] from_linear shape=(4864, 896) r=512 K=2  ||W||_F=40.7087
+[mrlin]   reconstruction Frobenius rel-err = 0.8233  (r_eff=512, K_eff=2)
+[mrlin] init d_in=896 d_out=4864 r=512 K=2 bias=False shadow_dtype=torch.float32
+  [mrblk]   mlp.up_proj: (896, 4864) r=512 K=2
+[mrlin] from_linear shape=(896, 4864) r=512 K=2  ||W||_F=38.7591
+[mrlin]   reconstruction Frobenius rel-err = 0.8106  (r_eff=512, K_eff=2)
+[mrlin] init d_in=4864 d_out=896 r=512 K=2 bias=False shadow_dtype=torch.float32
+  [mrblk]   mlp.down_proj: (4864, 896) r=512 K=2
+[mr-build] post-conversion reconstruction check (block 12):
+[mr-build]   self_attn.q_proj  Frob rel-err=0.7784
+[mr-build]   self_attn.k_proj  Frob rel-err=0.7706
+[mr-build]   self_attn.v_proj  Frob rel-err=0.7709
+[mr-build]   self_attn.o_proj  Frob rel-err=0.7820
+[mr-build]   mlp.gate_proj  Frob rel-err=0.8144
+[mr-build]   mlp.up_proj  Frob rel-err=0.8233
+[mr-build]   mlp.down_proj  Frob rel-err=0.8106
+[mr-build] === block 13/23 ===
+[mr-build] === block 14/23 ===
+[mr-build] === block 15/23 ===
+[mr-build] === block 16/23 ===
+[mr-build] === block 17/23 ===
+[mr-build] === block 18/23 ===
+[mr-build] === block 19/23 ===
+[mr-build] === block 20/23 ===
+[mr-build] === block 21/23 ===
+[mr-build] === block 22/23 ===
+[mr-build] === block 23/23 ===
+[mr-build] total build: 205.5s  (avg 8.6s/block)
+[mr-build] parameter budget breakdown (across all blocks):
+[mr-build]         U_fp:    153354240  (38.32%)
+[mr-build]         V_fp:    109314048  (27.31%)
+[mr-build]        U_mag:       608256  ( 0.15%)
+[mr-build]      V_mag_u:       135168  ( 0.03%)
+[mr-build]      V_mag_g:       491520  ( 0.12%)
+[mr-build]     V_mag_lv:       135168  ( 0.03%)
+[mr-build]         bias:        27648  ( 0.01%)
+[mr-build]        other:    136178560  (34.02%)
+[mr-build]        total:    400244608
+[mr-build] saving state_dict -> s6_0_mr_K2.student.pt
+[bench] teacher PPL cache hit: Qwen/Qwen2.5-0.5B @ seq=2048,tokens=25000,wikitext-2-raw-v1-test = 12.260
+[mr-build] eval student PPL at init (K=2)...
+Token indices sequence length is longer than the specified maximum sequence length for this model (298938 > 131072). Running this sequence through the model will result in indexing errors
+[mr-build]   student PPL = 1519921.682 (123974.04x teacher, 5.9s)
+[mr-build] saved s6_0_mr_K2.student.json

@@ -1,0 +1,380 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`torch_dtype` is deprecated! Use `dtype` instead!
+[brecq-prop] loading teacher
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 18815.52it/s]
+[brecq-prop] loading student copy
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 17614.19it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (298938 > 131072). Running this sequence through the model will result in indexing errors
+[brecq-prop]   loaded in 2.8s
+[brecq-prop] training blocks [0:24]
+[brecq-prop] loading Fisher from qwen05b_fisher.pt
+[brecq-prop] preparing calibration pool
+[brecq-prop]   32 sequences
+[brecq-prop] eval teacher PPL
+[brecq-prop]   teacher PPL = 12.260 (over 24999 tokens, 3.3s)
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 0/23 === (Fisher sum=63.782, init rel-err=0.9890)
+[brecq-prop]   step  100  loss=0.613830  rel-err=0.5511  t=3.4s
+[brecq-prop]   step  200  loss=0.571237  rel-err=0.4994  t=7.8s
+[brecq-prop]   step  300  loss=0.497798  rel-err=0.4586  t=12.6s
+[brecq-prop]   step  400  loss=0.401728  rel-err=0.4427  t=16.2s
+[brecq-prop]   step  500  loss=0.475712  rel-err=0.4330  t=20.0s
+[brecq-prop]   block 0 done in 20.0s, rel-err 0.9890 -> 0.4330
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 1/23 === (Fisher sum=34.514, init rel-err=0.5624)
+[brecq-prop]   step  100  loss=0.197446  rel-err=0.3090  t=4.1s
+[brecq-prop]   step  200  loss=0.173061  rel-err=0.2777  t=9.0s
+[brecq-prop]   step  300  loss=0.152517  rel-err=0.2572  t=14.3s
+[brecq-prop]   step  400  loss=0.122017  rel-err=0.2560  t=18.4s
+[brecq-prop]   step  500  loss=0.130078  rel-err=0.2443  t=23.0s
+[brecq-prop]   block 1 done in 23.0s, rel-err 0.5624 -> 0.2443
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 2/23 === (Fisher sum=20.973, init rel-err=0.9823)
+[brecq-prop]   step  100  loss=22.808743  rel-err=0.4343  t=4.4s
+[brecq-prop]   step  200  loss=22.558802  rel-err=0.2278  t=9.3s
+[brecq-prop]   step  300  loss=1.253017  rel-err=0.1372  t=14.3s
+[brecq-prop]   step  400  loss=0.726610  rel-err=0.1140  t=17.9s
+[brecq-prop]   step  500  loss=1.190060  rel-err=0.1268  t=22.2s
+[brecq-prop]   block 2 done in 22.2s, rel-err 0.9823 -> 0.1268
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 3/23 === (Fisher sum=14.205, init rel-err=0.5702)
+[brecq-prop]   step  100  loss=1.710909  rel-err=0.0811  t=5.0s
+[brecq-prop]   step  200  loss=0.527523  rel-err=0.0557  t=11.0s
+[brecq-prop]   step  300  loss=0.372925  rel-err=0.0501  t=15.9s
+[brecq-prop]   step  400  loss=0.365926  rel-err=0.0426  t=20.2s
+[brecq-prop]   step  500  loss=0.567901  rel-err=0.0374  t=26.1s
+[brecq-prop]   block 3 done in 26.1s, rel-err 0.5702 -> 0.0374
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 4/23 === (Fisher sum=10.963, init rel-err=0.0702)
+[brecq-prop]   step  100  loss=0.353696  rel-err=0.0570  t=6.1s
+[brecq-prop]   step  200  loss=0.289858  rel-err=0.0448  t=10.9s
+[brecq-prop]   step  300  loss=0.206308  rel-err=0.0382  t=14.9s
+[brecq-prop]   step  400  loss=0.153290  rel-err=0.0425  t=19.8s
+[brecq-prop]   step  500  loss=0.178946  rel-err=0.0357  t=24.3s
+[brecq-prop]   block 4 done in 24.3s, rel-err 0.0702 -> 0.0357
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 5/23 === (Fisher sum=8.658, init rel-err=0.0667)
+[brecq-prop]   step  100  loss=0.114632  rel-err=0.0291  t=5.6s
+[brecq-prop]   step  200  loss=0.080561  rel-err=0.0253  t=9.9s
+[brecq-prop]   step  300  loss=0.074336  rel-err=0.0240  t=14.9s
+[brecq-prop]   step  400  loss=0.061904  rel-err=0.0226  t=20.8s
+[brecq-prop]   step  500  loss=0.059566  rel-err=0.0217  t=25.4s
+[brecq-prop]   block 5 done in 25.4s, rel-err 0.0667 -> 0.0217
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 6/23 === (Fisher sum=7.575, init rel-err=0.0653)
+[brecq-prop]   step  100  loss=0.100921  rel-err=0.0289  t=4.5s
+[brecq-prop]   step  200  loss=0.068867  rel-err=0.0257  t=10.0s
+[brecq-prop]   step  300  loss=0.057654  rel-err=0.0227  t=15.3s
+[brecq-prop]   step  400  loss=0.052021  rel-err=0.0226  t=19.7s
+[brecq-prop]   step  500  loss=0.051599  rel-err=0.0212  t=24.7s
+[brecq-prop]   block 6 done in 24.7s, rel-err 0.0653 -> 0.0212
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 7/23 === (Fisher sum=6.548, init rel-err=0.0495)
+[brecq-prop]   step  100  loss=0.079204  rel-err=0.0279  t=5.9s
+[brecq-prop]   step  200  loss=0.054352  rel-err=0.0246  t=11.7s
+[brecq-prop]   step  300  loss=0.049997  rel-err=0.0228  t=16.3s
+[brecq-prop]   step  400  loss=0.044135  rel-err=0.0217  t=21.7s
+[brecq-prop]   step  500  loss=0.048508  rel-err=0.0210  t=26.3s
+[brecq-prop]   block 7 done in 26.3s, rel-err 0.0495 -> 0.0210
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 8/23 === (Fisher sum=6.664, init rel-err=0.0620)
+[brecq-prop]   step  100  loss=0.081759  rel-err=0.0290  t=5.6s
+[brecq-prop]   step  200  loss=0.060380  rel-err=0.0243  t=11.5s
+[brecq-prop]   step  300  loss=0.047004  rel-err=0.0223  t=17.6s
+[brecq-prop]   step  400  loss=0.040338  rel-err=0.0221  t=22.6s
+[brecq-prop]   step  500  loss=0.042559  rel-err=0.0210  t=28.2s
+[brecq-prop]   block 8 done in 28.2s, rel-err 0.0620 -> 0.0210
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 9/23 === (Fisher sum=6.233, init rel-err=0.0427)
+[brecq-prop]   step  100  loss=0.066737  rel-err=0.0273  t=6.4s
+[brecq-prop]   step  200  loss=0.054439  rel-err=0.0261  t=11.5s
+[brecq-prop]   step  300  loss=0.054461  rel-err=0.0243  t=16.7s
+[brecq-prop]   step  400  loss=0.037828  rel-err=0.0233  t=22.4s
+[brecq-prop]   step  500  loss=0.040690  rel-err=0.0218  t=27.8s
+[brecq-prop]   block 9 done in 27.8s, rel-err 0.0427 -> 0.0218
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 10/23 === (Fisher sum=6.119, init rel-err=0.0406)
+[brecq-prop]   step  100  loss=0.058863  rel-err=0.0268  t=6.2s
+[brecq-prop]   step  200  loss=0.046269  rel-err=0.0250  t=12.8s
+[brecq-prop]   step  300  loss=0.037449  rel-err=0.0222  t=18.6s
+[brecq-prop]   step  400  loss=0.030929  rel-err=0.0207  t=25.1s
+[brecq-prop]   step  500  loss=0.030681  rel-err=0.0196  t=31.1s
+[brecq-prop]   block 10 done in 31.1s, rel-err 0.0406 -> 0.0196
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 11/23 === (Fisher sum=5.360, init rel-err=0.0471)
+[brecq-prop]   step  100  loss=0.054745  rel-err=0.0282  t=5.5s
+[brecq-prop]   step  200  loss=0.041684  rel-err=0.0242  t=11.3s
+[brecq-prop]   step  300  loss=0.049759  rel-err=0.0221  t=17.9s
+[brecq-prop]   step  400  loss=0.035020  rel-err=0.0206  t=24.0s
+[brecq-prop]   step  500  loss=0.037923  rel-err=0.0198  t=30.1s
+[brecq-prop]   block 11 done in 30.1s, rel-err 0.0471 -> 0.0198
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 12/23 === (Fisher sum=4.918, init rel-err=0.0421)
+[brecq-prop]   step  100  loss=0.054041  rel-err=0.0265  t=6.2s
+[brecq-prop]   step  200  loss=0.036844  rel-err=0.0239  t=13.5s
+[brecq-prop]   step  300  loss=0.039165  rel-err=0.0222  t=21.2s
+[brecq-prop]   step  400  loss=0.032702  rel-err=0.0206  t=28.1s
+[brecq-prop]   step  500  loss=0.030274  rel-err=0.0193  t=35.6s
+[brecq-prop]   block 12 done in 35.6s, rel-err 0.0421 -> 0.0193
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 13/23 === (Fisher sum=4.579, init rel-err=0.0429)
+[brecq-prop]   step  100  loss=0.045326  rel-err=0.0269  t=6.8s
+[brecq-prop]   step  200  loss=0.033955  rel-err=0.0252  t=13.4s
+[brecq-prop]   step  300  loss=0.044590  rel-err=0.0228  t=20.0s
+[brecq-prop]   step  400  loss=0.033112  rel-err=0.0215  t=27.0s
+[brecq-prop]   step  500  loss=0.036352  rel-err=0.0209  t=34.1s
+[brecq-prop]   block 13 done in 34.1s, rel-err 0.0429 -> 0.0209
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 14/23 === (Fisher sum=3.983, init rel-err=0.0517)
+[brecq-prop]   step  100  loss=0.060833  rel-err=0.0358  t=6.8s
+[brecq-prop]   step  200  loss=0.040958  rel-err=0.0307  t=15.0s
+[brecq-prop]   step  300  loss=0.040155  rel-err=0.0253  t=21.7s
+[brecq-prop]   step  400  loss=0.034012  rel-err=0.0240  t=29.8s
+[brecq-prop]   step  500  loss=0.033955  rel-err=0.0220  t=36.3s
+[brecq-prop]   block 14 done in 36.3s, rel-err 0.0517 -> 0.0220
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 15/23 === (Fisher sum=3.671, init rel-err=0.0599)
+[brecq-prop]   step  100  loss=0.051946  rel-err=0.0323  t=6.4s
+[brecq-prop]   step  200  loss=0.040212  rel-err=0.0291  t=15.1s
+[brecq-prop]   step  300  loss=0.046277  rel-err=0.0268  t=22.1s
+[brecq-prop]   step  400  loss=0.036025  rel-err=0.0249  t=30.6s
+[brecq-prop]   step  500  loss=0.034915  rel-err=0.0230  t=37.3s
+[brecq-prop]   block 15 done in 37.3s, rel-err 0.0599 -> 0.0230
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 16/23 === (Fisher sum=2.682, init rel-err=0.0810)
+[brecq-prop]   step  100  loss=0.090136  rel-err=0.0520  t=7.7s
+[brecq-prop]   step  200  loss=0.086944  rel-err=0.0467  t=14.5s
+[brecq-prop]   step  300  loss=0.084346  rel-err=0.0430  t=21.5s
+[brecq-prop]   step  400  loss=0.071039  rel-err=0.0407  t=28.2s
+[brecq-prop]   step  500  loss=0.077657  rel-err=0.0384  t=36.5s
+[brecq-prop]   block 16 done in 36.5s, rel-err 0.0810 -> 0.0384
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 17/23 === (Fisher sum=2.084, init rel-err=0.0934)
+[brecq-prop]   step  100  loss=0.083524  rel-err=0.0466  t=8.2s
+[brecq-prop]   step  200  loss=0.068095  rel-err=0.0441  t=15.5s
+[brecq-prop]   step  300  loss=0.047542  rel-err=0.0379  t=23.6s
+[brecq-prop]   step  400  loss=0.045014  rel-err=0.0356  t=30.8s
+[brecq-prop]   step  500  loss=0.042484  rel-err=0.0333  t=38.0s
+[brecq-prop]   block 17 done in 38.0s, rel-err 0.0934 -> 0.0333
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 18/23 === (Fisher sum=1.642, init rel-err=0.0687)
+[brecq-prop]   step  100  loss=0.032956  rel-err=0.0382  t=7.2s
+[brecq-prop]   step  200  loss=0.028107  rel-err=0.0329  t=15.1s
+[brecq-prop]   step  300  loss=0.022026  rel-err=0.0288  t=22.5s
+[brecq-prop]   step  400  loss=0.019766  rel-err=0.0271  t=30.7s
+[brecq-prop]   step  500  loss=0.022917  rel-err=0.0250  t=38.5s
+[brecq-prop]   block 18 done in 38.5s, rel-err 0.0687 -> 0.0250
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 19/23 === (Fisher sum=1.268, init rel-err=0.1080)
+[brecq-prop]   step  100  loss=0.050255  rel-err=0.0487  t=7.8s
+[brecq-prop]   step  200  loss=0.042966  rel-err=0.0438  t=15.1s
+[brecq-prop]   step  300  loss=0.036774  rel-err=0.0397  t=22.7s
+[brecq-prop]   step  400  loss=0.031425  rel-err=0.0363  t=30.0s
+[brecq-prop]   step  500  loss=0.033532  rel-err=0.0345  t=37.8s
+[brecq-prop]   block 19 done in 37.8s, rel-err 0.1080 -> 0.0345
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 20/23 === (Fisher sum=0.911, init rel-err=0.1392)
+[brecq-prop]   step  100  loss=0.094456  rel-err=0.0726  t=7.5s
+[brecq-prop]   step  200  loss=0.060003  rel-err=0.0630  t=15.5s
+[brecq-prop]   step  300  loss=0.048893  rel-err=0.0527  t=23.3s
+[brecq-prop]   step  400  loss=0.038447  rel-err=0.0474  t=30.9s
+[brecq-prop]   step  500  loss=0.041004  rel-err=0.0447  t=38.9s
+[brecq-prop]   block 20 done in 38.9s, rel-err 0.1392 -> 0.0447
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 21/23 === (Fisher sum=0.715, init rel-err=1.7401)
+[brecq-prop]   step  100  loss=0.155059  rel-err=0.2895  t=8.7s
+[brecq-prop]   step  200  loss=0.121961  rel-err=0.1942  t=16.6s
+[brecq-prop]   step  300  loss=0.136743  rel-err=0.2042  t=24.0s
+[brecq-prop]   step  400  loss=0.100140  rel-err=0.1793  t=32.0s
+[brecq-prop]   step  500  loss=0.165509  rel-err=0.1522  t=39.8s
+[brecq-prop]   block 21 done in 39.8s, rel-err 1.7401 -> 0.1522
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 22/23 === (Fisher sum=0.547, init rel-err=0.3547)
+[brecq-prop]   step  100  loss=0.080791  rel-err=0.1838  t=8.3s
+[brecq-prop]   step  200  loss=0.082718  rel-err=0.1457  t=16.4s
+[brecq-prop]   step  300  loss=0.054125  rel-err=0.1334  t=25.6s
+[brecq-prop]   step  400  loss=0.044735  rel-err=0.1102  t=35.3s
+[brecq-prop]   step  500  loss=0.047365  rel-err=0.1015  t=44.0s
+[brecq-prop]   block 22 done in 44.0s, rel-err 0.3547 -> 0.1015
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[brecq-prop] === block 23/23 === (Fisher sum=0.787, init rel-err=0.7795)
+[brecq-prop]   step  100  loss=0.682902  rel-err=0.2633  t=8.5s
+[brecq-prop]   step  200  loss=0.344702  rel-err=0.1841  t=16.9s
+[brecq-prop]   step  300  loss=0.293448  rel-err=0.1651  t=25.9s
+[brecq-prop]   step  400  loss=0.392612  rel-err=0.1828  t=34.2s
+[brecq-prop]   step  500  loss=0.282223  rel-err=0.1613  t=42.7s
+[brecq-prop]   block 23 done in 42.7s, rel-err 0.7795 -> 0.1613
+[brecq-prop] total: 987.4s (41.1s/block)
+[brecq-prop] saving student state_dict -> s4_2_propagated_fixed.student.pt
+[brecq-prop] eval student PPL
+[brecq-prop]   student PPL = 678.973 (4.1s)
+[brecq-prop]   teacher -> student: 12.26 -> 678.97 (55.38x)
+[brecq-prop] saved s4_2_propagated_fixed.json

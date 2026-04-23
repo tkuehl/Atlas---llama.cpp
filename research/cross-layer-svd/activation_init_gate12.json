@@ -1,0 +1,26 @@
+{
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "role": "mlp.gate_proj",
+    "layer": 12,
+    "rank": 512,
+    "calib_samples": 32,
+    "seq_len": 2048
+  },
+  "frobenius_dual_svid": {
+    "frob_rel_err": 0.8243089201453987,
+    "act_rel_err": 0.8823692321238193
+  },
+  "activation_weighted_dual_svid": {
+    "frob_rel_err": 0.8458069493761482,
+    "act_rel_err": 0.9012993757232725
+  },
+  "frobenius_signs_als_scales": {
+    "frob_rel_err": 0.9364765810423809,
+    "act_rel_err": 0.5279305319038003
+  },
+  "sign_agreement_U": 0.5002850984272204,
+  "sign_agreement_V": 0.4999171665736607,
+  "aw_signs_improvement_ratio": 0.9789968304546288,
+  "als_scales_improvement_ratio": 1.6713737486291187
+}

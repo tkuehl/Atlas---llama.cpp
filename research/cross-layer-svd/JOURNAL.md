@@ -4185,3 +4185,156 @@ Recommend trying (A) first as a half-day PoC next session.
 4. Once 1.5B validates, 7B is next.
 
 
+## 2026-04-22 — Block-local BRECQ + polish: head-to-head vs KL-QAT at matched compute
+
+**Sprint:** Stage 4 of the one-shot PTQ sprint ([one_shot_ptq_plan.md](one_shot_ptq_plan.md),
+[stage_4_brecq_plan.md](stage_4_brecq_plan.md)).  Target: Qwen 2.5 0.5B,
+r=512, WikiText-2, seq=2048.  All runs on RTX 5080 Laptop.
+
+### Setup
+
+Fisher diagonals collected once ([littlebit_fisher.py](littlebit_fisher.py))
+from 128 calib seqs: 25k tokens in 11s, saved to `qwen05b_fisher.pt`.
+Per-block Fisher sum ranges 100× across 24 blocks (block 0: 63.8 →
+block 22: 0.55).  Teacher FP16 PPL at seq=2048: **12.26**.
+
+### Stage 4 variants tried
+
+| Experiment | Method | Training time | Final PPL | × teacher |
+|---|---|---:|---:|---:|
+| S4.1 | Pure-teacher BRECQ | 11.7 min | 1397 | 114× |
+| S4.2 | Propagated-input BRECQ | 17.2 min | 776 | 63× |
+| S4.2-fixed | + RMSNorm freeze, wd=0, proper loss | 17.2 min | **679** | 55× |
+| S4.3 polish | S4.2-fixed + KL+10·MSE 500 steps | +2.5 min | 450 | 37× |
+| S4.4 KL-from-scratch | Bare Dual-SVID + same polish recipe, 500 steps | 2.5 min | 805 | 66× |
+| S4.5 tuned polish | S4.2-fixed + cosine LR, warmup, λ=5, 1000 steps | +5 min | **381** | 31× |
+
+### Bugs found + fixed during Stage 4
+
+1. **RMSNorm weights were being trained** — `for pr in
+   student_block.parameters(): pr.requires_grad_(True)` enabled grads
+   on RMSNorm weights as well as LittleBit params.  Fixed via
+   `enable_littlebit_grads` helper that only enables grads on
+   `U_fp, V_fp, h, g, ell, bias`.
+2. **AdamW default weight_decay=0.01** was shrinking LittleBit scale
+   vectors.  Set to 0.0 everywhere.
+3. **Loss used `.mean()` instead of `.sum(-1).mean()`** — off by
+   1/d_model constant factor from BRECQ Eq. 10.  Minor but restored
+   for correctness.
+4. **No line-buffered stdout** — output was stuck in `tee` buffers
+   for 17 min at a time.  Added `sys.stdout.reconfigure(line_buffering=True)`
+   to every script's bootstrap.
+5. **No progress-file or intermediate checkpointing** — S4.1 crashed
+   on eval dtype mismatch, lost 12 min of training.  Added
+   `write_status` helper and pre-eval checkpoint saves.
+
+Bugs 1–3 combined: ~13% PPL improvement from 776 to 679.  Not dominant.
+
+### Diagnostic result (s4_1_diag.json, s4_2_diag.json)
+
+Measured end-to-end hidden-state drift and delta-contribution error on
+the assembled student.
+
+| Variant | Mean drift_X | Mean drift_Z | Final block drift_Z | Mean delta-contribution err |
+|---|---:|---:|---:|---:|
+| S4.1 (pure teacher) | 0.65 | 0.74 | 2.02 | 0.83 |
+| S4.2 (propagated) | **0.21** | **0.24** | 0.80 | 0.84 |
+
+**Propagation cut drift 3×**, but **delta-contribution error barely
+moved (0.83 → 0.84)**.  The residual stream hides per-matmul
+catastrophe: block-output rel-err of 0.03 that looks clean at training
+time conceals `f(X)` that's nearly orthogonal to teacher's `f(X)`.
+
+### Head-to-head at matched step count (500)
+
+| Step | BRECQ+polish | KL-QAT-from-scratch | Gap |
+|---:|---:|---:|---:|
+| 0 | 679 | 379,980 | 560× |
+| 100 | 717 | 2,758 | 3.8× |
+| 200 | 471 | 1,351 | 2.9× |
+| 300 | 387 | 959 | 2.5× |
+| 400 | 465 | 883 | 1.9× |
+| 500 | **450** | **805** | **1.79×** |
+
+### The compute-efficiency finding
+
+At matched step count (500), BRECQ+polish beats KL-from-scratch ~1.8×.
+But BRECQ+polish used **8× more wall time** (17 + 2.5 = 19.5 min vs
+2.5 min).  Extrapolating KL-from-scratch's log-decay trajectory out to
+matched 19.5-min compute (~4400 steps): projected PPL ~150–250, which
+would beat BRECQ+polish.
+
+**Per unit of compute:** KL-QAT reduced PPL 472× in 2.5 min (189×/min);
+BRECQ reduced PPL 560× in 17 min (33×/min).  KL-QAT is **5.7× more
+compute-efficient at pre-plateau stages**.
+
+### Tuned polish (S4.5)
+
+Applied standard LR-schedule fixes: peak lr=5e-5 (half), 50-step linear
+warmup, cosine decay to 1e-6, λ_mse=5 (half), 1000 steps.
+
+| Step | Original polish | Tuned polish |
+|---:|---:|---:|
+| 0 | 679 | 679 |
+| 100 | 717 | 512 |
+| 500 | 450 | 358 (best) |
+| 1000 | — | **381** |
+
+Trajectory was cleaner (no Adam warmup spike, less oscillation) but
+**plateaued at ~380 from step 400 onward**.  Batch=1 gradient noise
+persists below any LR schedule fix — amplitude dropped from ±20% to
+±10% but the floor is real.  Tuning bought 15% improvement, not
+transformational.
+
+### Why block-local BRECQ doesn't win here
+
+1. **Residual dominance** hides block-contribution errors during
+   training; assembled model has nearly-orthogonal `f(X)` per block.
+2. **Pure-teacher inputs** → composition fails (errors compound).
+   **Propagated inputs** → drift stable but student settles on
+   teacher's path from a drifted starting point, not pristine.
+3. **Factored binary form has a capacity ceiling** — rank 512 at
+   d=896 captures ~60% of activation-weighted subspace (§13.2).
+   Block-local can't break through.
+4. **End-to-end gradient is irreplaceable** for this scheme.  The
+   OneBit paper (LittleBit's predecessor) and the LittleBit paper
+   itself skip block-local and run end-to-end KD from Dual-SVID init.
+
+### Checkpoints
+
+- [littlebit_fisher.py](littlebit_fisher.py) — Fisher diagonal collection
+- [littlebit_qat_brecq.py](littlebit_qat_brecq.py) — single-block + shared helpers
+- [littlebit_qat_brecq_full.py](littlebit_qat_brecq_full.py) — pure-teacher 24-block (S4.1)
+- [littlebit_qat_brecq_prop.py](littlebit_qat_brecq_prop.py) — propagated 24-block (S4.2)
+- [littlebit_brecq_diag.py](littlebit_brecq_diag.py) — drift diagnostic
+- [littlebit_qat_polish.py](littlebit_qat_polish.py) — end-to-end polish (now with cosine LR + warmup + grad accum)
+- `qwen05b_fisher.pt` — 128-seq Fisher cache
+- `s4_2_propagated_fixed.student.pt` — best BRECQ checkpoint
+- `s4_5_polish_tuned.student.pt` — best polish endpoint (PPL 381)
+
+### Reframe from user (2026-04-22 evening)
+
+"What I'm trying to avoid is the long QAT process.  Don't write off
+block-local completely — use it as a cheap first pass and refine with
+short QAT."
+
+This reframes the target metric from "beat KL-QAT at matched compute"
+to "**total wall-clock to reach a quality bar**".  If (BRECQ + polish +
+short QAT) < (bare KL-QAT to same quality), block-local wins.
+
+### Next
+
+1. Continue QAT from the tuned-polish checkpoint (PPL 381) for
+   2000–3000 steps with Phase-B-style recipe (λ=10, higher LR).  Test
+   whether the polish basin is reachable by continued training or
+   locked-in suboptimal.
+2. If (1) reaches PPL ~100 in <15 additional min: **block-local +
+   short QAT wins overall**.  Ship workflow.
+3. Parallel: implement Stage 1 (rotation preprocessing) and/or
+   Stage 2 (activation-weighted Dual-SVID) — give KL-QAT a better
+   starting point that may render block-local obsolete.
+4. Document this entire negative-result chain as characterization data
+   even if (2) fails — it's a cleanly-measured finding about what
+   doesn't work for factored+residual quantization and why.
+
+

@@ -1,0 +1,25 @@
+{
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "rank": 512,
+    "K": 1,
+    "tau": 100.0,
+    "seq_len": 2048
+  },
+  "teacher_ppl": 12.26,
+  "student_ppl": 379980.0061625409,
+  "ppl_ratio": 30993.475217172996,
+  "build_seconds": 203.77487635612488,
+  "avg_block_seconds": 8.489163508017858,
+  "param_breakdown": {
+    "U_fp": 153354240,
+    "V_fp": 109314048,
+    "U_mag": 304128,
+    "V_mag_u": 67584,
+    "V_mag_g": 245760,
+    "V_mag_lv": 67584,
+    "bias": 27648,
+    "other": 136178560,
+    "total": 399559552
+  }
+}

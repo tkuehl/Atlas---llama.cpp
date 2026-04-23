@@ -1,0 +1,58 @@
+[
+  {
+    "K": 1,
+    "frob_rel_err": 0.8243089201453987,
+    "act_rel_err": 0.8823692321238193,
+    "extra_bits_per_weight_vs_K1": 0.0,
+    "tag": "K=1"
+  },
+  {
+    "K": 2,
+    "frob_rel_err": 0.8143654589975491,
+    "act_rel_err": 0.695595196223226,
+    "extra_bits_per_weight_vs_K1": 0.04981203007518797,
+    "tag": "K=2"
+  },
+  {
+    "K": 4,
+    "frob_rel_err": 0.8079835319099019,
+    "act_rel_err": 0.6346678761517203,
+    "extra_bits_per_weight_vs_K1": 0.14943609022556392,
+    "tag": "K=4"
+  },
+  {
+    "K": 8,
+    "frob_rel_err": 0.7996739540032902,
+    "act_rel_err": 0.5897108945333436,
+    "extra_bits_per_weight_vs_K1": 0.34868421052631576,
+    "tag": "K=8"
+  },
+  {
+    "K": 16,
+    "frob_rel_err": 0.7860038216138674,
+    "act_rel_err": 0.5367616895834764,
+    "extra_bits_per_weight_vs_K1": 0.7471804511278195,
+    "tag": "K=16"
+  },
+  {
+    "K": 32,
+    "frob_rel_err": 0.7621618183366924,
+    "act_rel_err": 0.5028570029565322,
+    "extra_bits_per_weight_vs_K1": 1.544172932330827,
+    "tag": "K=32"
+  },
+  {
+    "K": 64,
+    "frob_rel_err": 0.7213586930462834,
+    "act_rel_err": 0.45684669568666336,
+    "extra_bits_per_weight_vs_K1": 3.138157894736842,
+    "tag": "K=64"
+  },
+  {
+    "K": 512,
+    "frob_rel_err": 0.41642045837520225,
+    "act_rel_err": 0.2472711098540811,
+    "extra_bits_per_weight_vs_K1": 25.45394736842105,
+    "tag": "UPPER_BOUND"
+  }
+]

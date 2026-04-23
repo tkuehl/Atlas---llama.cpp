@@ -1,0 +1,10 @@
+{
+  "phase": "training",
+  "steps_total": 500,
+  "steps_done": 500,
+  "elapsed_s": 149.42878460884094,
+  "init_ppl": 379980.0061625409,
+  "teacher_ppl": 12.259979441248724,
+  "latest_ppl": 804.9882114141606,
+  "latest_loss": 22.08799171447754
+}

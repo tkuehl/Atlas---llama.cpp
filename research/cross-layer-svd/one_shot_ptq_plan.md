@@ -275,8 +275,16 @@ contract follows the [model_prep_pipeline.md](model_prep_pipeline.md)
 ### Stage 4 — BRECQ-style block reconstruction
 
 - **Requires:** Stage 2 + optional Stage 3 init.
-- **Produces:** Optimized `(h_l, g_l, ℓ_l)` per layer, optionally also
-  learnable clipping / smoothing of the sign function.
+- **Produces:** Optimized `(U_fp, V_fp, h_l, g_l, ℓ_l)` per layer
+  under relaxed-signs configuration.
+- **Design choices (locked 2026-04-22):**
+  - **Signs:** relaxed. `U_fp, V_fp` remain learnable via SmoothSign
+    at reduced LR; scales `(h, g, ℓ)` also learnable.
+  - **Block input:** pure teacher. `X_b^teacher` loaded from cache,
+    never propagated from student predecessor output.
+  - **Parameter scope within block:** joint. All 7 linears
+    (q, k, v, o, gate, up, down) of a Qwen block trained
+    simultaneously against the single block-output loss.
 - **Method:** For each transformer block `b = 1..B`:
   - Input: FP32 teacher activation `X_b^teacher` from calibration data.
   - Target: FP32 teacher block output `Z_b^teacher`.
@@ -284,11 +292,12 @@ contract follows the [model_prep_pipeline.md](model_prep_pipeline.md)
   - Objective (Fisher-weighted, BRECQ Eq. 10 adapted):
     `min 𝔼[(Z_b^student − Z_b^teacher)ᵀ diag(f_b) (Z_b^student − Z_b^teacher)]`
     where `f_b = (∂L/∂z_b)²` is the empirical Fisher diagonal.
-  - Gradient scope: scale vectors `(h, g, ℓ)` only. Signs frozen
-    (AdaRound-analog). Optional: learnable Λ if Stage 1 didn't ship.
+  - Gradient scope: all 7 block linears' `(U_fp, V_fp, h, g, ℓ)`.
+    Norms, embeddings, LM head frozen at FP16.
   - Optimizer: AdamW, ~500–1000 steps per block.
 - **Cost estimate:** ~1–3 min per block. 24 blocks × 2 min = ~50 min on 0.5B.
   ~3 hours on 7B (extrapolated linearly by block count).
+- **Detailed plan:** See `stage_4_brecq_plan.md` (to be written).
 
 ### Stage 5 — Heterogeneous rank allocation (Fisher-weighted)
 

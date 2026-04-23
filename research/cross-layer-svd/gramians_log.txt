@@ -1,0 +1,20 @@
+[gram] loading Qwen/Qwen2.5-0.5B (bfloat16)...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 21503.93it/s]
+[gram]   loaded in 3.9s
+[gram] 168 linear layers across 24 blocks
+[gram] calibrating: 128 samples, seq_len=2048
+[gram]   16/128  (2.9 samp/s, 3408 tokens)
+[gram]   32/128  (3.0 samp/s, 6353 tokens)
+[gram]   48/128  (3.1 samp/s, 8434 tokens)
+[gram]   64/128  (3.1 samp/s, 10944 tokens)
+[gram]   80/128  (3.1 samp/s, 13551 tokens)
+[gram]   96/128  (3.1 samp/s, 17664 tokens)
+[gram]   112/128  (3.1 samp/s, 21381 tokens)
+[gram]   128/128  (3.1 samp/s, 25295 tokens)
+[gram] 128 samples / 25295 tokens in 41.4s
+[gram] sanity: Gramian shapes present:
+[gram]   (896, 896)  e.g. model.layers.0.self_attn.q_proj  trace=1.13e+01
+[gram]   (4864, 4864)  e.g. model.layers.0.mlp.down_proj  trace=5.15e+01
+[gram] saved qwen05b_gramians.pt  (168 Gramians)

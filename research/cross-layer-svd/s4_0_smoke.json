@@ -1,0 +1,56 @@
+{
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "block": 12,
+    "rank": 512,
+    "steps": 25,
+    "lr": 0.001,
+    "tau": 100.0,
+    "calib_samples": 32,
+    "seq_len": 2048,
+    "batch_size": 1,
+    "ablation_scales_only": false
+  },
+  "init_block_rel_err": 0.044033493380993605,
+  "final_block_rel_err": 0.03904532780870795,
+  "total_train_seconds": 1.4549927711486816,
+  "fisher_sum_at_block": 4.9183430671691895,
+  "history": [
+    {
+      "step": 0,
+      "loss": null,
+      "block_rel_err": 0.044033493380993605,
+      "elapsed_s": 0.0
+    },
+    {
+      "step": 5,
+      "loss": 0.0001672756188781932,
+      "block_rel_err": 0.042322095949202776,
+      "elapsed_s": 0.41374969482421875
+    },
+    {
+      "step": 10,
+      "loss": 0.00016800855519250035,
+      "block_rel_err": 0.04106856323778629,
+      "elapsed_s": 0.6583583354949951
+    },
+    {
+      "step": 15,
+      "loss": 0.00013504928210750222,
+      "block_rel_err": 0.041008477099239826,
+      "elapsed_s": 0.9301145076751709
+    },
+    {
+      "step": 20,
+      "loss": 0.0001534708426333964,
+      "block_rel_err": 0.04044605139642954,
+      "elapsed_s": 1.2049667835235596
+    },
+    {
+      "step": 25,
+      "loss": 0.00014874683984089643,
+      "block_rel_err": 0.03904532780870795,
+      "elapsed_s": 1.454955816268921
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+[polish] loading teacher Qwen/Qwen2.5-0.5B
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 19942.42it/s]
+[polish] rebuilding student architecture  (multi-rank K=2)
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 15244.37it/s]
+[polish] loading checkpoint s6_0_mr_K2.student.pt
+[polish] trainable params: 264066048 across 1080 tensors
+[polish]         U_fp:    153354240 (58.07%)
+[polish]         V_fp:    109314048 (41.40%)
+[polish]        U_mag:       608256 ( 0.23%)
+[polish]      V_mag_g:       491520 ( 0.19%)
+[polish]      V_mag_u:       135168 ( 0.05%)
+[polish]     V_mag_lv:       135168 ( 0.05%)
+[polish]        .bias:        27648 ( 0.01%)
+[polish]   loaded in 207.1s
+[polish] preparing calibration pool
+[polish]   32 sequences
+[bench] teacher PPL cache hit: Qwen/Qwen2.5-0.5B @ seq=2048,tokens=25000,wikitext-2-raw-v1-test = 12.260
+[polish] eval student PPL at init (pre-polish)
+Token indices sequence length is longer than the specified maximum sequence length for this model (298938 > 131072). Running this sequence through the model will result in indexing errors
+[polish]   student PPL at init = 1519921.682 (123974.04x)
+[polish] training: 1000 steps, lr=5e-05, λ_mse=5.0
+[polish]   step   50  loss=57.0908 (kl=4.9931 mse=10.4195)  lr=5.00e-05  t=14.6s
+[polish]   step  100  loss=42.7706 (kl=4.2910 mse=7.6959)  lr=4.97e-05  t=28.2s
+[polish]     PPL at step 100 = 1886.921 (153.91x)
+[polish]   step  150  loss=28.8165 (kl=4.4721 mse=4.8689)  lr=4.87e-05  t=46.4s
+[polish]   step  200  loss=15.7273 (kl=4.0418 mse=2.3371)  lr=4.70e-05  t=60.8s
+[polish]     PPL at step 200 = 1338.959 (109.21x)
+[polish]   step  250  loss=14.0201 (kl=3.4900 mse=2.1060)  lr=4.48e-05  t=80.0s
+[polish]   step  300  loss=12.8097 (kl=3.3444 mse=1.8931)  lr=4.21e-05  t=93.2s
+[polish]     PPL at step 300 = 947.090 (77.25x)
+[polish]   step  350  loss=15.9978 (kl=3.0475 mse=2.5901)  lr=3.89e-05  t=112.2s
+[polish]   step  400  loss=10.4353 (kl=2.3904 mse=1.6090)  lr=3.53e-05  t=126.5s
+[polish]     PPL at step 400 = 891.791 (72.74x)
+[polish]   step  450  loss=13.2951 (kl=2.6570 mse=2.1276)  lr=3.15e-05  t=145.4s
+[polish]   step  500  loss=12.0658 (kl=2.3986 mse=1.9334)  lr=2.75e-05  t=159.1s
+[polish]     PPL at step 500 = 698.365 (56.96x)
+[polish]   step  550  loss=12.3456 (kl=2.9117 mse=1.8868)  lr=2.35e-05  t=177.9s
+[polish]   step  600  loss=12.7255 (kl=2.8324 mse=1.9786)  lr=1.95e-05  t=192.3s
+[polish]     PPL at step 600 = 701.950 (57.26x)
+[polish]   step  650  loss=9.5385 (kl=2.0300 mse=1.5017)  lr=1.57e-05  t=211.5s
+[polish]   step  700  loss=9.2472 (kl=1.4605 mse=1.5573)  lr=1.21e-05  t=225.2s
+[polish]     PPL at step 700 = 664.357 (54.19x)
+[polish]   step  750  loss=8.8587 (kl=1.3981 mse=1.4921)  lr=8.91e-06  t=243.5s
+[polish]   step  800  loss=8.3280 (kl=1.4477 mse=1.3761)  lr=6.17e-06  t=257.8s
+[polish]     PPL at step 800 = 621.178 (50.67x)
+[polish]   step  850  loss=8.2834 (kl=1.3526 mse=1.3862)  lr=3.95e-06  t=276.8s
+[polish]   step  900  loss=7.7073 (kl=1.5738 mse=1.2267)  lr=2.33e-06  t=290.4s
+[polish]     PPL at step 900 = 609.364 (49.70x)
+[polish]   step  950  loss=9.3998 (kl=1.3222 mse=1.6155)  lr=1.33e-06  t=309.3s
+[polish]   step 1000  loss=8.2290 (kl=1.6721 mse=1.3114)  lr=1.00e-06  t=323.9s
+[polish]     PPL at step 1000 = 632.005 (51.55x)
+[polish] training done in 328.6s
+[polish] saving -> s6_2_polish_on_mrK2.student.pt
+[polish] final eval
+[polish] final student PPL = 632.005 (51.55x)
+[polish] trajectory: init 1519921.68 -> final 632.01 (reduction 2404.92x)
+[polish] saved s6_2_polish_on_mrK2.json

@@ -1,0 +1,252 @@
+[polish] loading teacher Qwen/Qwen2.5-0.5B
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 20455.20it/s]
+[polish] rebuilding student LittleBit architecture
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 18210.17it/s]
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+  converting 7 linear layers to LittleBit:
+    self_attn.q_proj: (896, 896) r=512
+    self_attn.k_proj: (896, 128) r=128
+    self_attn.v_proj: (896, 128) r=128
+    self_attn.o_proj: (896, 896) r=512
+    mlp.gate_proj: (896, 4864) r=512
+    mlp.up_proj: (896, 4864) r=512
+    mlp.down_proj: (4864, 896) r=512
+[polish] loading checkpoint s4_5_polish_tuned.student.pt
+[polish] trainable params: 263313408 across 912 tensors
+[polish]   loaded in 206.6s
+[polish] preparing calibration pool
+[polish]   32 sequences
+[polish] eval teacher PPL
+Token indices sequence length is longer than the specified maximum sequence length for this model (298938 > 131072). Running this sequence through the model will result in indexing errors
+[polish]   teacher PPL = 12.260
+[polish] eval student PPL at init (pre-polish)
+[polish]   student PPL at init = 381.182 (31.09x)
+[polish] training: 1500 steps, lr=0.0001, λ_mse=10.0
+[polish]   step   50  loss=7.9027 (kl=0.7828 mse=0.7120)  lr=5.00e-05  t=25.9s
+[polish]   step  100  loss=12.8704 (kl=1.5438 mse=1.1327)  lr=1.00e-04  t=51.6s
+[polish]   step  150  loss=9.1884 (kl=0.8884 mse=0.8300)  lr=9.97e-05  t=78.0s
+[polish]   step  200  loss=8.2811 (kl=0.8284 mse=0.7453)  lr=9.88e-05  t=103.9s
+[polish]     PPL at step 200 = 503.553 (41.07x)
+[polish]   step  250  loss=10.2237 (kl=0.9589 mse=0.9265)  lr=9.72e-05  t=133.3s
+[polish]   step  300  loss=10.9814 (kl=0.9083 mse=1.0073)  lr=9.51e-05  t=167.7s
+[polish]   step  350  loss=7.6257 (kl=0.5594 mse=0.7066)  lr=9.24e-05  t=202.2s
+[polish]   step  400  loss=7.3882 (kl=0.5991 mse=0.6789)  lr=8.92e-05  t=235.4s
+[polish]     PPL at step 400 = 367.057 (29.94x)
+[polish]   step  450  loss=8.1970 (kl=0.8312 mse=0.7366)  lr=8.55e-05  t=265.8s
+[polish]   step  500  loss=8.1053 (kl=0.6958 mse=0.7409)  lr=8.14e-05  t=290.3s
+[polish]   step  550  loss=6.0749 (kl=0.4503 mse=0.5625)  lr=7.68e-05  t=315.6s
+[polish]   step  600  loss=5.7063 (kl=0.5324 mse=0.5174)  lr=7.20e-05  t=341.0s
+[polish]     PPL at step 600 = 395.092 (32.23x)
+[polish]   step  650  loss=6.5696 (kl=0.4045 mse=0.6165)  lr=6.68e-05  t=370.2s
+[polish]   step  700  loss=9.2483 (kl=0.6484 mse=0.8600)  lr=6.15e-05  t=396.0s
+[polish]   step  750  loss=5.7211 (kl=0.4479 mse=0.5273)  lr=5.60e-05  t=421.8s
+[polish]   step  800  loss=5.8864 (kl=0.4184 mse=0.5468)  lr=5.05e-05  t=447.4s
+[polish]     PPL at step 800 = 397.629 (32.43x)
+[polish]   step  850  loss=5.5875 (kl=0.4348 mse=0.5153)  lr=4.50e-05  t=477.0s
+[polish]   step  900  loss=5.3740 (kl=0.3436 mse=0.5030)  lr=3.95e-05  t=502.5s
+[polish]   step  950  loss=5.0608 (kl=0.3155 mse=0.4745)  lr=3.42e-05  t=528.7s
+[polish]   step 1000  loss=4.5472 (kl=0.3476 mse=0.4200)  lr=2.90e-05  t=554.7s
+[polish]     PPL at step 1000 = 376.575 (30.72x)
+[polish]   step 1050  loss=5.9687 (kl=0.3551 mse=0.5614)  lr=2.42e-05  t=586.2s
+[polish]   step 1100  loss=6.8495 (kl=0.3986 mse=0.6451)  lr=1.96e-05  t=611.3s
+[polish]   step 1150  loss=4.4230 (kl=0.2022 mse=0.4221)  lr=1.55e-05  t=637.5s
+[polish]   step 1200  loss=4.8673 (kl=0.2743 mse=0.4593)  lr=1.18e-05  t=663.5s
+[polish]     PPL at step 1200 = 398.393 (32.50x)
+[polish]   step 1250  loss=4.7914 (kl=0.3209 mse=0.4470)  lr=8.59e-06  t=692.8s
+[polish]   step 1300  loss=4.8740 (kl=0.2605 mse=0.4614)  lr=5.90e-06  t=718.4s
+[polish]   step 1350  loss=4.4887 (kl=0.2423 mse=0.4246)  lr=3.78e-06  t=744.1s
+[polish]   step 1400  loss=4.1659 (kl=0.2701 mse=0.3896)  lr=2.24e-06  t=770.1s
+[polish]     PPL at step 1400 = 392.320 (32.00x)
+[polish]   step 1450  loss=5.2178 (kl=0.2350 mse=0.4983)  lr=1.31e-06  t=800.0s
+[polish]   step 1500  loss=5.9463 (kl=0.2783 mse=0.5668)  lr=1.00e-06  t=825.0s
+[polish] training done in 825.0s
+[polish] saving -> s4_6_qat_refine.student.pt
+[polish] final eval
+[polish] final student PPL = 393.326 (32.08x)
+[polish] trajectory: init 381.18 -> final 393.33 (reduction 0.97x)
+[polish] saved s4_6_qat_refine.json

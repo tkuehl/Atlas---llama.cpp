@@ -1,0 +1,87 @@
+{
+  "Qwen/Qwen2.5-0.5B": {
+    "teacher_ppl": {
+      "seq=2048,tokens=25000,wikitext-2-raw-v1-test": 12.26,
+      "seq=512,tokens=25000,wikitext-2-raw-v1-test": 16.4,
+      "seq=512,tokens=250000,wikitext-2-raw-v1-test": 17.3
+    },
+    "known_results": {
+      "s15_kl_qat_8000_steps": {
+        "ppl": 83.3,
+        "seq_len": 512,
+        "notes": "KL-only full-model QAT from bare Dual-SVID, 8000 steps, full-test 250k tokens. Generation degenerate despite the PPL; see littlebit_math.md \u00a715."
+      },
+      "phase_b_kl_plus_mse": {
+        "ppl": 76.8,
+        "seq_len": 512,
+        "notes": "KL + 10*MSE end-to-end QAT, 20000 steps (pre-Sprint-0). 88.5% hidden-state capture, sentence-level loop generation."
+      },
+      "dual_svid_init_no_training": {
+        "ppl": 379980.0,
+        "seq_len": 2048,
+        "notes": "Bare Dual-SVID init, no training. Measured in s4_4_klqat_from_scratch at step 0."
+      },
+      "s4_1_pure_teacher_brecq": {
+        "ppl": 1397.6,
+        "seq_len": 2048,
+        "notes": "24-block BRECQ with pure-teacher inputs, 500 steps/block, RMSNorm bug present. 11.7 min wall time."
+      },
+      "s4_2_propagated_brecq_unfixed": {
+        "ppl": 775.65,
+        "seq_len": 2048,
+        "notes": "24-block BRECQ with propagated inputs, 500 steps/block, RMSNorm bug + wd=0.01 + wrong-scale loss. 17.2 min."
+      },
+      "s4_2_propagated_brecq_fixed": {
+        "ppl": 678.97,
+        "seq_len": 2048,
+        "notes": "BRECQ propagated with RMSNorm freeze + wd=0 + .sum(-1).mean() loss. 17.2 min."
+      },
+      "s4_3_polish_on_fixed_500_steps": {
+        "ppl": 450.2,
+        "seq_len": 2048,
+        "notes": "Polish on s4_2_propagated_fixed, KL + 10*MSE, lr=1e-4 flat, 500 steps. Best intermediate 387 at step 300."
+      },
+      "s4_4_klqat_from_scratch_500_steps": {
+        "ppl": 805.0,
+        "seq_len": 2048,
+        "notes": "KL QAT from bare Dual-SVID, same polish recipe, 500 steps. 2.5 min."
+      },
+      "s4_5_polish_tuned_1000_steps": {
+        "ppl": 381.18,
+        "seq_len": 2048,
+        "notes": "Polish on s4_2_propagated_fixed, lr=5e-5 cosine+warmup, lambda=5, 1000 steps. Plateau at ~380."
+      },
+      "s4_6_qat_refine_1500_steps": {
+        "ppl": 393.33,
+        "seq_len": 2048,
+        "notes": "Warm restart from s4_5 at lr=1e-4, lambda=10, grad_accum=2, 1500 steps. Final slightly WORSE than init (381 -> 393). Confirms PPL 380 is the floor from this init."
+      },
+      "s5_0_refined_init_no_training": {
+        "ppl": 500360.9,
+        "seq_len": 2048,
+        "notes": "Full-model activation-weighted ALS scale refinement, Frobenius signs frozen, 15 iters per linear. 230s build time. WORSE than bare Dual-SVID (380k). Scale refinement optimizes per-matrix at teacher activation distribution; fails to compose and over-fits away from student inference distribution."
+      },
+      "s5_1_polish_on_refined_diverged": {
+        "ppl_step_100": 2729.8,
+        "ppl_step_200": 45503.7,
+        "seq_len": 2048,
+        "notes": "Polish (lr=5e-5 cosine+warmup, lambda=5) from s5_0 refined init. Step 100 matched bare init's s4_4 trajectory, step 200 catastrophically diverged (polish unstable on refined-init scales). Killed at step 200. Refined init's unusual scale magnitudes incompatible with polish optimizer."
+      },
+      "s6_0_mr_K2_no_training": {
+        "ppl": 1519921.68,
+        "seq_len": 2048,
+        "notes": "Multi-rank-magnitude Dual-SVID init with K=2 (rank-2 SVD approx of |Up|, |Vp|). Single-matrix activation rel-err on gate_proj L12 improved 0.88->0.70 (27% better). BUT end-to-end init PPL is 4x WORSE than bare Dual-SVID (1.52M vs 380k). Diagnostic: max per-row norm of reconstructed W is 55% larger at K=2 vs K=1 (1.27 vs 0.82). K=2's sharper reconstruction has larger outlier entries that amplify through the residual stream."
+      },
+      "s6_1_mr_K1_sanity": {
+        "ppl": 379980.0,
+        "seq_len": 2048,
+        "notes": "Multi-rank class at K=1 should be numerically identical to bare Dual-SVID. Confirmed: PPL 379980.006 exactly matches bare (379980.006). No bug in multi-rank forward path; K=2 regression is structural not implementational."
+      }
+    }
+  },
+  "Qwen/Qwen2.5-1.5B": {
+    "teacher_ppl": {
+      "seq=2048,tokens=25000,wikitext-2-raw-v1-test": 8.53833293978661
+    }
+  }
+}
