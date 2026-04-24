@@ -1061,3 +1061,411 @@ noisy student input path) can't push below the floor.
 ### Next
 
 Implement TuneScalesKD (Phase 3) per paper spec.
+
+---
+
+## 2026-04-24 — Paper vs implementation audit (mid-Fisher+late-block run)
+
+Best result so far: Fisher-weighted MSE full pipeline, Qwen3-0.6B r=512 at Phase 3 step 500 → **PPL 135.20**. Paper claims 27.56 at the same bpw — ~5× gap. Triggered a structured audit comparing arXiv 2602.06694v1 PDF against our code. Findings ranked by likely contribution to the gap:
+
+### Deviations to fix (actionable)
+
+1. **Wrong target for TuneFP and STE (HIGH).** Paper Algorithm 1 lines 8–9 computes `Y ← B*_b(X)` fresh each block, where X is the student-side partially-quantized input. We use the cached teacher→teacher boundary at `phase2.py:171` (`Y_b = cache.load_boundary(b + 1)`). The comment there claiming "loss would be trivially zero" is wrong — the block is still FP at TuneFP start, so `block(X_student)` ≠ `B*_b(X_student)` exactly because X_student carries upstream drift. This breaks Step 1's error-propagation-mitigation objective and Step 3 STE's Eq. 10 simultaneously.
+   **Fix:** recompute `Y_b = FP_block(X_student)` (detached snapshot) before TuneFP starts each block, and reuse that snapshot for STE too.
+
+2. **TuneFP runs 4× too long (HIGH).** Appendix C says 8 epochs, batch=4, n=128 → 256 steps. We run `--tune-fp-steps 1024` = 32 epochs. Overtraining likely drifts FP weights away from the point LB-ADMM can cleanly sign.
+   **Fix:** default `--tune-fp-steps` to n_calib * 8 / batch = 256 (derive from other args).
+
+3. **TuneFP trains RMSNorm weights (MEDIUM-HIGH).** `tune_fp.py:134-136` unfreezes every block parameter. Paper's "full-precision weights" in standard PTQ lineage means Linear weights only — RMSNorm/LayerNorm shouldn't move. Our own `feedback_ste_training_gotchas` memory already flagged this exact failure mode in a prior sprint.
+   **Fix:** filter to `nn.Linear` weights only, like `quant_params` does for the STE step.
+
+4. **Fisher ≠ paper's weighted MSE (MEDIUM).** Paper's weighted MSE cites DBF (Boža & Macko 2025) which uses `‖D_out · (Y_t − Y_s)‖_F²` — the same D_out we already compute in `preconditioner.py`. Our `fisher_diag.py` computes `E[(∂L_CE/∂h_b)²]` at the residual-stream level, on a different axis (d_model vs d_out of each Linear). One-line reuse replaces a full backward pass.
+   **Fix:** retire `fisher_diag.py`; in TuneFP/STE loss, weight each Linear's output-contribution by its `D_out`.
+
+5. **ρ schedule endpoints unverified (MEDIUM).** Paper only says "linear schedule, K=400" — no values. Our `rho_start=0.1 rho_end=10.0` in `admm.py` are guesses. Thm 3 in the paper requires ρ > L_f, and L_f scales with `τ_max²·‖W‖₂` (Corollary 2) — `ρ_start=0.1` is probably below the threshold early on.
+   **Fix:** sweep ρ endpoints, or compute a data-driven lower bound from the first-iteration residual.
+
+6. **RobustDiag uses single-shot percentile (LOW-MEDIUM).** Paper (Appx B.2 Lemma 1) specifies `τ_t = max(τ_{t-1}, q_t)` — cumulative-max across calibration forward. We use one-shot `torch.quantile` at `preconditioner.py:203-206`. Our comment acknowledges the simplification. Likely minor.
+   **Fix:** optional, low priority.
+
+### Non-deviations (confirmed matching)
+
+- KL direction: `F.kl_div(log_s, log_t, log_target=True)` = `KL(teacher ‖ student)` = paper's Eq. 11.
+- STE clipped-identity `|x|<1`: not specified in paper, matches cited baselines (LittleBit, OneBit, DBF).
+- Rank uniform across Linears: matches paper's Figure 2 / Table convention.
+- Quantization scope: Linears under `.layers` only (embed + lm_head skipped) matches paper Section 3.
+- Calibration: 128 × 2048 WikiText-2 train seed=0 matches Appx C.
+- Cosine LR schedule with unspecified `eta_min` — we use `lr*0.1`; paper unspecified, inconsequential.
+
+### Instrumentation to add: block-level KL
+
+**Why:** Our Phase 2 block-MSE data shows late blocks accumulate error at ~25% per-block TuneFP absorption. But MSE isn't the thing we care about — it's the *effect on the teacher-vs-student logit KL*. We can run a per-block ablation: with the full quantized student, restore block `b`'s FP weights (or zero out its quantization delta) and measure the KL change. This tells us which blocks are actually load-bearing for global quality.
+
+**How:**
+- Script: `diag_block_kl.py` (new file).
+- For each block 0..N-1: save current quantized state → restore FP weights for block b only → forward on 32 calibration samples → KL against teacher → restore quantized → next.
+- Output: a tensor `dkl_per_block[b]` = (KL with block b FP) − (KL with everything quantized). Negative = that block was hurting KL; the more negative, the more hurt it caused.
+- Cost: N+1 forwards × 32 samples × seq=2048 ≈ 5 min on 0.6B.
+
+**Uses:**
+- Cross-reference with Phase 2 block-MSE: do blocks with high MSE actually dominate KL, or is the error surprisingly distributed?
+- Decide if late-block lever is targeting the right blocks.
+- Decide if mid-block dynamic rank (higher rank for load-bearing blocks) is worth implementing.
+
+### Priorities
+
+The audit suggests the gap is mostly fixable. Order of attack once the current Fisher+late-block run completes:
+
+1. Fix TuneFP/STE target (#1) — cheap, probably biggest single win.
+2. Cut TuneFP steps to 256 (#2) — cheap, frees ~75% of Phase 2 time for more runs.
+3. Freeze RMSNorm in TuneFP (#3) — one-liner.
+4. Add block-level KL diagnostic — informs whether late-block lever is worthwhile at all.
+5. Swap Fisher for D_out-weighted MSE (#4) — retires a bespoke file for one-line reuse.
+6. ρ-endpoint sweep (#5) — lower priority.
+
+If the current run lands near Fisher-only's 135.20 — as expected given #1/#2 are unchanged — it confirms the audit reading: our current lever additions can't beat the target-mismatch ceiling. Fixing #1 should be the next run.
+
+---
+
+## 2026-04-24 (later) — Three post-audit experiments. All killed. Audit vindicated.
+
+Three back-to-back runs under the same unfixed pipeline (target-mismatch + 4× overtrained TuneFP still present). Goal was A/B testing the levers we'd already shipped (Fisher, late-block, lr adjustment, save-best-KL). Result: **none of them beat Fisher-only's PPL 135.20, and the signals strongly suggest no lever built on top of the current pipeline can**.
+
+### Save-best-KL landed first
+
+- `tune_scales_kd.py` now tracks a 50-step windowed mean of per-step KL, saves to `*.phase3_best.pt` on new min. Throttled to `log_every` cadence so I/O stays bounded.
+- `TuneScalesKDStats` gained `best_windowed_kl`, `best_step`.
+- Trace JSON and results-log `method.params` reflect both.
+
+### Experiment 1: Phase-3-only lr=3e-7 resume (killed at step ~100)
+
+Motivated by my earlier (wrong) story that the baseline and Fisher runs were overshooting their best KL. Resumed from Fisher's `post_phase2.pt`, dropped lr 1e-6 → 3e-7, turned on save-best. At step 91:
+
+- Best windowed-mean KL: **7276.59** — significantly *worse* than prior Fisher at matched step 100 (windowed mean 6814).
+- Per-step KL range 6055-8368 across last 20 steps — noise envelope. No trend.
+
+Then I went back and **recomputed the prior Fisher run's windowed means** from its saved `step_kls`:
+
+- First-50-step mean: 7364.93
+- First-100-step mean: 6814.59
+- **Best windowed mean: 4027.78 at step 495**
+- **Final windowed mean: 4065.11 at step 500** (only 38 units above best)
+
+The "overshoot" I'd attributed to the baseline and Fisher runs was an illusion. I'd been reading single-sample KL values (last≈4218 vs min≈2722 for Fisher) and calling the 35% gap overshoot — but windowed mean shows near-monotonic convergence, 1% separation between best and final. **Lowering LR doesn't fix a problem that didn't exist**; it just trains slower.
+
+Killed Experiment 1. Takeaway: save-best-KL is a small-payoff defensive measure, not a lever. Useful if we later actually do see overshoot (e.g., after fixing the target, with sharper loss landscape) but meaningless right now.
+
+### Experiment 2: Fisher + late-block 2× on last 3 blocks (killed at step 21 of Phase 3)
+
+The theory: late-block 2× TuneFP/STE budget should do extra work on blocks 25-27, where Fisher weighting is already 30-50× concentrated. Expectation was ~15-20% PPL improvement from a direct attack on the error-accumulation tail.
+
+Full pipeline ran. Phase 2 results on the late blocks:
+
+| Block | Fisher-only STE final | Fisher+late2× STE final | Gain |
+|-------|----------------------|-------------------------|------|
+| 25    | 43.98                | 43.27                   | +1.6% |
+| 26    | 49.09                | 47.73                   | +3%   |
+| 27    | **25.11**            | **22.33**               | **+11%** |
+
+Block 27 **improved 11%** on its own MSE metric. Encouraging at first glance.
+
+Then Phase 3 init KL arrived (measured on fixed sample 0, so deterministic and cross-run comparable):
+
+| Run               | Phase 3 init KL |
+|-------------------|-----------------|
+| Baseline          | 7,604.67        |
+| **Fisher-only**   | **6,141.55**    |
+| Fisher+late2×     | 6,391.23        |
+
+**Fisher+late2× is 4% *worse* than Fisher-only at end-of-Phase-2 KL, despite local block-27 MSE being 11% better.**
+
+This is the MSE-vs-KL disconnect the Phase 1 rank-ladder analysis already hinted at — block MSE varies 3.4× while PPL varies 112×. Here the late-block 2× budget extracted local MSE wins by drifting weights off the residual-stream manifold in ways the lm_head sees but block-MSE doesn't.
+
+Also worth noting: this is exactly deviation #1's predicted failure mode. When you train against the wrong target (cached teacher→teacher rather than `B*_b(X_student)` recomputed each block), giving more gradient steps against the wrong target produces better fit *on that wrong target*. Global KL doesn't reward it.
+
+Killed Experiment 2. Takeaway: **local block-MSE is no longer a decision-useful metric for levers in this pipeline.** Until the target is fixed, MSE-guided interventions are as likely to hurt as help global quality.
+
+### The cross-run metric we can trust: Phase 3 init KL
+
+What emerged as actually useful across these three runs is **Phase 3 init KL measured on fixed sample 0** (`tune_scales_kd.py` line near the `init KL = ...` print). It's:
+
+- **Deterministic** given the same post-Phase-2 state — confirmed by the lr=3e-7 resume matching Fisher-only's 6141.55 to 6 sig figs after loading the same checkpoint.
+- **Cross-run comparable** — same sample, same teacher, same init procedure.
+- **A direct measure of end-of-Phase-2 quality** — what happens before any Phase 3 scale tuning runs.
+- **Decoupled from Phase 3 LR or budget choices** — lets us isolate Phase 2 gains from Phase 3 gains cleanly.
+
+Should be the primary metric for all Phase 2 interventions going forward, over block-MSE.
+
+### Monitor script worth keeping
+
+During Experiment 2 I used `Monitor` with a poll-loop that grepped the log for phase transitions, step progress, ckpt mtimes, and error signatures, emitting state-change notifications every 30 min. Filter pattern covered Traceback / CUDA error / OOM / FAILED / Killed so silence wasn't success. Worked well and didn't over-fire; ~1 event per 20-30 min of real state change. Keep the pattern for long runs.
+
+### Bottom line
+
+Three experiments × ~5 hours of GPU each, and **best PPL still sits at Fisher-only's 135.20**. The audit was right: the current pipeline has a ceiling that no tuning of its existing knobs can break. The next run must fix deviations #1 (target), #2 (TuneFP budget), #3 (RMSNorm freeze). Those are the path to closing 135 → 27; everything else is noise at this layer.
+
+### Next
+
+1. Fix #1/#2/#3 together (estimated 1 hour of code work, likely one commit).
+2. Add `diag_block_kl.py` — per-block KL ablation — so the next run gets a real global-KL readout per block, not just block-MSE.
+3. Rerun full pipeline. If init KL drops substantially (target fix is predicted to be the biggest Phase-2 improvement), we'll see it immediately at Phase 3 step 0.
+
+---
+
+## 2026-04-24 (later still) — Audit fixes implemented. Predictions empirically wrong.
+
+Implemented the three audit fixes and clarified fix #1's scope via a follow-up agent read of Algorithm 1:
+
+- **Fix #1 (revised):** STE target changed to `B(X_student)` where `B` is the post-TuneFP tuned FP block (paper Eq. 10). Recomputed fresh per block just before LB-ADMM binarizes. TuneFP target kept as cached teacher-teacher boundary — paper Algorithm 1 line 9 literally specifies `Y* = B*_b(X_student)` as a shared target, but at block level this yields zero initial TuneFP loss. The paper's Algorithm 1 is ambiguous here; a faithful reading implies per-layer interleaving within LB-ADMM, which we don't implement. Block-level pragmatic target preserved TuneFP signal.
+- **Fix #2:** `--tune-fp-epochs` CLI flag added to `run_phase2.py`. When set, derives steps as `n_calib * epochs / batch`. Paper's 8 epochs at n=128 batch=4 = 256 steps (vs our previous 1024 = 32 epochs).
+- **Fix #3:** `tune_fp.py` now unfreezes only `nn.Linear` weights/biases; RMSNorm stays frozen. Matches QuaRot/GPTQ lineage and avoids the residual-stream scale drift flagged in feedback memory.
+
+Smoke test passed end-to-end. Launched full Fisher pipeline with all three fixes at paper-faithful budget. Monitor caught the first meaningful pipeline event, the derived budget:
+
+```
+[tunefp-budget] epochs=8 n_calib=128 batch=4 -> 256 steps
+```
+
+### Phase 2 wall time halved
+
+Pre-fix Fisher: 137 min (8142s). Post-fix: **71 min (4263s)**. The 4× TuneFP budget cut accounts for most of the savings — each block now does 256 TuneFP steps instead of 1024. Confirms deviation #2 was real bloat, not load-bearing.
+
+### Per-block trajectory: TuneFP init ~25% higher throughout
+
+Post-fix block-by-block TuneFP init MSEs are ~1.2–2.9× the pre-fix values through blocks 3–26. Absorption ratio drops from pre-fix's 20–25% to post-fix's 10–17% (less budget → less absorption, expected). Block 27 anomaly persists: tunefp 109.15→13.13 (88% absorption) vs pre-fix 103.70→7.82 (92%). Ratio tightens with depth — by block 26 only 1.21× higher init.
+
+STE finals are not directly comparable across runs (target changed). They're all small (0.05–0.15 middle blocks) because Eq. 10's target `tuned_FP(X_student)` is easy to match — LB-ADMM init already gets close.
+
+### The prediction that broke
+
+Audit predicted: correcting the STE target would substantially improve Phase 3 init KL and final PPL. Prior Fisher ran with "wrong" STE target + overtrained TuneFP + trainable RMSNorm → PPL 135.20. We expected post-fix to beat it.
+
+Measured instead:
+
+| Config | Post-Phase-2 PPL | Phase 3 init KL | Phase 2 wall |
+|--------|-----------------:|----------------:|-------------:|
+| **Pre-fix Fisher** | **1156.59** | 6141.55 | 137 min |
+| Post-fix Fisher | 1449.05 | 7249.85 | 71 min |
+
+**Post-fix is 25% WORSE at post-Phase-2 PPL and 18% worse at init KL.** Killed the run early rather than burn the ~8h Phase 3 to confirm the projection; direct post-Phase-2 PPL eval is sufficient.
+
+### Why the audit's prediction failed
+
+Interpretation — the pre-fix pipeline was *accidentally* acting as a global-KL regularizer via three interacting "bugs":
+
+1. **STE against cached teacher-teacher boundary** asks the binary block to reproduce the teacher's *clean-input output* while receiving drifted input. Literally impossible to minimize this loss to zero, but the unsatisfied gradient pressure pushes the binary block's behavior to *compensate* for upstream drift — a form of implicit error-correction not present in Eq. 10's local objective.
+2. **4× overtrained TuneFP** amplifies (1) because each block's FP weights have more opportunity to absorb drift before binarization. Eq. 10's paper-faithful STE target sees this fully-tuned FP block as its target — which is "cleaner" but discards the drift-compensation pressure.
+3. **Trainable RMSNorm** adds another dimension of freedom for TuneFP to compensate with.
+
+Fix #1 individually removes the most important of these (STE target → Eq. 10), which the paper describes as the theoretically correct objective. In isolation, it *is* the cleaner local objective — matching what the FP block produces on drifted input. What it loses is the implicit global regularization that came from forcing the binary block to fight the drift, not just reproduce the FP block's already-drifted response.
+
+This is a concrete example of the "paper-replication discipline" feedback memory: a bug that works as well or better than the paper-faithful version, for reasons the paper's theoretical framing doesn't surface. The audit correctly identified the deviation; it was wrong that the deviation was load-bearing for quality in our direction.
+
+### Concrete honest takeaways
+
+- **The audit was right about WHAT the paper says. It was wrong that fixing made things better for this model.** The three pragmatic deviations compound into an implicit regularization that our paper-faithful replacement doesn't have.
+- **Don't trust audit severity rankings without an actual measurement.** We assumed deviation #1 was the biggest single win; it was actually a regression.
+- **Per-block MSE continues to be misleading.** Phase 2's per-block trajectories in post-fix look fine (consistent, small, monotonic-ish) — but global KL says the blocks are worse aligned.
+- **Post-Phase-2 PPL is now our cross-run quality metric**, alongside init KL. Lets us A/B without waiting 8h for Phase 3 to finish. Should add `--eval-post-phase2` as a built-in pipeline flag for future runs.
+
+### What's preserved
+
+- `post_phase2_prefix.pt` (pre-fix Fisher Phase 2 state) — still on disk for future diag_block_kl.py experiments.
+- `post_phase2.pt` (post-fix Fisher Phase 2 state) — preserved too.
+- Three fix patches are in `tune_fp.py`, `phase2.py`, `run_phase2.py`; `diag_block_kl.py` exists as a new file. None reverted yet — they're available under CLI flags / default-off where applicable.
+
+### Artifacts by run
+
+**Pre-fix Fisher run** (the earlier run that reached PPL 135.20 at Phase 3 step 500):
+- Full-pipeline log: [fullpipeline_fisher.log](fullpipeline_fisher.log)
+- Diagnostic log (Fisher concentration stats): [diag_fisher.log](diag_fisher.log)
+- Phase 3 lr=3e-7 retry log (killed at step ~100): [fullpipeline_fisher_lr3e-7.log](fullpipeline_fisher_lr3e-7.log)
+- Post-Phase-2 PPL eval log: [eval_prefix_post_phase2.log](eval_prefix_post_phase2.log)
+- Phase 3 step-500 PPL eval log: [eval_fisher_step500.log](eval_fisher_step500.log)
+- Post-Phase-2 checkpoint: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.post_phase2_prefix.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.post_phase2_prefix.pt)
+- Phase 3 ckpt at step 500: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.phase3_progress_lr1e-6_step500.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.phase3_progress_lr1e-6_step500.pt)
+- Phase 3 lr=3e-7 best-KL ckpt (step 91): [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.phase3_best_lr3e-7_step91.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.phase3_best_lr3e-7_step91.pt)
+- Per-block status JSON: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.status_prefix.json](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.status_prefix.json)
+
+**Fisher + late-block 2× run** (killed at Phase 3 step 21, confirmed MSE-vs-KL disconnect):
+- Full-pipeline log: [fullpipeline_fisher_late.log](fullpipeline_fisher_late.log)
+- Post-Phase-2 checkpoint: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher_late3x2.post_phase2.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher_late3x2.post_phase2.pt)
+- Status JSON: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher_late3x2.status.json](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher_late3x2.status.json)
+
+**Post-fix Fisher run** (this entry — audit fixes #1/#2/#3 applied):
+- Full-pipeline log: [fullpipeline_postfix.log](fullpipeline_postfix.log)
+- Smoke test log (validated pipeline before full run): [smoke_post_fix.log](smoke_post_fix.log)
+- Post-Phase-2 PPL eval log: [eval_postfix_post_phase2.log](eval_postfix_post_phase2.log)
+- Post-Phase-2 checkpoint: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.post_phase2.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.post_phase2.pt)
+
+**Baseline (no Fisher, no fixes, paper Appendix C budget)** — the 389.59 PPL reference:
+- Resume log (the live run that produced 389.59): [fullpipeline_resume.log](fullpipeline_resume.log)
+- Full-pipeline log (earlier Phase 2 that produced the post-Phase-2 ckpt later reused by the resume): [fullpipeline_full.log](fullpipeline_full.log)
+- Post-Phase-2 checkpoint: [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0.post_phase2.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0.post_phase2.pt)
+- Eval at Phase 3 step 200 (PPL 389.59): [eval_step200.log](eval_step200.log)
+
+**Supporting artifacts (cross-run):**
+- Results DB: [results.json](results.json)
+- K-FAC preconditioners (cached, reused across runs): [cache/qwen-qwen3-0-6b/n128_L2048_seed0/preconditioners.pt](cache/qwen-qwen3-0-6b/n128_L2048_seed0/preconditioners.pt)
+- Fisher diagonal (cached): [cache/qwen-qwen3-0-6b/n128_L2048_seed0/fisher_diag.pt](cache/qwen-qwen3-0-6b/n128_L2048_seed0/fisher_diag.pt)
+
+### Next
+
+Three options, ranked by leverage vs time:
+
+1. **Ablate each fix individually** (3× Phase-2-only runs at ~75 min each with `--tune-scales-steps 0`). Gives clean attribution — which of #1/#2/#3 actually hurt, and by how much. Useful if we ever want to revisit a "cleaner" pipeline from a different angle.
+2. **Revert all three, accept pre-fix config as baseline PPL 135.20, invest elsewhere.** Either Phase 3 improvements (LR schedule, best-KL + early stopping), or new Phase 2 knobs (per-block rank, different loss weighting than Fisher/D_out, etc.).
+3. **Partial revert guess.** Keep whichever fix we suspect is neutral/helpful, revert the others. Risky without ablation data.
+
+Going with (1) to get definitive attribution before committing direction. After the three ablations land, we'll have a proper understanding of which knob was load-bearing and can design the next lever from data.
+
+---
+
+## 2026-04-24 (later still 2) — Drift review + full paper deviation audit
+
+Context: post-fix Fisher run showed drift accumulating badly in the second half of blocks. Reviewed per-block data from both status JSONs and discovered:
+
+- Per-block drift-amplification ratios are **the same** pre-fix and post-fix (~1.35-1.41× per block in the second half). Structural to the residual stream.
+- Post-fix enters the second half from a **2.2× higher drift floor** at block 14 (init_loss 1.96 vs pre-fix 0.90).
+- Two compounding causes: (A) TuneFP absorption halved by the 4× budget cut — each block passes ~90% of upstream drift instead of ~80%, compounding to a 20× difference across 26 blocks; (B) Eq. 10 STE target has ~2-unit gap (easy) vs pre-fix ~10-unit gap (impossible), so post-fix STE no longer applies the implicit drift-correction gradient pressure that pre-fix accidentally benefited from.
+
+With that diagnosis in hand, re-read the NanoQuant paper (arXiv:2602.06694v1) end-to-end via agent and cross-referenced against every file in the pipeline. Findings organized by whether they're likely contributing to the second-half drift.
+
+### Deviations — HIGH (plausibly explain the drift)
+
+**D1. STE target recomputed AFTER TuneFP, not shared with TuneFP ([phase2.py:197-199](phase2.py)).** Paper Algorithm 1 lines 7-9 compute `Y* ← B*_b(X)` **once** (teacher block on student input), then line 11 TuneFP and line 18 TuneLatentSTE **share** that Y*. Our code recomputes `Y_b_ste = compute_teacher_on_student(block, X_student, ...)` AFTER TuneFP runs — so STE sees `tuned_FP(X_student)` as its target, not `teacher(X_student)`. Consequence: STE fits a post-TuneFP block that has already absorbed drift, and STE itself gets no drift-correction gradient signal. This is the direct mechanism for the second-half drift: fix #1 accidentally removed a regularization that the paper's shared-Y* protocol was supposed to preserve.
+
+**D2. TuneFP target is cached teacher-to-teacher boundary, not `B*_b(X_student)` ([phase2.py:169](phase2.py)).** Already flagged, partially reverted. The comment's "zero initial loss" argument is literally correct at block level — which points to an unresolved paper ambiguity: Algorithm 1 Step 1's prose ("errors introduced by ... previously factorized layers in the current block") suggests per-layer TuneFP/LB-ADMM interleaving, not block-level. Our block-level implementation substitutes a target to keep gradient signal.
+
+**D3. Weighted MSE = Fisher on residual stream, not `D_out` on per-Linear output channels ([fisher_diag.py](fisher_diag.py) vs [preconditioner.py:196](preconditioner.py)).** Paper cites DBF (Boža & Macko 2025): weighted MSE is `‖D_out·(Y_t − Y_s)‖²` per-Linear. Ours weights the `d_model` residual-stream dimension once per block. Different axis, different statistic. Audit #4, not fixed.
+
+### Deviations — MEDIUM (structural but not obviously drift-related)
+
+**D4. K-FAC preconditioner normalized to mean=1 in LB-ADMM ([admm.py:97-106](admm.py)).** Paper Eq. 15: raw `W̃ = D_out · W · D_in`. Our code divides `D_in` and `D_out` by their means before forming `W̃`. Documented as a fix for gradient vanishing when `D_out` magnitudes were ≈1e-4. Structurally deviates from paper; possibly masks an upstream estimator mis-scale.
+
+**D5. RobustDiag uses single-shot percentile, not cumulative-max ([preconditioner.py:203-206](preconditioner.py)).** Paper Appx B.2 Lemma 1 specifies `τ_t = max(τ_{t-1}, q_t)`. Ours uses `torch.quantile` one-shot. Audit #6, low priority.
+
+**D6. ρ schedule endpoints unverified ([admm.py:74](admm.py)).** Paper: "linear, K=400", no endpoints. Ours: `rho_start=0.1, rho_end=10.0`. Paper's Thm 3 requires `ρ > L_f` per step. `ρ_start=0.1` may not satisfy that early on. Audit #5.
+
+### Verified matching (non-deviations)
+
+K=400 LB-ADMM iterations ✓; TuneFP 256 steps / lr=1e-4 / batch=4 ✓; STE lr=1e-5 ✓; STE trains (U, V, s1, s2) ✓; Phase 3 lr=1e-6 / scales-only ✓; Phase 3 KL direction = forward KL from teacher ✓; calibration 128×2048 seed=0 ✓; RMSNorm frozen ✓; Ledoit-Wolf shrinkage on D̃ ✓; SVID ✓; magnitude balancing Eq. 7-9 ✓.
+
+### Paper ambiguities (unresolvable from text)
+
+STE backward form (plain vs clipped-identity `|x|<1`) — ours clipped; block-level vs per-layer structure of Step 1+2; ρ endpoints; "weighted MSE" exact form (paper punts to DBF / Kim 2025); ADMM λ value.
+
+### Priority
+
+D1 is the new finding that directly maps to the drift mechanism. Implementing first. Change is ~10 lines in [phase2.py](phase2.py): compute `Y_b = compute_teacher_on_student(block, X_student, ...)` once BEFORE TuneFP, pass the same `Y_b` to both `tune_fp` and `train_block`. This supersedes the current ablation plan — if D1 recovers the drift-correction pressure via the paper-faithful mechanism, ablations become less urgent.
+
+Open item: at block level, paper-faithful D1 gives TuneFP zero initial loss (block still equals teacher, target = teacher-on-student = block(student)). TuneFP would be a no-op. That's acceptable — STE is the stage we want to fix. If we then want TuneFP to do real work, we'd need to address D2 by either restructuring to per-layer interleaving or substituting a different non-teacher target.
+
+### Next
+
+1. Log audit (this entry).
+2. Implement D1 in `phase2.py`.
+3. Run post-D1 Phase 2 + post-Phase-2 PPL eval. Compare against pre-fix PPL 1156 and current post-fix 1449.
+4. Decide D2 direction based on D1 result.
+
+---
+
+## 2026-04-24 (later still 3) — D1 empirically regresses 500×; paper-faithful audit branched off master
+
+Implemented D1 and ran full Qwen3-0.6B Fisher pipeline. D1 regresses catastrophically. Code preserved on branch `research/nanoquant-d1-shared-y-star` (tip commit `0fd4e208b`); master reverted to pre-audit-fixes state (`1ac0d3c89`).
+
+### D1 implementation
+
+- [phase2.py](phase2.py): `Y_b = compute_teacher_on_student(block, X_student, ...)` computed ONCE on the pristine FP (teacher) block BEFORE TuneFP. Same `Y_b` passed to both `tune_fp` and `train_block`. Cached teacher-to-teacher boundary no longer used in Phase 2.
+- [tune_fp.py](tune_fp.py): docstring updated to note the shared-`Y*` protocol and the block-level zero-gradient caveat.
+- Smoke test on Qwen3-0.6B n=4 rank=32 steps=20 confirmed wiring: all 28 blocks reported `tunefp 0.0000->0.0000` (target == block output at init), STE init_mse in "impossible target" regime (block 27 init_mse = 215.7 vs post-fix 33.3).
+
+### Full run results
+
+Full pipeline Qwen3-0.6B with Fisher: rank=512, K=400, 1024 STE steps/block, 8 TuneFP epochs (256 steps), Phase 3 500 steps lr=1e-6. Phase 2 completed in 70.7 min (matches post-fix 71 min). Phase 3 killed at step 146 of 500 after trajectory confirmed a plateau well above baselines.
+
+| config | post-Phase-2 PPL | Phase 3 init KL | best Phase 3 PPL | notes |
+|--------|------------------:|-----------------:|-----------------:|-------|
+| pre-fix Fisher | 1,156 | 6,142 | 135.20 @ step 500 | baseline |
+| post-fix Fisher (audit #1/#2/#3) | 1,449 | 7,250 | — (killed) | +25% post-P2 |
+| **D1 Fisher** | **588,507** | **22,531** | **19,767 @ step 146** | **509× post-P2, 146× vs pre-fix final** |
+
+### The prediction that broke (the other way this time)
+
+I predicted D1 would recover drift-correction pressure that fix #1 accidentally removed. The smoke test data looked correct: STE was visibly doing work (70% reductions vs pre-fix's 5%), per-block MSE growth looked similar across configs. Pre-fix's "STE barely moves" I interpreted as unsatisfied gradient pressure — the paper-faithful shared-`Y*` target would let STE fully converge while still pulling binary toward teacher's distribution.
+
+Measured: the opposite. STE's strong convergence on the paper-faithful target **preserves** drift rather than fighting it.
+
+### Why D1 preserves drift — the drift-amplification mechanism
+
+Consider block b with student input `X_s[b]` (drifted from teacher input `X_t[b]` by accumulated upstream quantization error). Call the drift `δ[b] = X_s[b] − X_t[b]`. Each block in each config optimizes:
+
+- **Pre-fix:** `min‖binary_block(X_s[b]) − teacher_block(X_t[b])‖²` — target is pristine teacher output on TEACHER input. Unreachable (binary can only process `X_s[b]`, can't reverse upstream drift on arbitrary input). STE residual gradient pushes binary's output partway toward the teacher manifold, effectively subtracting a component of `δ`. Downstream, `X_s[b+1]` is a mix of "teacher behavior on X_s[b]" and "pulled toward clean teacher output". Per-block drift growth: bounded below teacher-Jacobian rate.
+- **D1:** `min‖binary_block(X_s[b]) − teacher_block(X_s[b])‖²` — target is teacher's response to DRIFTED input. Reachable in principle (binary ≈ teacher is the whole quantization goal). STE converges strongly (~70% reduction). Downstream, `X_s[b+1] ≈ teacher_block(X_s[b])`. Linearizing teacher around `X_t[b]`: `teacher_block(X_t[b] + δ[b]) ≈ teacher_block(X_t[b]) + J_b · δ[b]`. So `δ[b+1] ≈ J_b · δ[b]` — drift propagates through the teacher's Jacobian at FULL amplification.
+- **Post-fix:** similar to D1 but with TuneFP having absorbed some drift into the FP weights first, so the target is slightly different from pristine teacher-on-student. Drift propagates at near-full Jacobian rate with a constant-factor attenuation.
+
+Transformer Jacobian norms at typical input scales are `||J_b|| ≥ 1` (residual connections contribute identity; MLP + attention contribute magnitude > 1 on the directions that carry signal). Over 28 blocks, `Π ||J_b||` compounds geometrically. Pre-fix's drift-cancellation subtracted a component each block, bringing effective per-block amplification below 1 on average. D1 does not — drift grows at full teacher-Jacobian rate every block.
+
+### Empirical evidence for the mechanism
+
+D1 per-block STE init_mse (pre-STE LB-ADMM error measured against `teacher(X_s[b])`):
+| block | D1 | pre-fix | post-fix |
+|------|-----|---------|----------|
+| 14 | 0.87 | 0.93 | 0.15 |
+| 20 | 5.35 | 10.86 | 2.85 |
+| 27 | 119.42 | 42.66 | 33.29 |
+
+Counter-intuitive: D1 init_mse at block 14 is comparable to pre-fix, but at block 27 it's **2.8× larger**. Pre-fix's drift-cancellation was kicking in at middle-to-late blocks — by block 27, pre-fix's `||X_s||` is smaller than D1's because each block subtracted a drift component. D1's `||X_s||` grew geometrically via the teacher Jacobian, so the same LB-ADMM relative factorization error (`ε_LB-ADMM · ||W||₂ · ||x||`) produced much larger absolute errors.
+
+Per-block STE init_mse growth ratio (B14→B26 average):
+- pre-fix: 1.41× per block
+- post-fix: 1.35× per block
+- D1: **1.46× per block** (highest)
+
+D1's ratio is highest. If `||J||_avg ≈ 1.4` in the latter half, D1 tracks that exactly. Pre-fix undershoots by ~0.05 per block; over 12 blocks that's `1.05^12 ≈ 1.8×` less drift at block 26. That matches the observed pre-fix init_mse 42.66 vs D1 119.42 at block 27 (ratio 2.8, close to the predicted factor once you include LB-ADMM scaling with `||x||`).
+
+### Why local fidelity ≠ global fidelity
+
+Paper's Eq. 10 is the locally correct objective: each block should reproduce teacher's mapping. For a composition `f = f_28 ∘ f_27 ∘ … ∘ f_1`, local fidelity `f̂_b ≈ f_b` should in theory compose to `f̂ ≈ f`. This fails for two reasons at binary precision:
+
+1. **Input domain shift.** `f̂_b` is optimized over the student input distribution `X_s[b]`, which differs from `X_t[b]` by the accumulated drift. But `f̂_b` only gets trained on a 128-sample calibration — it's not a global function approximation, it's a local fit. The "approximation" is valid only in a neighborhood of the training inputs. At block 27, if `X_s[27]` has drifted far from `X_t[27]`, the training distribution is also drifted, so `f̂_27` converges to approximate `f_27` **on the drifted distribution** — which is precisely what we asked for, but the test distribution at inference time is whatever `X_s[27]` happens to be, and if that distribution is fatter-tailed than calibration, generalization breaks.
+
+2. **Error composition under bounded STE capacity.** Even if `||f̂_b − f_b|| ≤ ε_b` uniformly, composition yields error bounds `||f̂ − f|| ≤ Σ Lip(f) · ε_b` — growing linearly at best, geometrically if Lipschitz constants exceed 1. Pre-fix's "impossible target" biased STE toward a different point in its capacity ball — specifically the point closest to the teacher-on-clean-input manifold, which happens to compose multiplicatively BETTER even though per-block it's strictly worse.
+
+### Lessons
+
+1. **Paper-faithful is not always quality-faithful.** The audit correctly identified 3 deviations from the paper. All three, when fixed, regressed quality. D1 is the cleanest example — literally implementing what Algorithm 1 line 9 says produced 500× worse PPL than the pre-fix "bug". The paper's protocol likely works at their scale (H100, larger calibration, possibly different regularization pulled in via "weighted MSE") but breaks at ours. Replication discipline requires distinguishing "paper-faithful" from "paper-intent" — sometimes our bugs are the paper's intent by accident.
+
+2. **Per-block MSE is misleading three ways.** The journal has noted this twice before but D1 produced the sharpest example yet. D1's per-block STE reductions (70%) looked like the pipeline was working **better**. It was working better at the local objective; the local objective is decoupled from global KL; and the composed network was the only thing that mattered for PPL.
+
+3. **Implicit regularization can be load-bearing.** Pre-fix had two "accidental regularizers" working together: (a) impossible STE target → drift-cancellation gradient, (b) overtrained TuneFP → extra FP weight adaptation absorbing drift. Fix #1 removed (a); fix #2 removed most of (b). D1 doubled down on removing (a). All three operate on the same drift-control axis the paper's explicit mechanisms apparently control differently — possibly via the undefined "weighted MSE", possibly via budget.
+
+4. **Post-Phase-2 PPL eval is the right cross-run metric.** It predicted D1's failure at 90 minutes instead of 8 hours. Every future Phase 2 lever should be A/B'd at post-Phase-2 PPL first. Add `--eval-post-phase2` as a built-in flag next time we revisit this pipeline.
+
+### Artifacts preserved
+
+- **Branch:** `research/nanoquant-d1-shared-y-star` @ `0fd4e208b` — paper-faithful audit fixes #1/#2/#3 + D1 bundled.
+- **D1 Phase 2 ckpt:** [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.post_phase2.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.post_phase2.pt)
+- **D1 Phase 3 best-KL ckpt (step 146, KL 12938):** [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.phase3_best.pt](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.phase3_best.pt)
+- **D1 full pipeline log:** [fullpipeline_d1.log](fullpipeline_d1.log)
+- **D1 Phase 2 per-block status:** [runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.status.json](runs/phase2_qwen-qwen3-0-6b_r512_K400_steps1024_n128_L2048_seed0_fisher.status.json)
+- **D1 PPL eval logs:** [eval_d1_post_phase2.log](eval_d1_post_phase2.log), [eval_d1_phase3_best.log](eval_d1_phase3_best.log)
+- **Post-fix Fisher artifacts (preserved via rename):** `.post_phase2_postfix.pt`, `.status_postfix.json`
+- **Pre-fix Fisher artifacts (earlier preservation):** `.post_phase2_prefix.pt`, `.status_prefix.json`
+
+### Master state
+
+Master code reverted to `1ac0d3c89`. Audit fixes #1/#2/#3 and D1 all live on the branch. To reproduce the paper-faithful pipeline (regressive): `git checkout research/nanoquant-d1-shared-y-star`. To reproduce pre-fix 135.20 baseline: stay on master.
+
+### Next
+
+With D1 ruled out and the paper-faithful direction empirically wrong at our scale, the research question shifts: **what direction is actually paying?**
+
+Options to consider for the next session:
+
+1. **Bank pre-fix 135.20, invest in Phase 3.** LR schedule, save-best + early stopping (already built), validation-window-based stopping, temperature-scaled KL. Phase 3 pre-fix ended at step 500 with windowed mean 4028, only 1% above the min at step 495 — likely close to its own limit, but worth verifying.
+2. **Different Phase 2 loss.** Replace Fisher with the paper's actual D_out-weighted MSE (audit D3). This is the one unattacked axis that's paper-faithful but hasn't been tried.
+3. **Per-block rank allocation.** Fisher diagnostic showed 10× concentration in late blocks. Rank-allocation that gives more rank to late blocks may directly reduce per-block factorization error, slowing drift propagation even under the current STE regime. This is an orthogonal lever to target/budget choices.
+4. **Larger model.** Qwen3-0.6B has 28 blocks; the drift compounding is measurable here precisely because depth is modest. Qwen3-4B has 36 blocks and possibly better-conditioned Jacobians. If the drift mechanism is scale-sensitive, D1 might stop regressing at 4B — would bring replication closer to paper scale.
+
+Option 3 is the highest-leverage low-risk move. Option 2 closes the last paper-audit deviation without re-introducing D1's mechanism. Option 4 is informative but takes real GPU time.
