@@ -22,6 +22,7 @@ scale-vector gradients are retained (tiny).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +39,15 @@ class TuneScalesKDStats:
     bad_steps: int
     n_scale_params: int
     steps_taken: int
+    step_kls: list = None
+    step_lrs: list = None
+    temperature: float = 1.0
+
+    def __post_init__(self):
+        if self.step_kls is None:
+            self.step_kls = []
+        if self.step_lrs is None:
+            self.step_lrs = []
 
 
 def _collect_scale_params(student_model) -> list[torch.nn.Parameter]:
@@ -108,6 +118,9 @@ def tune_scales_kd(
     verbose: bool = False,
     free_teacher_after_precompute: bool = True,
     temperature: float = 1.0,
+    ckpt_path: "str | Path | None" = None,
+    ckpt_every: int = 200,
+    resume_from_ckpt: bool = True,
 ) -> TuneScalesKDStats:
     """Freeze all student params except `s1, s2`, then train via KL against teacher.
 
@@ -179,12 +192,41 @@ def tune_scales_kd(
     init_loss = _eval_kd_loss_from_cache(student_model, teacher_log_probs, input_ids, device)
     print(f"  [tune_scales_kd] init KL = {init_loss:.6f}", flush=True)
 
+    # Resume from prior checkpoint if available.
+    start_step = 0
+    step_kls: list[float] = []
+    step_lrs: list[float] = []
+    if ckpt_path is not None and resume_from_ckpt and Path(ckpt_path).exists():
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            student_model.load_state_dict(ckpt["model_state"])
+            opt.load_state_dict(ckpt["opt_state"])
+            if sched is not None and "sched_state" in ckpt:
+                sched.load_state_dict(ckpt["sched_state"])
+            start_step = int(ckpt.get("step", 0))
+            step_kls = list(ckpt.get("step_kls", []))
+            step_lrs = list(ckpt.get("step_lrs", []))
+            print(
+                f"  [tune_scales_kd] resumed from {ckpt_path} at step {start_step}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"  [tune_scales_kd] could not resume from {ckpt_path}: {e} — starting fresh",
+                flush=True,
+            )
+
     bad_steps = 0
     log_every = max(1, steps // 20)
     pbar = tqdm(range(steps), desc="TuneScalesKD", leave=False)
 
     steps_taken = 0
+    # If resuming, skip ahead on the pbar count.
+    if start_step > 0:
+        pbar.update(start_step)
     for step in pbar:
+        if step < start_step:
+            continue
         idx = torch.randperm(n_samples)[:batch_size]
         ids = input_ids[idx].to(device)
         t_lp = teacher_log_probs[idx].to(device=device, dtype=torch.float32, non_blocking=True)
@@ -202,6 +244,10 @@ def tune_scales_kd(
         if not torch.isfinite(loss):
             bad_steps += 1
             opt.zero_grad(set_to_none=True)
+            if sched is not None:
+                sched.step()
+            step_kls.append(float("nan"))
+            step_lrs.append(opt.param_groups[0]["lr"])
             continue
 
         opt.zero_grad(set_to_none=True)
@@ -210,6 +256,8 @@ def tune_scales_kd(
         if sched is not None:
             sched.step()
         steps_taken += 1
+        step_kls.append(loss.item())
+        step_lrs.append(opt.param_groups[0]["lr"])
 
         # Explicit cleanup so intermediate logit tensors don't accumulate.
         del s_logits, s_lp, t_lp
@@ -221,6 +269,31 @@ def tune_scales_kd(
                     f"  [tune_scales_kd] step {step}: kl={loss.item():.5f} bad={bad_steps}",
                     flush=True,
                 )
+
+        # Periodic checkpoint.
+        if (
+            ckpt_path is not None
+            and ckpt_every > 0
+            and (step + 1) % ckpt_every == 0
+            and step + 1 < steps
+        ):
+            tmp = Path(str(ckpt_path) + ".tmp")
+            torch.save(
+                {
+                    "model_state": student_model.state_dict(),
+                    "opt_state": opt.state_dict(),
+                    "sched_state": sched.state_dict() if sched is not None else None,
+                    "step": step + 1,
+                    "step_kls": step_kls,
+                    "step_lrs": step_lrs,
+                    "bad_steps": bad_steps,
+                },
+                tmp,
+            )
+            import os as _os
+            _os.replace(tmp, ckpt_path)
+            if verbose:
+                print(f"  [tune_scales_kd] ckpt saved @ step {step + 1}", flush=True)
 
     # Final loss snapshot.
     final_loss = _eval_kd_loss_from_cache(student_model, teacher_log_probs, input_ids, device)
@@ -245,4 +318,7 @@ def tune_scales_kd(
         bad_steps=bad_steps,
         n_scale_params=len(scales),
         steps_taken=steps_taken,
+        step_kls=step_kls,
+        step_lrs=step_lrs,
+        temperature=temperature,
     )

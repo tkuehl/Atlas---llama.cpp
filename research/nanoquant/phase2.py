@@ -22,7 +22,9 @@ boundaries for b > 0 are unused here.
 
 from __future__ import annotations
 
+import copy
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,11 +42,55 @@ from tune_fp import (
 )
 
 
+def _capture_admm_init_stats(block: nn.Module, orig_linears: dict[str, nn.Linear]) -> dict:
+    """Per-linear diagnostics immediately after LB-ADMM init, before STE.
+
+    Records weight-space relative Frobenius error and per-param magnitudes.
+    Compares against the pre-TuneFP original Linear weights stored in
+    `orig_linears` — so the error includes both TuneFP drift and the
+    signing cost of LB-ADMM.
+    """
+    out: dict = {}
+    for name, bf in block.named_modules():
+        if not isinstance(bf, BinaryFactoredLinear):
+            continue
+        orig = orig_linears.get(name)
+        if orig is None:
+            continue
+        with torch.no_grad():
+            W = orig.weight.data.float()
+            s1 = bf.s1.float().unsqueeze(1)
+            s2 = bf.s2.float().unsqueeze(0)
+            U_sign = torch.sign(bf.U_latent.float())
+            V_sign = torch.sign(bf.V_latent.float())
+            W_eff = (s1 * U_sign) @ (V_sign.T * s2)
+            diff = (W - W_eff).norm().item()
+            denom = max(W.norm().item(), 1e-12)
+        out[name] = {
+            "shape": tuple(W.shape),
+            "frob_rel_err": diff / denom,
+            "U_abs_mean": bf.U_latent.abs().mean().item(),
+            "U_abs_max": bf.U_latent.abs().max().item(),
+            "V_abs_mean": bf.V_latent.abs().mean().item(),
+            "V_abs_max": bf.V_latent.abs().max().item(),
+            "s1_abs_mean": bf.s1.abs().mean().item(),
+            "s2_abs_mean": bf.s2.abs().mean().item(),
+            "frac_U_under_1_ste_active": (bf.U_latent.abs() < 1).float().mean().item(),
+        }
+    return out
+
+
 @dataclass
 class Phase2BlockStats:
     idx: int
     tune_fp: TuneFPStats | None
     ste: BlockStats
+    wall_seconds: float = 0.0
+    admm_init: dict = None  # per-linear: frob_rel, U_abs_mean, s1_abs_mean, etc.
+
+    def __post_init__(self):
+        if self.admm_init is None:
+            self.admm_init = {}
 
 
 def _pick_compute_dtype(block: nn.Module) -> torch.dtype:
@@ -87,12 +133,20 @@ def quantize_model_with_tunefp(
 
     stats: list[Phase2BlockStats] = []
     for b in range(n_blocks):
+        t_block_start = time.time()
         block = model.model.layers[b]
         verbose = b < verbose_first_blocks
 
         # Initial compute dtype (block is still all-FP here; use its
         # first param's dtype — for a pristine Qwen3 block that's bf16).
         compute_dtype = next(p for p in block.parameters()).dtype
+
+        # Snapshot the original FP Linear modules for admm-init diagnostic.
+        # We need them to compute frob_rel_err after ADMM replaces them.
+        orig_linears: dict[str, nn.Linear] = {}
+        for name, m in block.named_modules():
+            if isinstance(m, nn.Linear):
+                orig_linears[name] = copy.deepcopy(m)
 
         # Target Y_b: cached teacher block output on teacher input
         # (= boundary_{b+1} in our cache). The paper's Algorithm 1 line 9
@@ -129,6 +183,9 @@ def quantize_model_with_tunefp(
             print(f"[block {b:2d}] no Linears found — skipping", flush=True)
             continue
 
+        # Diagnostic snapshot AFTER ADMM init, BEFORE STE.
+        admm_init_stats = _capture_admm_init_stats(block, orig_linears)
+
         # Step 3: STE refinement on (X_student, Y_b) — not the cached
         # teacher-to-teacher pair.
         ste_stats = train_block(
@@ -142,7 +199,19 @@ def quantize_model_with_tunefp(
             block_idx=b,
             verbose=verbose,
         )
-        stats.append(Phase2BlockStats(idx=b, tune_fp=tunefp_stats, ste=ste_stats))
+        block_wall = time.time() - t_block_start
+        stats.append(
+            Phase2BlockStats(
+                idx=b,
+                tune_fp=tunefp_stats,
+                ste=ste_stats,
+                wall_seconds=block_wall,
+                admm_init=admm_init_stats,
+            )
+        )
+
+        # Free the deepcopy'd originals.
+        del orig_linears
 
         tfp_line = (
             f" tunefp {tunefp_stats.init_loss:.4f}->{tunefp_stats.final_loss:.4f}"

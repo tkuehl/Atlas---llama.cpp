@@ -119,6 +119,19 @@ def main() -> None:
         help="Temperature scaling for KL (Hinton distillation). "
              "T>1 flattens distributions, making low-LR optimization easier.",
     )
+    ap.add_argument(
+        "--tune-scales-ckpt-every",
+        type=int,
+        default=200,
+        help="TuneScalesKD: save model/optimizer checkpoint every N steps. "
+             "0 disables periodic checkpointing.",
+    )
+    ap.add_argument(
+        "--resume-phase3",
+        action="store_true",
+        help="If set, skip Phase 2 and load the post-Phase-2 checkpoint instead. "
+             "Useful for re-running Phase 3 with different hyperparameters.",
+    )
     ap.add_argument("--eval-seq-len", type=int, default=2048)
     ap.add_argument("--notes", default=None)
     args = ap.parse_args()
@@ -271,6 +284,7 @@ def main() -> None:
             init_fn_factory=init_fn_factory,
             verbose_first_blocks=args.verbose_blocks,
         )
+        phase2_block_stats = None
         mean_tunefp_init = None
         mean_tunefp_final = None
     phase2_secs = time.time() - t0
@@ -279,6 +293,20 @@ def main() -> None:
         f"({phase2_secs / max(len(block_stats), 1):.1f}s/block)",
         flush=True,
     )
+
+    # --- Save post-Phase-2 checkpoint (full model state) so Phase 3 can
+    # resume after a crash without re-running Phase 2 ---
+    post_phase2_ckpt = STATUS_ROOT / f"{run_slug}.post_phase2.pt"
+    phase3_ckpt = STATUS_ROOT / f"{run_slug}.phase3_progress.pt"
+    if args.tune_scales_steps > 0:
+        print(f"[ckpt] saving post-Phase-2 model -> {post_phase2_ckpt}", flush=True)
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "args": vars(args),
+            },
+            post_phase2_ckpt,
+        )
 
     # --- Phase 3 (optional): TuneScalesKD — global scale fine-tune ---
     tune_scales_stats = None
@@ -312,6 +340,9 @@ def main() -> None:
             device=args.device,
             batch_size=args.tune_scales_batch,
             temperature=args.tune_scales_temperature,
+            ckpt_path=phase3_ckpt,
+            ckpt_every=args.tune_scales_ckpt_every,
+            resume_from_ckpt=True,
         )
         print(
             f"[phase3] done in {time.time() - t0_scales:.1f}s, "
@@ -339,10 +370,6 @@ def main() -> None:
         f"windows={result.num_windows} tokens={result.num_tokens}",
         flush=True,
     )
-
-    if args.no_log:
-        print("[log] --no-log set, skipping results.json append", flush=True)
-        return
 
     mean_init = sum(s.init_mse for s in block_stats) / max(len(block_stats), 1)
     mean_final = sum(s.final_mse for s in block_stats) / max(len(block_stats), 1)
@@ -400,27 +427,45 @@ def main() -> None:
             "n_scale_params": tune_scales_stats.n_scale_params,
         })
 
-    entry = append_entry(
-        model_hf_id=args.model,
-        model_revision=revision,
-        model_dtype=args.dtype,
-        method_name=method_name,
-        method_params=method_params,
-        eval_info={
-            "dataset": "wikitext-2-raw-v1",
-            "split": "test",
-            "seq_len": result.seq_len,
-            "stride": result.stride,
-            "num_tokens": result.num_tokens,
-            "num_windows": result.num_windows,
-            "metric": "ppl",
-            "value": result.ppl,
-            "nll_mean": result.nll_mean,
-        },
-        hardware={"gpu": gpu_name, "torch": torch.__version__},
-        notes=args.notes,
-    )
-    print(f"[log] appended entry id={entry['id']}", flush=True)
+    eval_info = {
+        "dataset": "wikitext-2-raw-v1",
+        "split": "test",
+        "seq_len": result.seq_len,
+        "stride": result.stride,
+        "num_tokens": result.num_tokens,
+        "num_windows": result.num_windows,
+        "metric": "ppl",
+        "value": result.ppl,
+        "nll_mean": result.nll_mean,
+    }
+
+    if args.no_log:
+        print("[log] --no-log set, skipping results.json append", flush=True)
+        # Fabricate a minimal entry-equivalent dict so the trace still
+        # records the run's identity.
+        import datetime, re as _re
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        slug = _re.sub(r"[^a-zA-Z0-9]+", "-", args.model).strip("-").lower()
+        entry = {
+            "id": f"{ts}-{slug}-{method_name}-NOLOG",
+            "timestamp_utc": ts,
+            "git": {"commit": None, "dirty": None, "branch": None},
+            "hardware": {"gpu": gpu_name, "torch": torch.__version__},
+            "model": {"hf_id": args.model, "revision": revision, "dtype": args.dtype},
+            "eval": eval_info,
+        }
+    else:
+        entry = append_entry(
+            model_hf_id=args.model,
+            model_revision=revision,
+            model_dtype=args.dtype,
+            method_name=method_name,
+            method_params=method_params,
+            eval_info=eval_info,
+            hardware={"gpu": gpu_name, "torch": torch.__version__},
+            notes=args.notes,
+        )
+        print(f"[log] appended entry id={entry['id']}", flush=True)
 
     final_status_file = status_file.with_name(status_file.stem + ".final.json")
     with open(final_status_file, "w") as f:
@@ -434,6 +479,80 @@ def main() -> None:
             indent=2,
         )
     print(f"[log] block stats -> {final_status_file}", flush=True)
+
+    # Full structured trace: every per-step trajectory, every per-linear
+    # init-time diagnostic, cross-phase summary. Useful for post-run
+    # investigation without needing to rerun.
+    trace_file = status_file.with_name(status_file.stem + ".trace.json")
+    trace_payload = {
+        "run_id": entry["id"],
+        "timestamp_utc": entry["timestamp_utc"],
+        "git": entry["git"],
+        "args": vars(args),
+        "hardware": entry["hardware"],
+        "model": entry["model"],
+        "eval": entry["eval"],
+        "phase2": {
+            "method_name": method_name,
+            "wall_seconds": phase2_secs,
+            "mean_block_init_mse": mean_init,
+            "mean_block_final_mse": mean_final,
+            "blocks": [
+                (
+                    {
+                        "idx": s.idx if hasattr(s, "idx") else (ps.idx if ps is not None else None),
+                        "wall_seconds": ps.wall_seconds if ps is not None else None,
+                        "ste": {
+                            "init_mse": s.init_mse,
+                            "final_mse": s.final_mse,
+                            "n_linears_replaced": s.n_linears_replaced,
+                            "n_params_trained": getattr(s, "n_params_trained", None),
+                            "bad_steps": getattr(s, "bad_steps", None),
+                            "step_losses": getattr(s, "step_losses", []),
+                            "step_lrs": getattr(s, "step_lrs", []),
+                            "final_grad_norms": getattr(s, "final_grad_norms", []),
+                        },
+                        "tune_fp": (
+                            {
+                                "init_loss": ps.tune_fp.init_loss,
+                                "final_loss": ps.tune_fp.final_loss,
+                                "bad_steps": ps.tune_fp.bad_steps,
+                                "n_params_trained": ps.tune_fp.n_params_trained,
+                                "step_losses": ps.tune_fp.step_losses,
+                                "step_lrs": ps.tune_fp.step_lrs,
+                                "final_grad_norm": ps.tune_fp.final_grad_norm,
+                            }
+                            if ps is not None and ps.tune_fp is not None
+                            else None
+                        ),
+                        "admm_init": ps.admm_init if ps is not None else {},
+                    }
+                )
+                for s, ps in zip(
+                    block_stats,
+                    (phase2_block_stats if args.tune_fp_steps > 0 else [None] * len(block_stats)),
+                )
+            ],
+        },
+        "phase3": (
+            {
+                "enabled": True,
+                "init_kl": tune_scales_stats.init_loss,
+                "final_kl": tune_scales_stats.final_loss,
+                "steps_taken": tune_scales_stats.steps_taken,
+                "bad_steps": tune_scales_stats.bad_steps,
+                "n_scale_params": tune_scales_stats.n_scale_params,
+                "temperature": tune_scales_stats.temperature,
+                "step_kls": tune_scales_stats.step_kls,
+                "step_lrs": tune_scales_stats.step_lrs,
+            }
+            if tune_scales_stats is not None
+            else {"enabled": False}
+        ),
+    }
+    with open(trace_file, "w") as f:
+        json.dump(trace_payload, f, indent=2)
+    print(f"[log] trace -> {trace_file}", flush=True)
 
 
 if __name__ == "__main__":

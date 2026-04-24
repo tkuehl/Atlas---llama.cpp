@@ -39,6 +39,15 @@ class TuneFPStats:
     final_loss: float
     bad_steps: int
     n_params_trained: int
+    step_losses: list = None
+    step_lrs: list = None
+    final_grad_norm: float = 0.0  # summed across all trainable params
+
+    def __post_init__(self):
+        if self.step_losses is None:
+            self.step_losses = []
+        if self.step_lrs is None:
+            self.step_lrs = []
 
 
 def _block_forward(block: nn.Module, x: torch.Tensor, aux_kwargs: dict) -> torch.Tensor:
@@ -145,6 +154,10 @@ def tune_fp(
     bad_steps = 0
     log_every = max(1, steps // 10)
 
+    step_losses: list[float] = []
+    step_lrs: list[float] = []
+    final_grad_norm = 0.0
+
     pbar = tqdm(range(steps), desc=f"TuneFP b{block_idx:2d}", leave=False)
     for step in pbar:
         idx = torch.randperm(n_samples)[:batch_size]
@@ -157,13 +170,28 @@ def tune_fp(
         if not torch.isfinite(loss):
             bad_steps += 1
             opt.zero_grad(set_to_none=True)
+            if sched is not None:
+                sched.step()
+            step_losses.append(float("nan"))
+            step_lrs.append(opt.param_groups[0]["lr"])
             continue
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
+
+        if step == steps - 1:
+            total_sq = 0.0
+            for p in trainable:
+                if p.grad is not None:
+                    total_sq += p.grad.pow(2).sum().item()
+            final_grad_norm = total_sq ** 0.5
+
         opt.step()
         if sched is not None:
             sched.step()
+
+        step_losses.append(loss.item())
+        step_lrs.append(opt.param_groups[0]["lr"])
 
         if step % log_every == 0 or step == steps - 1:
             pbar.set_postfix(mse=f"{loss.item():.4f}", bad=bad_steps)
@@ -195,4 +223,7 @@ def tune_fp(
         final_loss=final_loss,
         bad_steps=bad_steps,
         n_params_trained=len(trainable),
+        step_losses=step_losses,
+        step_lrs=step_lrs,
+        final_grad_norm=final_grad_norm,
     )

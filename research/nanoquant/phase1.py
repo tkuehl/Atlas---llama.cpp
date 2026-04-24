@@ -35,6 +35,21 @@ class BlockStats:
     init_mse: float
     final_mse: float
     n_linears_replaced: int
+    # Per-step trajectories (captured when verbose or when instrumented).
+    # Empty lists if not captured (keeps memory minimal by default).
+    step_losses: list = None
+    step_lrs: list = None
+    bad_steps: int = 0
+    n_params_trained: int = 0
+    final_grad_norms: list = None  # grad norm per trainable param at last step
+
+    def __post_init__(self):
+        if self.step_losses is None:
+            self.step_losses = []
+        if self.step_lrs is None:
+            self.step_lrs = []
+        if self.final_grad_norms is None:
+            self.final_grad_norms = []
 
 
 def _block_forward(block: nn.Module, x: torch.Tensor, aux_kwargs: dict) -> torch.Tensor:
@@ -72,6 +87,8 @@ def train_block(
     device,
     block_idx: int,
     verbose: bool = False,
+    cosine_schedule: bool = True,
+    record_trajectory: bool = True,
 ) -> BlockStats:
     # Freeze everything, then unfreeze only the quant parameters.
     for p in block.parameters():
@@ -93,6 +110,11 @@ def train_block(
         )
 
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0, betas=(0.9, 0.95))
+    sched = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(steps, 1), eta_min=lr * 0.1)
+        if cosine_schedule
+        else None
+    )
 
     # Cache is stored as fp16 for disk space; the block's compute dtype
     # is the dtype of NON-quant params (RMSNorm weights, bias). We must
@@ -120,6 +142,9 @@ def train_block(
     pbar = tqdm(range(steps), desc=f"block {block_idx:2d}", leave=False)
     bad_steps = 0
     log_every = max(1, steps // 20)
+    step_losses: list[float] = []
+    step_lrs: list[float] = []
+    final_grad_norms: list[float] = []
     for step in pbar:
         idx = torch.randint(0, n_samples, (1,)).item()
         x = X[idx : idx + 1].to(device=device, dtype=target_dtype, non_blocking=True)
@@ -132,6 +157,11 @@ def train_block(
         if not torch.isfinite(loss):
             bad_steps += 1
             opt.zero_grad(set_to_none=True)
+            if sched is not None:
+                sched.step()
+            if record_trajectory:
+                step_losses.append(float("nan"))
+                step_lrs.append(opt.param_groups[0]["lr"])
             continue
 
         opt.zero_grad(set_to_none=True)
@@ -152,7 +182,20 @@ def train_block(
                 flush=True,
             )
 
+        # Capture grad norms at last step for trace file.
+        if step == steps - 1 and record_trajectory:
+            final_grad_norms = [
+                (p.grad.norm().item() if p.grad is not None else 0.0)
+                for p in trainable
+            ]
+
         opt.step()
+        if sched is not None:
+            sched.step()
+
+        if record_trajectory:
+            step_losses.append(loss.item())
+            step_lrs.append(opt.param_groups[0]["lr"])
 
         if step % log_every == 0 or step == steps - 1:
             pbar.set_postfix(mse=f"{loss.item():.4f}", bad=bad_steps)
@@ -177,6 +220,11 @@ def train_block(
         n_linears_replaced=sum(
             1 for m in block.modules() if type(m).__name__ == "BinaryFactoredLinear"
         ),
+        step_losses=step_losses,
+        step_lrs=step_lrs,
+        bad_steps=bad_steps,
+        n_params_trained=len(trainable),
+        final_grad_norms=final_grad_norms,
     )
 
 
