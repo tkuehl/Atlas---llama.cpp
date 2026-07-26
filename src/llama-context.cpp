@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2382,6 +2383,17 @@ llm_graph_result * llama_context::gf_res_prev_get(llm_graph_type gtype, uint32_t
     // current split plan belongs to (sched_owned_res would dangle), nor the one
     // we are about to return.
     auto * res = static_cast<llm_graph_result *>(slot.get());
+    if (gf_res_lru.size() > GF_RES_PREV_MAX) {
+        // an eviction here is free only if the victim is genuinely cold. if the
+        // live working set exceeds the cap, we evict shapes we need again next
+        // step: each miss forces a full rebuild with a fresh uid, which defeats
+        // backend graph replay. that is a silent throughput cliff, so say so.
+        if (++gf_res_n_evict == GF_RES_EVICT_WARN_AT) {
+            LLAMA_LOG_WARN("%s: graph-reuse cache evicted %zu times (cap %zu) - if this keeps growing "
+                    "the live graph working set exceeds the cache and backend graph replay is being defeated\n",
+                    __func__, gf_res_n_evict, GF_RES_PREV_MAX);
+        }
+    }
     while (gf_res_lru.size() > GF_RES_PREV_MAX) {
         bool erased = false;
         for (auto it = gf_res_lru.end(); it != gf_res_lru.begin(); ) {

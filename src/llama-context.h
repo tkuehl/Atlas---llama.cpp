@@ -386,10 +386,22 @@ private:
     std::list<std::pair<int, int>>                      gf_res_lru;  // front = most recently used
     size_t gf_res_max_nodes = 0;
 
-    // enough for every shape a spec-decode step interleaves (draft, verify,
-    // chained segments, KV-catchup) plus the full-size prefill chunk, with room
-    // to spare; cold remainder shapes fall off the back.
-    static constexpr size_t GF_RES_PREV_MAX = 16;
+    // enough for every shape a spec-decode step interleaves plus prefill chunks.
+    // sizing note: the live working set is roughly (n_draft_max + 2) verify
+    // shapes x the number of graph types in play (a spec-decode target context
+    // alternates DEFAULT with the MTP/KV-catchup type, which do NOT share keys),
+    // plus the full-size prefill chunk. that is ~10 shapes at n_draft_max=4 but
+    // ~34 at n_draft_max=16, which the chained-block work moves toward. 64 keeps
+    // headroom for that without plumbing the draft size through cparams; the
+    // per-slot cost is only host graph metadata, and cold shapes still fall off
+    // the back. if the working set ever exceeds this, the cache thrashes
+    // silently (full rebuild + fresh uid defeats backend graph replay), so
+    // sustained eviction pressure is reported once rather than hidden.
+    static constexpr size_t GF_RES_PREV_MAX = 64;
+
+    // eviction counter + the threshold at which we warn once (see gf_res_prev_get)
+    size_t gf_res_n_evict = 0;
+    static constexpr size_t GF_RES_EVICT_WARN_AT = 256;
 
     // which cached graph result the scheduler's current split plan belongs to.
     // compute executes the sched's stored plan, so a reused graph must re-alloc
