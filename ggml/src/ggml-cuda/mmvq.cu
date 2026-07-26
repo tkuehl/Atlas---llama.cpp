@@ -280,6 +280,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+    // ATLAS EXPERIMENT (atlas/gdn-ring-state-cuda): force ternary Q1_0/Q2_0 off the dp4a mmvq path
+    // at decode so they fall through to the int8-tensor-core MMQ path, to test whether tensor cores
+    // beat dp4a at batch=1 for 1.71-bit weights. Env-gated so it's a clean A/B (unset = stock behavior).
+    if ((type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0) && getenv("ATLAS_NO_MMVQ_LOWBIT") != nullptr) {
+        return false;
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {

@@ -2617,7 +2617,8 @@ bool llama_context::dspark_markov_resample(
 
     const auto supported_head_type = [](ggml_type type) {
         return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
-               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
+               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || // ATLAS: shipped drafters use Q4_1 markov heads
+               type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
     };
     if (!supported_head_type(head_a->type) || !supported_head_type(head_b->type)) {
         return false;

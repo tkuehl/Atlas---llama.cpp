@@ -1331,20 +1331,48 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // would need i to be the RAW ubatch row (ctx_len + k here), since
             // it resolves through output_resolve_row() same as the
             // pre-norm/capture accessors -- the bulk buffer sidesteps that.
-            const float * logits_base = llama_get_logits(ctx_dft);
-            if (logits_base == nullptr) {
-                LOG_ERR("%s: llama_get_logits(ctx_dft) returned null for seq %d\n", __func__, (int) seq_id);
-                continue;
+            // ATLAS reorder (WDDM finding, nsys 2026-07-26): try the fully
+            // device-resident resample FIRST — it reads the drafter's
+            // still-device-resident logits tensor directly, so the success path
+            // never pays the ~5MB/round D2H of block logits (llama_get_logits)
+            // nor the host-fed path's matching H2D + per-copy stream syncs,
+            // which the profile convicted as 94% of round time on WDDM. The
+            // host-fed CUDA path becomes fallback. ATLAS_MARKOV_HOSTFED=1
+            // restores the original order for A/B.
+            bool did_dev = false;
+            if (has_markov && getenv("ATLAS_MARKOV_HOSTFED") == nullptr) {
+                result.resize((size_t) block_size);
+                if (llama_dspark_markov_resample(ctx_dft, block_size, dp.id_last, result.data())) {
+                    static bool warned_dev_mask = false;
+                    for (int32_t k = 1; k < block_size && !warned_dev_mask; ++k) {
+                        if (result[(size_t) (k - 1)] == mask_token_id) {
+                            LOG_WRN("%s: device markov resample sampled mask_token_id at a chained position\n", __func__);
+                            warned_dev_mask = true;
+                        }
+                    }
+                    did_dev = true;
+                } else {
+                    result.clear();
+                }
             }
 
-            bool did_cuda = false;
+            const float * logits_base = nullptr;
+            if (!did_dev) {
+                logits_base = llama_get_logits(ctx_dft);
+                if (logits_base == nullptr) {
+                    LOG_ERR("%s: llama_get_logits(ctx_dft) returned null for seq %d\n", __func__, (int) seq_id);
+                    continue;
+                }
+            }
+
+            bool did_cuda = did_dev; // device path already produced the block
 #ifdef LLAMA_DSPARK_MARKOV_CUDA
             // Device path: one H2D of this round's base logits, then a
             // sequential per-position fused GEMV + add-base + argmax that
             // chains through a device-resident prev token. The chaining
             // invariant is structural -- position k's kernel reads the argmax
             // position k-1's kernel wrote to device memory, never a host id.
-            if (markov_use_cuda && has_markov) {
+            if (!did_dev && markov_use_cuda && has_markov) {
                 static_assert(sizeof(llama_token) == sizeof(int32_t),
                         "dspark cuda markov path assumes llama_token == int32_t");
                 result.resize((size_t) block_size);
@@ -1381,8 +1409,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // argmax feeds the next step's get_rows), reading the drafter's
             // still-device-resident logits. Returns false when the head or
             // backend is unsupported (or DSPARK_MARKOV_CPU=1) -> host path.
-            bool did_metal = false;
-            if (!did_cuda && has_markov) {
+            bool did_metal = did_dev; // ATLAS: device-first path already ran above
+            if (!did_cuda && !did_metal && has_markov) {
                 result.resize((size_t) block_size);
                 if (llama_dspark_markov_resample(ctx_dft, block_size, dp.id_last, result.data())) {
                     static bool warned_metal_mask = false;
