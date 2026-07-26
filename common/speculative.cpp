@@ -903,6 +903,51 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// ATLAS: grammar-aware drafting (see common_speculative_draft_params::smpl_tgt).
+// env kill-switch so the behavior can be A/B'd against a running server.
+static bool grammar_drafting_enabled() {
+    static const bool disabled = getenv("ATLAS_NO_GRAMMAR_DRAFT") != nullptr;
+    return !disabled;
+}
+
+// Apply `grmr` to the drafter's candidate array and return the highest-ranked token
+// that the grammar still permits, or LLAMA_TOKEN_NULL if the grammar rejects all of
+// them. cur_p is the drafter's own top-k, already sorted by probability, so the
+// first survivor is the best legal draft.
+//
+// Note this constrains the draft to the intersection of "what the drafter likes" and
+// "what the grammar allows". It cannot invent a token outside the drafter's top-k --
+// if the only legal continuations sit below that cut, we correctly draft nothing
+// rather than guess.
+static llama_token grammar_pick(llama_sampler * grmr, const llama_token_data_array * cur_p) {
+    if (!grmr || !cur_p || cur_p->size == 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    // grammar application mutates the array, so work on a copy of the drafter's view
+    std::vector<llama_token_data> cand(cur_p->data, cur_p->data + cur_p->size);
+    llama_token_data_array arr = {
+        /* .data     = */ cand.data(),
+        /* .size     = */ cand.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ cur_p->sorted,
+    };
+
+    llama_sampler_apply(grmr, &arr);
+
+    // rejected candidates come back with -INFINITY logits
+    llama_token best_id = LLAMA_TOKEN_NULL;
+    float       best_l  = -INFINITY;
+    for (size_t k = 0; k < arr.size; ++k) {
+        if (arr.data[k].logit > best_l) {
+            best_l  = arr.data[k].logit;
+            best_id = arr.data[k].id;
+        }
+    }
+
+    return std::isfinite(best_l) ? best_id : LLAMA_TOKEN_NULL;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1230,6 +1275,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // at the first position below the confidence threshold.
                 const float * conf = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
+                // ATLAS: grammar-aware drafting. under a grammar the target rejects any
+                // draft token that is not currently LEGAL, however good the drafter
+                // thought it was, so proposing illegal tokens is pure wasted verify.
+                // constrain the drafter to the same grammar and it stops making that
+                // class of mistake. the clone is advanced through DRAFT tokens (which
+                // may be rejected), so it must never be the target's own grammar.
+                // RAII: the chain loop below has several `break` paths, so do not
+                // hand-free this.
+                std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> grmr_owner(
+                        grammar_drafting_enabled() ? common_sampler_clone_grammar(dp.smpl_tgt) : nullptr,
+                        &llama_sampler_free);
+                llama_sampler * grmr = grmr_owner.get();
+
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
@@ -1247,13 +1305,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    const llama_token id = grmr ? grammar_pick(grmr, cur_p) : cur_p->data[0].id;
+                    if (id == LLAMA_TOKEN_NULL) {
+                        // every candidate the drafter offered is illegal here. drafting
+                        // further would just feed verify guaranteed rejects - stop and
+                        // let the target decode this position itself.
+                        break;
+                    }
 
                     common_sampler_accept(smpl, id, true);
+                    if (grmr) {
+                        llama_sampler_accept(grmr, id);
+                    }
 
                     result.push_back(id);
                 }
-
                 // ATLAS: chained segments — a cleanly-drafted block seeds another
                 // [anchor + masks] segment (anchor = last drafted token) until
                 // n_want. Verify weight-read cost is ~flat in batch size, so
@@ -1307,8 +1373,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         common_sampler_sample(smpl, ctx_dft, idx, true);
                         const auto * cp = common_sampler_get_candidates(smpl, true);
-                        const llama_token id = cp->data[0].id;
+                        // ATLAS: same grammar constraint as the first block. grmr is
+                        // already advanced through every token drafted so far.
+                        const llama_token id = grmr ? grammar_pick(grmr, cp) : cp->data[0].id;
+                        if (id == LLAMA_TOKEN_NULL) {
+                            break;
+                        }
                         common_sampler_accept(smpl, id, true);
+                        if (grmr) {
+                            llama_sampler_accept(grmr, id);
+                        }
                         result.push_back(id);
                         added++;
                     }

@@ -48,6 +48,18 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // ATLAS: optional grammar-aware drafting. when the target is decoding under a
+    // grammar (json_schema, GBNF), draft tokens that are correct but not currently
+    // LEGAL are rejected at verify, which is pure wasted work: measured draft
+    // acceptance on Atlas's schema-constrained routing traffic was 46% vs 75-85%
+    // free-running. pass the target's sampler here and the drafter constrains its
+    // own candidates to the grammar before picking, so it stops proposing tokens
+    // that verify is guaranteed to throw away.
+    // the implementation CLONES this sampler's grammar - the draft advances grammar
+    // state through tokens that may be rejected, which must never touch the
+    // target's real state.
+    struct common_sampler * smpl_tgt = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

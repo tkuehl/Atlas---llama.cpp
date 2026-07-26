@@ -2970,6 +2970,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .smpl_tgt = */ slot.smpl.get(), // ATLAS: grammar-aware drafting
                         };
 
                         drafting.push_back(&slot);

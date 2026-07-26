@@ -52,6 +52,18 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// ATLAS: grammar-aware drafting support.
+//
+// returns a standalone CLONE of the sampler's grammar sampler, already advanced to
+// the sampler's current parse state, or nullptr when no grammar is active (or the
+// grammar is currently not being applied, e.g. a lazy grammar whose trigger has not
+// fired, or the reasoning budget is still open).
+//
+// the caller owns the result and must llama_sampler_free() it. a clone is required
+// because a speculative drafter advances grammar state through tokens that may be
+// rejected at verify - that must never touch the target sampler's real state.
+struct llama_sampler * common_sampler_clone_grammar(struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits

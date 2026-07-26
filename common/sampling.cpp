@@ -548,6 +548,16 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+struct llama_sampler * common_sampler_clone_grammar(struct common_sampler * gsmpl) {
+    if (!gsmpl || !grammar_should_apply(gsmpl)) {
+        return nullptr;
+    }
+
+    // clone carries the current parse state, so the drafter starts constrained
+    // exactly where the target is
+    return llama_sampler_clone(gsmpl->grmr);
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
