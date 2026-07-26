@@ -8,7 +8,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
+    // stock PrismML dspark GGUFs use "<arch>.dspark.*" keys; dflash-converted
+    // files use the flat "<arch>.target_layers". One arch, one key set.
+    const llm_kv kv_target_layers = arch == LLM_ARCH_DSPARK ? LLM_KV_DSPARK_TARGET_LAYERS : LLM_KV_TARGET_LAYERS;
+    if (!ml.get_arr(kv_target_layers, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
@@ -37,26 +40,53 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
-    // DSpark = DFlash + a semi-autoregressive Markov head and Confidence head
+    // DSpark = DFlash + a semi-autoregressive Markov head and Confidence head.
+    // Two on-disk formats, one arch class: dflash-converted files use the
+    // PR-canonical flat names; stock PrismML dspark files (arch "dspark") use
+    // their native "dspark.*" names. Per-arch loading — no fallbacks.
     //
     // TODO: only Qwen3-style backbones are supported for now; other backbones (e.g. Gemma4)
     //       need their own conversion path and graph tweaks
-    const struct ggml_tensor * markov_meta = ml->get_tensor_meta("markov_w1.weight");
+    const bool is_dspark_arch = arch == LLM_ARCH_DSPARK;
+
+    const struct ggml_tensor * markov_meta =
+        ml->get_tensor_meta(is_dspark_arch ? "dspark.markov_head_a.weight" : "markov_w1.weight");
     if (markov_meta) {
         const int64_t dspark_markov_rank = markov_meta->ne[0];
 
-        dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
-        dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab }, 0);
-
-        dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
-        dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
+        if (is_dspark_arch) {
+            dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_A, "weight"), { dspark_markov_rank, n_vocab }, 0);
+            dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_B, "weight"), { dspark_markov_rank, n_vocab }, 0);
+            dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_HEAD, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
+            dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_HEAD, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
+        } else {
+            dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+            dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab }, 0);
+            dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
+            dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
+        }
 
         LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
     }
 
-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
-    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
-    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+    if (is_dspark_arch) {
+        fc              = create_tensor(tn(LLM_TENSOR_DSPARK_FC,          "weight"), { n_embd_inp, n_embd }, 0);
+        output_norm_enc = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_NORM, "weight"), { n_embd }, 0);
+    } else {
+        fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+        output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+    }
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0); // decoder final norm
+
+    // drafter-own lm_head (stock dspark files ship one; dflash-converted files
+    // fall back to the target's via ctx_other in the graph)
+    {
+        const struct ggml_tensor * out_meta = ml->get_tensor_meta(tn(LLM_TENSOR_OUTPUT, "weight").str().c_str());
+        if (out_meta) {
+            output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, 0);
+            LLAMA_LOG_INFO("%s: DFlash using its own output head\n", __func__);
+        }
+    }
 
     // ATLAS: optional drafter-own token embeddings (mirrors eagle3). Converted
     // DSpark drafters carry a TRAINED mask-token row (and log-SNR conditioning
@@ -71,13 +101,26 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         }
     }
 
-    // ATLAS: optional DSpark GIDD log-SNR conditioning MLP (128-freq sinusoid ->
-    // fc1 -> SiLU -> fc2, added to draft-block embeddings in the decoder graph).
-    // Trained-in for DSpark drafters; running without it distorts every block row.
-    dflash_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC1, "weight"), { 128, n_embd },    TENSOR_NOT_REQUIRED);
-    dflash_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC1, "bias"),   { n_embd },         TENSOR_NOT_REQUIRED);
-    dflash_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, TENSOR_NOT_REQUIRED);
-    dflash_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC2, "bias"),   { n_embd },         TENSOR_NOT_REQUIRED);
+    // GIDD log-SNR conditioning MLP (128-freq sinusoid -> fc1 -> SiLU -> fc2,
+    // added to draft-block embeddings in the decoder graph). Stock dspark files
+    // declare it via <arch>.dspark.log_snr_conditioning and it is REQUIRED when
+    // declared (a drafter trained with conditioning must not run without it);
+    // dflash-converted files may carry it under the ATLAS dflash.* names.
+    if (is_dspark_arch) {
+        bool snr_cond = false;
+        ml->get_key(LLM_KV_DSPARK_LOG_SNR_COND, snr_cond, false);
+        if (snr_cond) {
+            dflash_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "weight"), { 128, n_embd },    0);
+            dflash_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "bias"),   { n_embd },         0);
+            dflash_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, 0);
+            dflash_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "bias"),   { n_embd },         0);
+        }
+    } else {
+        dflash_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC1, "weight"), { 128, n_embd },    TENSOR_NOT_REQUIRED);
+        dflash_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC1, "bias"),   { n_embd },         TENSOR_NOT_REQUIRED);
+        dflash_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, TENSOR_NOT_REQUIRED);
+        dflash_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC2, "bias"),   { n_embd },         TENSOR_NOT_REQUIRED);
+    }
     if (dflash_log_snr_fc1_w) {
         LLAMA_LOG_INFO("%s: DFlash log-SNR conditioning tensors loaded\n", __func__);
     }
@@ -159,8 +202,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 
-    const auto it = model.gguf_kv.find("dflash.block_size");
-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
+    // per-format key: dflash-converted files vs stock PrismML dspark files
+    const char * key_block = model.arch == LLM_ARCH_DSPARK ? "dspark.dspark.block_size" : "dflash.block_size";
+    const auto it = model.gguf_kv.find(key_block);
+    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires the block_size GGUF metadata key");
     const int64_t block_size = std::stoi(it->second);
     GGML_ASSERT(block_size > 0);
 

@@ -951,24 +951,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
-        // read the trained block size from the dflash.block_size metadata key
+        // read the trained block size from drafter metadata. Two on-disk formats,
+        // keyed per architecture (no fallbacks): dflash-converted files use
+        // "dflash.*"; stock PrismML dspark files use "dspark.dspark.*".
+        char arch_buf[32] = {};
+        llama_model_meta_val_str(model_dft, "general.architecture", arch_buf, sizeof(arch_buf));
+        const bool is_dspark_file = strcmp(arch_buf, "dspark") == 0;
+        const char * key_block = is_dspark_file ? "dspark.dspark.block_size"    : "dflash.block_size";
+        const char * key_mask  = is_dspark_file ? "dspark.dspark.mask_token_id" : "dflash.mask_token_id";
+
         block_size = 16;
         {
             char buf[32] = {};
-            if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+            if (llama_model_meta_val_str(model_dft, key_block, buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        // ATLAS: drafters shipped with a null tokenizer (tokenizer.ggml.model=none)
-        // cannot surface a mask token through the vocab — fall back to the
-        // dflash.mask_token_id metadata key (e.g. converted DSpark drafters).
+        // drafters shipped with a null tokenizer (tokenizer.ggml.model=none)
+        // cannot surface a mask token through the vocab — read it from the
+        // format's metadata key instead.
         if (mask_token_id == LLAMA_TOKEN_NULL) {
             char buf[32];
-            if (llama_model_meta_val_str(model_dft, "dflash.mask_token_id", buf, sizeof(buf)) >= 0) {
+            if (llama_model_meta_val_str(model_dft, key_mask, buf, sizeof(buf)) >= 0) {
                 mask_token_id = std::atoi(buf);
-                LOG_INF("%s: mask token from dflash.mask_token_id metadata: %d\n", __func__, mask_token_id);
+                LOG_INF("%s: mask token from %s metadata: %d\n", __func__, key_mask, mask_token_id);
             }
         }
 
