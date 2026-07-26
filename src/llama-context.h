@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <list>
 #include <map>
 #include <vector>
 
@@ -374,10 +375,21 @@ private:
     // n-token/0-output KV-catchup pass with 1-token draft steps). a single slot
     // (or per-type slot) is evicted on every alternation, which forces a full
     // rebuild with a fresh uid and silently defeats backend CUDA-graph replay.
-    // slot count is bounded in practice: gtypes are few and n_tokens classes are
-    // prefill chunk sizes + small verify/draft sizes (<= n_max + 2).
+    // slot count is NOT bounded by traffic: the hot shapes are few (draft/verify
+    // sizes and full prefill chunks), but every prefill whose length is not a
+    // multiple of n_ubatch mints one more slot from its remainder ubatch. over a
+    // long-lived server that is up to n_ubatch distinct sizes, each retaining a
+    // graph result whose buf_compute_meta is ~tensor_overhead*max_nodes (2.8 MB
+    // for a 27B target) — hundreds of MB of host metadata that is never reused.
+    // so the map is an LRU: keep the hot shapes, evict the cold one-off sizes.
     std::map<std::pair<int, int>, llm_graph_result_ptr> gf_res_prev;
+    std::list<std::pair<int, int>>                      gf_res_lru;  // front = most recently used
     size_t gf_res_max_nodes = 0;
+
+    // enough for every shape a spec-decode step interleaves (draft, verify,
+    // chained segments, KV-catchup) plus the full-size prefill chunk, with room
+    // to spare; cold remainder shapes fall off the back.
+    static constexpr size_t GF_RES_PREV_MAX = 16;
 
     // which cached graph result the scheduler's current split plan belongs to.
     // compute executes the sched's stored plan, so a reused graph must re-alloc

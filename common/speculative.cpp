@@ -13,9 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
-#include <thread>
 #include <cstring>
-#include <thread>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -925,6 +923,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // per-round scratch, reused so the hot draft/process path does not allocate
+    std::vector<int32_t> i_batch_beg, i_batch_end;      // process()
+    std::vector<int32_t> i_block_beg, n_block, n_want;  // draft()
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1021,77 +1023,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
 
-        // ATLAS: optional DSpark low-rank Markov chaining correction, loaded from
-        // a side file (ATLAS_DFLASH_MARKOV=path). The DSpark drafter's block
-        // proposals are per-position marginals; the fork chains them with
-        //   step_logit[v] = base_logit[k][v] + dot(A[prev], B[v])
-        // where prev is the anchor for k==0 and the corrected argmax of k-1
-        // after. Without this the drafter measured 13.7% matched acceptance vs
-        // ~70% in the fork's full stack. Layout: 'DMRK' i32 ver i32 rank
-        // i64 n_vocab, A[n_vocab][rank] f32, B[n_vocab][rank] f32.
-        if (const char * mpath = getenv("ATLAS_DFLASH_MARKOV")) {
-            FILE * mf = fopen(mpath, "rb");
-            if (mf) {
-                char magic[4] = {};
-                int32_t ver = 0, rank = 0;
-                int64_t nv = 0;
-                markov_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                if (fread(magic, 1, 4, mf) == 4 && memcmp(magic, "DMRK", 4) == 0 &&
-                        fread(&ver, 4, 1, mf) == 1 && ver == 1 &&
-                        fread(&rank, 4, 1, mf) == 1 && rank > 0 &&
-                        fread(&nv, 8, 1, mf) == 1 && nv == markov_n_vocab) {
-                    markov_rank = rank;
-                    markov_a.resize((size_t) nv * rank);
-                    markov_b.resize((size_t) nv * rank);
-                    has_markov =
-                        fread(markov_a.data(), 4, markov_a.size(), mf) == markov_a.size() &&
-                        fread(markov_b.data(), 4, markov_b.size(), mf) == markov_b.size();
-                }
-                fclose(mf);
-            }
-            LOG_INF("%s: - ATLAS markov correction %s (rank=%d, n_vocab=%lld)\n", __func__,
-                    has_markov ? "LOADED" : "FAILED TO LOAD", (int) markov_rank, (long long) markov_n_vocab);
-        }
-    }
-
-    // ATLAS markov side-state
-    std::vector<float> markov_a, markov_b;
-    int32_t markov_rank    = 0;
-    int64_t markov_n_vocab = 0;
-    bool    has_markov     = false;
-
-    // corrected argmax over base + dot(A[prev], B[v]), threaded over vocab chunks
-    llama_token markov_corrected_argmax(const float * base, llama_token prev) const {
-        const int64_t nv = markov_n_vocab;
-        const float * arow = markov_a.data() + (size_t) prev * markov_rank;
-        const int nthread = 8;
-        std::vector<std::pair<float, int64_t>> best(nthread, {-1e30f, 0});
-        std::vector<std::thread> ths;
-        for (int t = 0; t < nthread; ++t) {
-            ths.emplace_back([&, t]() {
-                const int64_t v0 = nv *  t      / nthread;
-                const int64_t v1 = nv * (t + 1) / nthread;
-                float   bv = -1e30f;
-                int64_t bi = v0;
-                for (int64_t v = v0; v < v1; ++v) {
-                    const float * brow = markov_b.data() + (size_t) v * markov_rank;
-                    float corr = 0.0f;
-                    for (int32_t r = 0; r < markov_rank; ++r) {
-                        corr += arow[r] * brow[r];
-                    }
-                    const float s = base[v] + corr;
-                    if (s > bv) { bv = s; bi = v; }
-                }
-                best[t] = {bv, bi};
-            });
-        }
-        for (auto & th : ths) { th.join(); }
-        float   bv = -1e30f;
-        int64_t bi = 0;
-        for (const auto & p : best) {
-            if (p.first > bv) { bv = p.first; bi = p.second; }
-        }
-        return (llama_token) bi;
+        // note: the DSpark low-rank Markov chaining correction used to be applied
+        // here on the CPU from a side file (ATLAS_DFLASH_MARKOV). It now runs
+        // in-graph on the backend (build_dspark_markov_head), reading the head
+        // straight out of the drafter GGUF, so the side-file path is gone: it
+        // pinned ~509 MB of host RAM (2 x [n_vocab, rank] f32) and spawned a
+        // thread pool per drafted position for work the GPU already does.
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1130,8 +1067,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t n_tokens = batch_in.n_tokens;
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
-        std::vector<int32_t> i_batch_beg(n_seq, -1);
-        std::vector<int32_t> i_batch_end(n_seq, -1);
+        i_batch_beg.assign(n_seq, -1);
+        i_batch_end.assign(n_seq, -1);
         for (int32_t k = 0; k < n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
@@ -1222,9 +1159,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
-        std::vector<int32_t> i_block_beg(n_seq, -1);
-        std::vector<int32_t> n_block    (n_seq,  0);
-        std::vector<int32_t> n_want     (n_seq,  0); // ATLAS: total requested (chained segments)
+        i_block_beg.assign(n_seq, -1);
+        n_block    .assign(n_seq,  0);
+        n_want     .assign(n_seq,  0); // ATLAS: total requested (chained segments)
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];

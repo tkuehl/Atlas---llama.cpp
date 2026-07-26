@@ -130,15 +130,25 @@ void llm_graph_input_atlas_logsnr::set_input(const llama_ubatch * ubatch) {
     const int64_t half     = n_freq / 2;
     GGML_ASSERT(ubatch->n_tokens == n_tokens);
 
-    std::vector<float> buf((size_t) n_freq * n_tokens);
-    for (int64_t r = 0; r < n_tokens; ++r) {
-        const float t = (ubatch->token[r] == mask_id) ? 0.0f : 1000.0f;
+    // the two possible rows are shape-invariant - build them once
+    if ((int64_t) row_mask.size() != n_freq) {
+        row_mask  .resize(n_freq);
+        row_anchor.resize(n_freq);
         for (int64_t i = 0; i < half; ++i) {
-            const float freq  = expf(-logf(10000.0f) * (float) i / (float) half);
-            const float angle = t * freq;
-            buf[(size_t) r * n_freq + i]        = sinf(angle);
-            buf[(size_t) r * n_freq + half + i] = cosf(angle);
+            const float freq = expf(-logf(10000.0f) * (float) i / (float) half);
+            for (int s = 0; s < 2; ++s) {
+                const float   angle = (s == 0 ? 0.0f : 1000.0f) * freq;
+                float * const row   = s == 0 ? row_mask.data() : row_anchor.data();
+                row[i]        = sinf(angle);
+                row[half + i] = cosf(angle);
+            }
         }
+    }
+
+    buf.resize((size_t) n_freq * n_tokens);
+    for (int64_t r = 0; r < n_tokens; ++r) {
+        const float * src = (ubatch->token[r] == mask_id) ? row_mask.data() : row_anchor.data();
+        std::memcpy(buf.data() + (size_t) r * n_freq, src, (size_t) n_freq * sizeof(float));
     }
     ggml_backend_tensor_set(feat, buf.data(), 0, ggml_nbytes(feat));
 }

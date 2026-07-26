@@ -165,6 +165,14 @@ public:
     ggml_tensor * feat = nullptr; // F32 [128, n_tokens]
 
     const llama_token mask_id;
+
+private:
+    // only two distinct rows exist (t=0 for mask rows, t=1000 for anchors) and the
+    // sinusoid frequencies are constant, so the transcendentals are computed once
+    // on first use and the per-ubatch fill is a memcpy select.
+    std::vector<float> row_mask;   // [n_freq] t = 0
+    std::vector<float> row_anchor; // [n_freq] t = 1000
+    std::vector<float> buf;        // staging, reused across calls
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {

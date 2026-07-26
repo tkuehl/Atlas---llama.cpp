@@ -2361,11 +2361,52 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::gf_res_prev_get(llm_graph_type gtype, uint32_t n_tokens) {
-    auto & slot = gf_res_prev[{(int) gtype, (int) n_tokens}];
+    const auto key = std::make_pair((int) gtype, (int) n_tokens);
+
+    auto & slot = gf_res_prev[key];
     if (!slot) {
         slot.reset(new llm_graph_result(gf_res_max_nodes));
     }
-    return static_cast<llm_graph_result *>(slot.get());
+
+    // touch: move to the front of the LRU
+    {
+        auto it = std::find(gf_res_lru.begin(), gf_res_lru.end(), key);
+        if (it != gf_res_lru.end()) {
+            gf_res_lru.splice(gf_res_lru.begin(), gf_res_lru, it);
+        } else {
+            gf_res_lru.push_front(key);
+        }
+    }
+
+    // evict cold shapes from the back. never evict the slot the scheduler's
+    // current split plan belongs to (sched_owned_res would dangle), nor the one
+    // we are about to return.
+    auto * res = static_cast<llm_graph_result *>(slot.get());
+    while (gf_res_lru.size() > GF_RES_PREV_MAX) {
+        bool erased = false;
+        for (auto it = gf_res_lru.end(); it != gf_res_lru.begin(); ) {
+            --it;
+            auto victim = gf_res_prev.find(*it);
+            if (victim == gf_res_prev.end()) {
+                it = gf_res_lru.erase(it);
+                erased = true;
+                break;
+            }
+            const void * vptr = (const void *) victim->second.get();
+            if (vptr == (const void *) res || vptr == sched_owned_res) {
+                continue; // pinned - try the next-coldest
+            }
+            gf_res_prev.erase(victim);
+            gf_res_lru.erase(it);
+            erased = true;
+            break;
+        }
+        if (!erased) {
+            break; // everything left is pinned
+        }
+    }
+
+    return res;
 }
 
 void llama_context::gf_res_prev_reset_all() {
