@@ -1322,22 +1322,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // n_want. Verify weight-read cost is ~flat in batch size, so
                 // extra segments are near-free tokens on clean rounds. A short
                 // or conf-truncated read stops chaining naturally.
-                while ((int32_t) result.size() > 0 &&
+                static const bool atlas_no_chain = getenv("ATLAS_NO_CHAIN") != nullptr;
+                while (!atlas_no_chain &&
+                       (int32_t) result.size() > 0 &&
                        (int32_t) result.size() % block_size == 0 && // every segment so far drafted fully
                        (int32_t) result.size() < n_want[seq_id]) {
                     const int32_t done  = (int32_t) result.size();
                     const int32_t seg   = std::min(block_size, n_want[seq_id] - done);
-                    const int32_t n0    = (int32_t) dp.n_past + done;
+                    const int32_t n_base = (int32_t) dp.n_past;
+
+                    // Re-decode the already-drafted tokens as REAL context rows so
+                    // the chained segment's non-causal attention conditions on
+                    // actual token representations instead of the previous
+                    // segment's stale mask rows. Crop those stale rows first
+                    // (consecutive-position requirement), then decode
+                    // [drafted..., masks...] in one batch. The last drafted token
+                    // doubles as the segment anchor.
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) n_base, -1);
 
                     common_batch_clear(batch_chain);
+                    for (int32_t i = 0; i < done; ++i) {
+                        common_batch_add(batch_chain, result[(size_t) i], n_base + i, { seq_id }, /*logits=*/ i == done - 1);
+                    }
                     for (int32_t i = 0; i < seg; ++i) {
-                        common_batch_add(batch_chain, i == 0 ? result.back() : mask_token_id, n0 + i, { seq_id }, true);
+                        common_batch_add(batch_chain, mask_token_id, n_base + done + i, { seq_id }, true);
                     }
                     {
                         static const bool chain_dbg = getenv("ATLAS_CHAIN_DEBUG") != nullptr;
                         const int rc = llama_decode(ctx_dft, batch_chain);
                         if (chain_dbg) {
-                            LOG_WRN("ATLAS chain: seg=%d n0=%d rc=%d done=%d want=%d\n", (int) seg, (int) n0, rc, (int) done, (int) n_want[seq_id]);
+                            LOG_WRN("ATLAS chain: seg=%d base=%d rc=%d done=%d want=%d\n", (int) seg, (int) n_base, rc, (int) done, (int) n_want[seq_id]);
                         }
                         if (rc != 0) {
                             break;
@@ -1345,11 +1359,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     const float * conf_c = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                     int32_t added = 0;
+                    // logits-bearing BATCH rows: the anchor (index done-1) predicts
+                    // the first new token; mask rows (done..done+seg-2) predict the
+                    // rest. get_logits_ith resolves BATCH indices — context rows
+                    // without logits would resolve to null (the old ordinal trap).
                     for (int32_t i = 0; i < seg; ++i) {
-                        if (conf_c && conf_c[(size_t) i * n_embd_dec] < params.conf_min) {
+                        const int32_t idx = i == 0 ? done - 1 : done + (i - 1);
+                        if (conf_c && conf_c[(size_t) idx * n_embd_dec] < params.conf_min) {
                             break;
                         }
-                        common_sampler_sample(smpl, ctx_dft, i, true);
+                        common_sampler_sample(smpl, ctx_dft, idx, true);
                         const auto * cp = common_sampler_get_candidates(smpl, true);
                         const llama_token id = cp->data[0].id;
                         common_sampler_accept(smpl, id, true);
