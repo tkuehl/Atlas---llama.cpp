@@ -95,6 +95,92 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_0(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK2_0;
+    constexpr int threads_per_row = blocks_per_iter * QI2_0;
+    constexpr int nrows = warp_size / threads_per_row;
+    constexpr int scale_entries_per_block = QK2_0 / QK8_1;
+    constexpr int scale_entries_per_row = blocks_per_iter * scale_entries_per_block;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / QI2_0;
+    const int kqsx = txi % QI2_0;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + kbx;
+        // this thread's 32-value chunk: 8 bytes of 2-bit codes. blocks are 18B
+        // (2B scale + 16B qs), so qs is 2-byte aligned — use int16 loads
+        // (matches the Q1_0 loader; plain byte loads measured ~30% slower prefill)
+        const int16_t * qs16 = (const int16_t *) (bxi->qs + 8*kqsx);
+        const int q0 = (uint16_t) qs16[0] | ((uint16_t) qs16[1] << 16);
+        const int q1 = (uint16_t) qs16[2] | ((uint16_t) qs16[3] << 16);
+
+        const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int q = j == 0 ? q0 : q1;
+            // unpack 16 2-bit codes {0,1,2,3} into 4 ints of signed int8
+            // symbols {-1,0,+1,+2} (code - 1), preserving element order
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int codes = (q >> (8*b)) & 0xFF;
+                const int c0 = ((codes >> 0) & 0x3) - 1;
+                const int c1 = ((codes >> 2) & 0x3) - 1;
+                const int c2 = ((codes >> 4) & 0x3) - 1;
+                const int c3 = ((codes >> 6) & 0x3) - 1;
+                const int v  = (c0 & 0xFF) | ((c1 & 0xFF) << 8) | ((c2 & 0xFF) << 16) | ((c3 & 0xFF) << 24);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+                x_qs[i*sram_stride           + dst_offset + j*4 + b] = v;
+#else
+                x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*4 + b] = v;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            }
+        }
+    }
+
+    const int ksx = threadIdx.x % scale_entries_per_row;
+    const int scale_block = ksx / scale_entries_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + scale_block;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                           + ksx] = bxi->d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
