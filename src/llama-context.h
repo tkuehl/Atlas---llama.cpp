@@ -364,7 +364,29 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    llm_graph_result_ptr gf_res_prev;
+    // per-graph-type cache of the previously built graph. a single shared slot
+    // defeats graph reuse whenever one context alternates topologies every step
+    // (e.g. spec-decode: verify/process graph vs draft graphs) — each build then
+    // evicts the other, forcing a full rebuild with a fresh uid, which in turn
+    // prevents backend CUDA-graph replay for BOTH graphs.
+    // keyed by (graph type, ubatch n_tokens): one context can interleave several
+    // graph shapes every step (e.g. spec decode on an MTP context alternates an
+    // n-token/0-output KV-catchup pass with 1-token draft steps). a single slot
+    // (or per-type slot) is evicted on every alternation, which forces a full
+    // rebuild with a fresh uid and silently defeats backend CUDA-graph replay.
+    // slot count is bounded in practice: gtypes are few and n_tokens classes are
+    // prefill chunk sizes + small verify/draft sizes (<= n_max + 2).
+    std::map<std::pair<int, int>, llm_graph_result_ptr> gf_res_prev;
+    size_t gf_res_max_nodes = 0;
+
+    // which cached graph result the scheduler's current split plan belongs to.
+    // compute executes the sched's stored plan, so a reused graph must re-alloc
+    // if another graph shape owned the sched since its last run.
+    const void * sched_owned_res = nullptr;
+
+    llm_graph_result * gf_res_prev_get(llm_graph_type gtype, uint32_t n_tokens);
+    void gf_res_prev_reset_all();
+
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

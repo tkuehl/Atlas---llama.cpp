@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <thread>
 #include <cstring>
+#include <thread>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -953,6 +955,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        // ATLAS: drafters shipped with a null tokenizer (tokenizer.ggml.model=none)
+        // cannot surface a mask token through the vocab — fall back to the
+        // dflash.mask_token_id metadata key (e.g. converted DSpark drafters).
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            char buf[32];
+            if (llama_model_meta_val_str(model_dft, "dflash.mask_token_id", buf, sizeof(buf)) >= 0) {
+                mask_token_id = std::atoi(buf);
+                LOG_INF("%s: mask token from dflash.mask_token_id metadata: %d\n", __func__, mask_token_id);
+            }
+        }
+
         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
@@ -984,6 +997,78 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        // ATLAS: optional DSpark low-rank Markov chaining correction, loaded from
+        // a side file (ATLAS_DFLASH_MARKOV=path). The DSpark drafter's block
+        // proposals are per-position marginals; the fork chains them with
+        //   step_logit[v] = base_logit[k][v] + dot(A[prev], B[v])
+        // where prev is the anchor for k==0 and the corrected argmax of k-1
+        // after. Without this the drafter measured 13.7% matched acceptance vs
+        // ~70% in the fork's full stack. Layout: 'DMRK' i32 ver i32 rank
+        // i64 n_vocab, A[n_vocab][rank] f32, B[n_vocab][rank] f32.
+        if (const char * mpath = getenv("ATLAS_DFLASH_MARKOV")) {
+            FILE * mf = fopen(mpath, "rb");
+            if (mf) {
+                char magic[4] = {};
+                int32_t ver = 0, rank = 0;
+                int64_t nv = 0;
+                markov_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+                if (fread(magic, 1, 4, mf) == 4 && memcmp(magic, "DMRK", 4) == 0 &&
+                        fread(&ver, 4, 1, mf) == 1 && ver == 1 &&
+                        fread(&rank, 4, 1, mf) == 1 && rank > 0 &&
+                        fread(&nv, 8, 1, mf) == 1 && nv == markov_n_vocab) {
+                    markov_rank = rank;
+                    markov_a.resize((size_t) nv * rank);
+                    markov_b.resize((size_t) nv * rank);
+                    has_markov =
+                        fread(markov_a.data(), 4, markov_a.size(), mf) == markov_a.size() &&
+                        fread(markov_b.data(), 4, markov_b.size(), mf) == markov_b.size();
+                }
+                fclose(mf);
+            }
+            LOG_INF("%s: - ATLAS markov correction %s (rank=%d, n_vocab=%lld)\n", __func__,
+                    has_markov ? "LOADED" : "FAILED TO LOAD", (int) markov_rank, (long long) markov_n_vocab);
+        }
+    }
+
+    // ATLAS markov side-state
+    std::vector<float> markov_a, markov_b;
+    int32_t markov_rank    = 0;
+    int64_t markov_n_vocab = 0;
+    bool    has_markov     = false;
+
+    // corrected argmax over base + dot(A[prev], B[v]), threaded over vocab chunks
+    llama_token markov_corrected_argmax(const float * base, llama_token prev) const {
+        const int64_t nv = markov_n_vocab;
+        const float * arow = markov_a.data() + (size_t) prev * markov_rank;
+        const int nthread = 8;
+        std::vector<std::pair<float, int64_t>> best(nthread, {-1e30f, 0});
+        std::vector<std::thread> ths;
+        for (int t = 0; t < nthread; ++t) {
+            ths.emplace_back([&, t]() {
+                const int64_t v0 = nv *  t      / nthread;
+                const int64_t v1 = nv * (t + 1) / nthread;
+                float   bv = -1e30f;
+                int64_t bi = v0;
+                for (int64_t v = v0; v < v1; ++v) {
+                    const float * brow = markov_b.data() + (size_t) v * markov_rank;
+                    float corr = 0.0f;
+                    for (int32_t r = 0; r < markov_rank; ++r) {
+                        corr += arow[r] * brow[r];
+                    }
+                    const float s = base[v] + corr;
+                    if (s > bv) { bv = s; bi = v; }
+                }
+                best[t] = {bv, bi};
+            });
+        }
+        for (auto & th : ths) { th.join(); }
+        float   bv = -1e30f;
+        int64_t bi = 0;
+        for (const auto & p : best) {
+            if (p.first > bv) { bv = p.first; bi = p.second; }
+        }
+        return (llama_token) bi;
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1126,6 +1211,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
+            // ATLAS: crop any stale rows at/after this round's block start —
+            // REJECTED verify tokens' injected features from last round live at
+            // positions >= n_past and must not survive (the fork's dspark impl
+            // tracks this via rows_since_accept; the reference crops the draft
+            // KV every round). Without this the non-causal drafter attends to
+            // an ever-growing pile of dead-branch features.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) n, -1);
+
             int32_t n_draft = params.n_max;
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
@@ -1150,6 +1243,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // ATLAS: crop the just-decoded anchor+mask rows out of the drafter KV
+        // immediately (the reference's past_key_values_draft.crop(start)).
+        // process() will inject the REAL verify-row features at these same
+        // positions; without the crop both copies coexist and the non-causal
+        // attention sees stale mask rows at accepted positions forever.
+        // (logits were materialized into the output buffer by the decode above,
+        // so cropping KV before reading them is safe.)
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
+                        (llama_pos) dparams[seq_id].n_past, -1);
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1162,6 +1269,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+
+            // ATLAS: DSpark markov chaining — sequential corrected argmax.
+            // prev MUST chain through the corrected result (never precomputed):
+            // that sequential dependency is the entire mechanism.
+            if (has_markov) {
+                llama_token prev = dp.id_last;
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    const float * base = llama_get_logits_ith(ctx_dft, beg + i);
+                    if (base == nullptr) {
+                        break;
+                    }
+                    const llama_token id = markov_corrected_argmax(base, prev);
+                    if (id == mask_token_id) {
+                        break; // drafter predicts "no token here" — stop the block
+                    }
+                    result.push_back(id);
+                    prev = id;
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
+            }
 
             // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
             for (int32_t i = 1; i < n_block_tokens; ++i) {

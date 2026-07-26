@@ -590,7 +590,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    gf_res_max_nodes = max_nodes;
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -800,7 +800,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        gf_res_prev_reset_all();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1321,14 +1321,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
+    auto * res = gf_res_prev_get(gtype, ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // llama-level graph reuse (skip rebuild + alloc) is only sound while the
+    // scheduler still holds THIS graph's split plan — compute executes the
+    // sched's stored plan, not the graph passed in. when another shape ran in
+    // between, fall through to a full rebuild into this shape's own slot. the
+    // per-slot arenas keep tensor addresses deterministic across rebuilds, so
+    // the backend's property compare still replays its captured graph (fresh
+    // uid -> full compare -> equal props -> replay, no re-capture).
+    if (!graph_reuse_disable && sched_owned_res == (const void *) res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1362,6 +1369,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        sched_owned_res = (const void *) res;
     }
 
     // set the input data for the input tensors
@@ -2352,6 +2360,23 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+llm_graph_result * llama_context::gf_res_prev_get(llm_graph_type gtype, uint32_t n_tokens) {
+    auto & slot = gf_res_prev[{(int) gtype, (int) n_tokens}];
+    if (!slot) {
+        slot.reset(new llm_graph_result(gf_res_max_nodes));
+    }
+    return static_cast<llm_graph_result *>(slot.get());
+}
+
+void llama_context::gf_res_prev_reset_all() {
+    for (auto & [gtype, slot] : gf_res_prev) {
+        if (slot) {
+            slot->reset();
+        }
+    }
+    sched_owned_res = nullptr;
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2365,7 +2390,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    gf_res_prev_reset_all();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3364,7 +3389,7 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            auto * res = gf_res_prev_get(ctx_type_to_graph_type(cparams.ctx_type), ubatch.n_tokens);
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 

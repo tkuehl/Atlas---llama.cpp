@@ -152,6 +152,21 @@ public:
     const int64_t n_embd = 0;
 };
 
+// ATLAS: DSpark log-SNR sinusoid features for dflash draft blocks. Rows are
+// filled per-ubatch by a token==mask_id test: mask rows get t=0, the anchor
+// (any non-mask token) gets t=1000, then the standard 64-freq sin|cos split.
+class llm_graph_input_atlas_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_atlas_logsnr(llama_token mask_id) : mask_id(mask_id) {}
+    virtual ~llm_graph_input_atlas_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [128, n_tokens]
+
+    const llama_token mask_id;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -714,6 +729,16 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+#define ARDBG_FAIL(tag) do { \
+        static const bool ardbg_on = getenv("ATLAS_REUSE_DEBUG") != nullptr; \
+        if (ardbg_on) fprintf(stderr, "ARDBG fail=%s gtype=%d ntok=%d/%d nout=%d/%d nextn=%d/%d smpl=%d/%d tok=%d/%d embd=%d/%d\n", \
+            tag, (int) gtype, (int) ubatch.n_tokens, (int) other.ubatch.n_tokens, \
+            (int) n_outputs, (int) other.n_outputs, \
+            (int) cparams.nextn_layer_offset, (int) other.cparams.nextn_layer_offset, \
+            (int) samplers.size(), (int) other.samplers.size(), \
+            (int) (ubatch.token != nullptr), (int) (other.ubatch.token != nullptr), \
+            (int) (ubatch.embd != nullptr), (int) (other.ubatch.embd != nullptr)); } while (0)
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -742,14 +767,17 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            ARDBG_FAIL("ubatch");
             return false;
         }
 
         if (n_outputs != other.n_outputs) {
+            ARDBG_FAIL("n_outputs");
             return false;
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            ARDBG_FAIL("samplers");
             return false;
         }
 
@@ -769,10 +797,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            ARDBG_FAIL("nextn_layer_offset");
             return false;
         }
 
-        return
+        const bool tail =
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
@@ -782,7 +811,12 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
+        if (!tail) {
+            ARDBG_FAIL("tail-flags");
+        }
+        return tail;
     }
+#undef ARDBG_FAIL
 };
 
 struct llm_graph_fused_node {

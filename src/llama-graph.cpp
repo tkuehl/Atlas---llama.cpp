@@ -121,6 +121,28 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_atlas_logsnr::set_input(const llama_ubatch * ubatch) {
+    if (!feat || !ubatch || !ubatch->token) {
+        return;
+    }
+    const int64_t n_tokens = feat->ne[1];
+    const int64_t n_freq   = feat->ne[0];
+    const int64_t half     = n_freq / 2;
+    GGML_ASSERT(ubatch->n_tokens == n_tokens);
+
+    std::vector<float> buf((size_t) n_freq * n_tokens);
+    for (int64_t r = 0; r < n_tokens; ++r) {
+        const float t = (ubatch->token[r] == mask_id) ? 0.0f : 1000.0f;
+        for (int64_t i = 0; i < half; ++i) {
+            const float freq  = expf(-logf(10000.0f) * (float) i / (float) half);
+            const float angle = t * freq;
+            buf[(size_t) r * n_freq + i]        = sinf(angle);
+            buf[(size_t) r * n_freq + half + i] = cosf(angle);
+        }
+    }
+    ggml_backend_tensor_set(feat, buf.data(), 0, ggml_nbytes(feat));
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;

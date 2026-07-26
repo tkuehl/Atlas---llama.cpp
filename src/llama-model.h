@@ -563,6 +563,11 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+    // ATLAS: DSpark GIDD log-SNR conditioning MLP (optional, dflash drafters)
+    struct ggml_tensor * dflash_log_snr_fc1_w = nullptr;
+    struct ggml_tensor * dflash_log_snr_fc1_b = nullptr;
+    struct ggml_tensor * dflash_log_snr_fc2_w = nullptr;
+    struct ggml_tensor * dflash_log_snr_fc2_b = nullptr;
 
 
     // NVFP4 per-tensor scale2, input_scale for LM head

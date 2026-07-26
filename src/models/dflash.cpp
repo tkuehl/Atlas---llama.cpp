@@ -41,6 +41,30 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
+    // ATLAS: optional drafter-own token embeddings (mirrors eagle3). Converted
+    // DSpark drafters carry a TRAINED mask-token row (and log-SNR conditioning
+    // folded into the table) — falling back to the target's tok_embd feeds the
+    // block a wrong mask embedding and no conditioning.
+    {
+        const struct ggml_tensor * tok_embd_meta = ml->get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
+        if (tok_embd_meta) {
+            const int64_t n_vocab_own = tok_embd_meta->ne[1];
+            tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_own }, 0);
+            LLAMA_LOG_INFO("%s: DFlash using its own token_embd (vocab = %lld)\n", __func__, (long long) n_vocab_own);
+        }
+    }
+
+    // ATLAS: optional DSpark GIDD log-SNR conditioning MLP (128-freq sinusoid ->
+    // fc1 -> SiLU -> fc2, added to draft-block embeddings in the decoder graph).
+    // Trained-in for DSpark drafters; running without it distorts every block row.
+    dflash_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC1, "weight"), { 128, n_embd },    TENSOR_NOT_REQUIRED);
+    dflash_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC1, "bias"),   { n_embd },         TENSOR_NOT_REQUIRED);
+    dflash_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, TENSOR_NOT_REQUIRED);
+    dflash_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DFLASH_LOG_SNR_FC2, "bias"),   { n_embd },         TENSOR_NOT_REQUIRED);
+    if (dflash_log_snr_fc1_w) {
+        LLAMA_LOG_INFO("%s: DFlash log-SNR conditioning tensors loaded\n", __func__);
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -214,6 +238,32 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
+
+    // ATLAS: DSpark log-SNR conditioning. Per-row sinusoid features (anchor rows
+    // t=1000, mask rows t=0 — filled at set_input by a token==mask_id test) run
+    // through the trained fc1 -> SiLU -> fc2 MLP and add onto the block
+    // embeddings, mirroring the fork's dspark graph exactly.
+    if (model.dflash_log_snr_fc1_w) {
+        llama_token mask_id_snr = model.vocab.token_mask();
+        if (mask_id_snr == LLAMA_TOKEN_NULL) {
+            // converted DSpark drafters ship a null tokenizer; their mask id is
+            // the top vocab id (matches dflash.mask_token_id metadata).
+            mask_id_snr = (llama_token) (model.vocab.n_tokens() - 1);
+        }
+        auto snr_inp = std::make_unique<llm_graph_input_atlas_logsnr>(mask_id_snr);
+        snr_inp->feat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 128, n_tokens);
+        ggml_set_input(snr_inp->feat);
+
+        ggml_tensor * snr = build_lora_mm(model.dflash_log_snr_fc1_w, snr_inp->feat);
+        snr = ggml_add(ctx0, snr, model.dflash_log_snr_fc1_b);
+        snr = ggml_silu(ctx0, snr);
+        snr = build_lora_mm(model.dflash_log_snr_fc2_w, snr);
+        snr = ggml_add(ctx0, snr, model.dflash_log_snr_fc2_b);
+        inpL = ggml_add(ctx0, inpL, snr);
+        cb(inpL, "inp_noise_embd_snr", -1);
+
+        res->add_input(std::move(snr_inp));
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];

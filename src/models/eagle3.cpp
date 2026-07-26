@@ -134,6 +134,17 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
 
+    // ATLAS EAGLE-3.1 retrofit (env-gated for compat with pre-norm-trained heads):
+    // weightless RMS after fc bounds g magnitude ("FC normalization" — the
+    // attention-drift fix). The head must be TRAINED with the same contract.
+    {
+        static const bool postnorm = getenv("ATLAS_EAGLE3_POSTNORM") != nullptr;
+        if (postnorm) {
+            cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+            cb(cur, "fc_out_norm", -1);
+        }
+    }
+
     // Output: g_embeddings e.g. [4096, n_tokens]
     // store in t_h_nextn (same as MTP) so can be read via llama_get_embeddings_nextn(ctx_dft)
     ggml_set_output(cur);
@@ -280,14 +291,25 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     cur = inpL;
 
-    // Output prenorm state (for next token's g_embeddings in autoregressive generation)
-    ggml_set_output(cur);
-    res->t_h_nextn = cur;
+    // Chain-feed state (next token's g_embeddings in autoregressive generation).
+    // EAGLE-3: pre-norm residual. ATLAS EAGLE-3.1 retrofit (env-gated): feed the
+    // POST-output_norm hidden instead — bounded magnitude across chain steps
+    // (attention-drift fix). Head must be trained with the matching contract.
+    static const bool atlas_postnorm = getenv("ATLAS_EAGLE3_POSTNORM") != nullptr;
+    if (!atlas_postnorm) {
+        ggml_set_output(cur);
+        res->t_h_nextn = cur;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
+
+    if (atlas_postnorm) {
+        ggml_set_output(cur);
+        res->t_h_nextn = cur;
+    }
 
     // lm_head - projects to draft vocabulary
     // if the draft has no own output projection, inherit the target model's lm_head

@@ -4141,6 +4141,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // ATLAS_GRAPH_DEBUG: log per-launch graph-cache behavior to diagnose key
+    // collisions between alternating topologies on one context (verify vs draft).
+    {
+        static const bool atlas_gdbg = getenv("ATLAS_GRAPH_DEBUG") != nullptr;
+        if (atlas_gdbg) {
+            fprintf(stderr, "AGDBG key=%p n_nodes=%d use_graph=%d update=%d\n",
+                    graph_key, cgraph->n_nodes, (int) use_cuda_graph, (int) cuda_graph_update_required);
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4802,6 +4812,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -4840,6 +4851,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
