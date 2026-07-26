@@ -911,6 +911,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
+    llama_batch batch_chain;  // ATLAS: dspark chained segments
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -985,17 +986,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
-        // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
-        const int32_t n_draft_max = is_dspark ? block_size : block_size - 1;
+        // block_size-1 draft tokens, DSpark yield a full block_size draft tokens.
+        // ATLAS: DSpark additionally supports CHAINED blocks — when n_max is a
+        // larger multiple of block_size, a fully-drafted block seeds another
+        // [anchor + masks] segment (anchor = last drafted token) before verify.
+        // Verify weight-read cost is ~flat in batch size, so extra blocks are
+        // near-free tokens whenever the first block drafts cleanly.
+        const int32_t n_draft_max = is_dspark ? 4 * block_size : block_size - 1;
         if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
-            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained block size %d -- clamping to %d\n",
-                    __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
+            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the supported maximum %d -- clamping\n",
+                    __func__, this->params.n_max, this->params.n_min, n_draft_max);
             this->params.n_max = std::min(this->params.n_max, n_draft_max);
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        batch_chain  = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq); // ATLAS: dspark chained segments
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1090,6 +1097,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     ~common_speculative_impl_draft_dflash() override {
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+        llama_batch_free(batch_chain);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1216,6 +1224,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_want     (n_seq,  0); // ATLAS: total requested (chained segments)
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1240,6 +1249,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 n_draft = std::min(n_draft, dp.n_max);
             }
 
+            // ATLAS: dspark drafts at most block_size per SEGMENT (the trained
+            // shape); larger n_draft is served by chaining segments below.
+            n_want[seq_id] = n_draft;
+            if (is_dspark) {
+                n_draft = std::min(n_draft, block_size);
+            }
+
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
@@ -1257,20 +1273,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
-        }
-
-        // ATLAS: crop the just-decoded anchor+mask rows out of the drafter KV
-        // immediately (the reference's past_key_values_draft.crop(start)).
-        // process() will inject the REAL verify-row features at these same
-        // positions; without the crop both copies coexist and the non-causal
-        // attention sees stale mask rows at accepted positions forever.
-        // (logits were materialized into the output buffer by the decode above,
-        // so cropping KV before reading them is safe.)
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
-                        (llama_pos) dparams[seq_id].n_past, -1);
-            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1314,6 +1316,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                 }
+
+                // ATLAS: chained segments — a cleanly-drafted block seeds another
+                // [anchor + masks] segment (anchor = last drafted token) until
+                // n_want. Verify weight-read cost is ~flat in batch size, so
+                // extra segments are near-free tokens on clean rounds. A short
+                // or conf-truncated read stops chaining naturally.
+                while ((int32_t) result.size() > 0 &&
+                       (int32_t) result.size() % block_size == 0 && // every segment so far drafted fully
+                       (int32_t) result.size() < n_want[seq_id]) {
+                    const int32_t done  = (int32_t) result.size();
+                    const int32_t seg   = std::min(block_size, n_want[seq_id] - done);
+                    const int32_t n0    = (int32_t) dp.n_past + done;
+
+                    common_batch_clear(batch_chain);
+                    for (int32_t i = 0; i < seg; ++i) {
+                        common_batch_add(batch_chain, i == 0 ? result.back() : mask_token_id, n0 + i, { seq_id }, true);
+                    }
+                    {
+                        static const bool chain_dbg = getenv("ATLAS_CHAIN_DEBUG") != nullptr;
+                        const int rc = llama_decode(ctx_dft, batch_chain);
+                        if (chain_dbg) {
+                            LOG_WRN("ATLAS chain: seg=%d n0=%d rc=%d done=%d want=%d\n", (int) seg, (int) n0, rc, (int) done, (int) n_want[seq_id]);
+                        }
+                        if (rc != 0) {
+                            break;
+                        }
+                    }
+                    const float * conf_c = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                    int32_t added = 0;
+                    for (int32_t i = 0; i < seg; ++i) {
+                        if (conf_c && conf_c[(size_t) i * n_embd_dec] < params.conf_min) {
+                            break;
+                        }
+                        common_sampler_sample(smpl, ctx_dft, i, true);
+                        const auto * cp = common_sampler_get_candidates(smpl, true);
+                        const llama_token id = cp->data[0].id;
+                        common_sampler_accept(smpl, id, true);
+                        result.push_back(id);
+                        added++;
+                    }
+                    if (added < seg) {
+                        break; // truncated segment: stop extending
+                    }
+                }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -1341,6 +1387,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+            }
+        }
+
+        // ATLAS: crop the drafted rows (block-1 + any chained segments) out of
+        // the drafter KV now that all reads are done — process() will inject
+        // the REAL verify-row features at these positions; without the crop the
+        // non-causal attention sees stale mask rows at accepted positions
+        // forever. Deferred until AFTER chaining: chained segments require the
+        // preceding block's rows to still be resident (consecutive positions).
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
+                        (llama_pos) dparams[seq_id].n_past, -1);
             }
         }
     }
