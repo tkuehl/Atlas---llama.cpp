@@ -675,6 +675,60 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     return d6 * sumf_d;
 }
 
+// ATLAS: support for the SoA (aligned-y) multi-column MMVQ path — see
+// mul_mat_vec_q_lowbit_soa in mmvq.cu. One unpacked 32-weight chunk, reusable
+// across all dst columns.
+struct lowbit_chunk_unpacked {
+    int   v[8]; // 32 weights as signed int8x4 lanes (q1_0) or raw 2-bit codes (q2_0)
+    float d;    // block scale
+};
+
+static __device__ __forceinline__ void unpack_q1_0_chunk(
+        const void * __restrict__ vbq, const int kbx, const int iqs, lowbit_chunk_unpacked & up) {
+    const block_q1_0 * bq1_0 = (const block_q1_0 *) vbq + kbx;
+    up.d = bq1_0->d;
+    const int16_t * qs = (const int16_t *) bq1_0->qs + iqs * 2;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int q  = qs[j];
+        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        up.v[j*4+0] = __byte_perm(s0, s1, 0x5410);
+        up.v[j*4+1] = __byte_perm(s0, s1, 0x7632);
+        up.v[j*4+2] = __byte_perm(s2, s3, 0x5410);
+        up.v[j*4+3] = __byte_perm(s2, s3, 0x7632);
+    }
+}
+
+static __device__ __forceinline__ void unpack_q2_0_chunk(
+        const void * __restrict__ vbq, const int kbx, const int iqs, lowbit_chunk_unpacked & up) {
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+    up.d = bq2_0->d;
+    const int offset = iqs * 8;
+    const int v0 = bq2_0->qs[offset + 0] | (bq2_0->qs[offset + 1] << 8) |
+                   (bq2_0->qs[offset + 2] << 16) | (bq2_0->qs[offset + 3] << 24);
+    const int v1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
+                   (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int shift = j * 8;
+        const int codes = (v0 >> shift) & 0xFF;
+        up.v[j] = ((codes >> 0) & 0x3) | (((codes >> 2) & 0x3) << 8) |
+                  (((codes >> 4) & 0x3) << 16) | (((codes >> 6) & 0x3) << 24);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int shift = j * 8;
+        const int codes = (v1 >> shift) & 0xFF;
+        up.v[4+j] = ((codes >> 0) & 0x3) | (((codes >> 2) & 0x3) << 8) |
+                    (((codes >> 4) & 0x3) << 16) | (((codes >> 6) & 0x3) << 24);
+    }
+}
+
 static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

@@ -1010,6 +1010,165 @@ static void mul_mat_vec_q_switch_ncols_dst(
             break;
     }
 }
+// ============================================================================
+// ATLAS: aligned-y (SoA) multi-column MMVQ for Q1_0/Q2_0.
+//
+// NCU forensics (RTX 5070, Q1_0 n=5): the generic kernel's top stall is LG
+// Throttle (32%) — 8 narrow 4-byte y-loads per column per iteration from the
+// 36-byte-strided block_q8_1 layout saturate the L1 load/store issue queue
+// (DRAM idles at 24%, 57% no-eligible-warp cycles). block_q8_1's stride
+// forbids vectorized loads, so: repack y once (µs-scale, index-preserving)
+// into a 16-byte-aligned SoA layout — qs[nblocks][32] + ds[nblocks] — and
+// read each column's chunk with two int4 loads instead of eight int loads.
+// Scoped to the spec-decode shapes: no ids, no fusion (fusion is batch-1-only
+// anyway), single channel/sample. Kill-switch: ATLAS_NO_MMVQ_SOA=1.
+// ============================================================================
+
+static __global__ void repack_q8_1_soa(
+        const block_q8_1 * __restrict__ in, int8_t * __restrict__ qs_out, float2 * __restrict__ ds_out,
+        const int nblocks) {
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nblocks) {
+        return;
+    }
+    const block_q8_1 * blk = in + b;
+    int tmp[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        tmp[k] = get_int_b4(blk->qs, k);
+    }
+    int4 * dst4 = (int4 *) (qs_out + (size_t) b*QK8_1);
+    dst4[0] = make_int4(tmp[0], tmp[1], tmp[2], tmp[3]);
+    dst4[1] = make_int4(tmp[4], tmp[5], tmp[6], tmp[7]);
+    ds_out[b] = __half22float2(blk->ds);
+}
+
+template <ggml_type type, int ncols_dst>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_lowbit_soa(
+        const void * __restrict__ vx, const int8_t * __restrict__ y_qs, const float2 * __restrict__ y_ds,
+        float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int tid  = warp_size*threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_cuda_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = nwarps*warp_size / qi;
+
+    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+    for (int kbx = tid / qi; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kqs = tid % qi;            // chunk of 32 within the x block
+        const int kby = kbx*qi + kqs;        // absolute q8 block index (qk/QK8_1 == qi for qr==1 types)
+
+        lowbit_chunk_unpacked up[rows_per_cuda_block];
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            if constexpr (type == GGML_TYPE_Q1_0) {
+                unpack_q1_0_chunk(vx, (row0 + i)*stride_row_x + kbx, kqs, up[i]);
+            } else {
+                unpack_q2_0_chunk(vx, (row0 + i)*stride_row_x + kbx, kqs, up[i]);
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int4 * u4 = (const int4 *) (y_qs + ((size_t) j*stride_col_y + kby)*QK8_1);
+            const int4 ua = u4[0];
+            const int4 ub = u4[1];
+            const float2 ds = y_ds[(size_t) j*stride_col_y + kby];
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a(up[i].v[0], ua.x, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[1], ua.y, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[2], ua.z, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[3], ua.w, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[4], ub.x, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[5], ub.y, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[6], ub.z, sumi);
+                sumi = ggml_cuda_dp4a(up[i].v[7], ub.w, sumi);
+                if constexpr (type == GGML_TYPE_Q1_0) {
+                    tmp[j][i] += up[i].d * ds.x * sumi;
+                } else {
+                    tmp[j][i] += up[i].d * (sumi * ds.x - ds.y);
+                }
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    dst += row0;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x)) {
+                dst[j*stride_col_dst + i] = tmp[j][i];
+            }
+        }
+    }
+}
+
+#define ATLAS_MMVQ_SOA_CASE(c_ncols)                                                                       \
+    case c_ncols: {                                                                                        \
+        const int nwarps         = calc_nwarps(type, c_ncols, table_id);                                   \
+        const int rows_per_block = calc_rows_per_block(c_ncols, table_id, false, nwarps);                  \
+        const dim3 block_dims(warp_size, nwarps, 1);                                                       \
+        const dim3 grid_dims((nrows_x + rows_per_block - 1) / rows_per_block, 1, 1);                       \
+        mul_mat_vec_q_lowbit_soa<type, c_ncols><<<grid_dims, block_dims, 0, stream>>>(                     \
+            vx, y_qs, y_ds, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);            \
+    } break;
+
+template <ggml_type type>
+static void mul_mat_vec_q_lowbit_soa_switch(
+        const void * vx, const int8_t * y_qs, const float2 * y_ds, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        cudaStream_t stream) {
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
+
+    switch (ncols_dst) {
+        ATLAS_MMVQ_SOA_CASE(2)
+        ATLAS_MMVQ_SOA_CASE(3)
+        ATLAS_MMVQ_SOA_CASE(4)
+        ATLAS_MMVQ_SOA_CASE(5)
+        ATLAS_MMVQ_SOA_CASE(6)
+        ATLAS_MMVQ_SOA_CASE(7)
+        ATLAS_MMVQ_SOA_CASE(8)
+        default: GGML_ABORT("fatal error"); break;
+    }
+}
+#undef ATLAS_MMVQ_SOA_CASE
+
 static void mul_mat_vec_q_switch_type(
         const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -1270,6 +1429,37 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // ATLAS: aligned-y SoA path for Q1_0/Q2_0 multi-column (spec-decode verify widths).
+    // See the kernel comment above for the LG-throttle rationale. Kill-switch env for A/B.
+    {
+        static const bool soa_disabled = getenv("ATLAS_NO_MMVQ_SOA") != nullptr;
+        const bool is_lowbit = src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0;
+        const int  qk_x      = ggml_blck_size(src0->type);
+        if (!soa_disabled && is_lowbit && !ids && !fusion &&
+            ncols_dst >= 2 && ncols_dst <= 8 &&
+            ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+            ne00 % qk_x == 0) {
+            const int64_t nblocks_total = ne11 * (ne10_padded / QK8_1);
+            ggml_cuda_pool_alloc<char> y_soa(ctx.pool(), nblocks_total * (QK8_1 + sizeof(float2)));
+            int8_t * y_qs = (int8_t *) y_soa.get();
+            float2 * y_ds = (float2 *) (y_soa.get() + nblocks_total*QK8_1);
+
+            const int repack_threads = 256;
+            const int repack_blocks  = (int) ((nblocks_total + repack_threads - 1) / repack_threads);
+            repack_q8_1_soa<<<repack_blocks, repack_threads, 0, stream>>>(
+                (const block_q8_1 *) src1_q8_1.get(), y_qs, y_ds, (int) nblocks_total);
+
+            if (src0->type == GGML_TYPE_Q1_0) {
+                mul_mat_vec_q_lowbit_soa_switch<GGML_TYPE_Q1_0>(
+                    src0->data, y_qs, y_ds, dst_d, ne00, ne01, (int) ncols_dst, s01, s11, s1, stream);
+            } else {
+                mul_mat_vec_q_lowbit_soa_switch<GGML_TYPE_Q2_0>(
+                    src0->data, y_qs, y_ds, dst_d, ne00, ne01, (int) ncols_dst, s01, s11, s1, stream);
+            }
+            return;
+        }
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
