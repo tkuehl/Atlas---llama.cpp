@@ -465,13 +465,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                } else {
-                    if (Q->ne[1] == 1) {
-                        return BEST_FATTN_KERNEL_VEC;
+                // ATLAS: at D=256 the vec kernel compiles to 245-255 registers
+                // (2 blocks/SM ceiling) and serially scans quantized KV at ~13 GB/s
+                // effective on decode (measured: 158 us/layer where the data floor is
+                // ~3 us; RTX 5070, 4-KV-head hybrid). The MMA path measured ~2x faster
+                // per layer at the same shapes even paying KV dequant (plain decode
+                // 15.4 -> 13.9 ms/step). Prefer MMA for large heads + quantized KV;
+                // ATLAS_NO_FA_MMA_DECODE=1 restores the stock vec preference.
+                static const bool no_mma_decode = getenv("ATLAS_NO_FA_MMA_DECODE") != nullptr;
+                const bool vec_reg_bound = Q->ne[0] >= 256 && !no_mma_decode;
+                if (!vec_reg_bound) {
+                    if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                        if (Q->ne[1] <= 2) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
+                    } else {
+                        if (Q->ne[1] == 1) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
                     }
                 }
             }
