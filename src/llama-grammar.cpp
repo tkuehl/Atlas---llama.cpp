@@ -1006,7 +1006,7 @@ static bool llama_grammar_detect_left_recursion(
 }
 
 const llama_grammar_rules & llama_grammar_get_rules(const struct llama_grammar * grammar) {
-    return grammar->rules;
+    return *grammar->rules;
 }
 
 llama_grammar_stacks & llama_grammar_get_stacks(struct llama_grammar * grammar) {
@@ -1035,7 +1035,7 @@ static void llama_grammar_accept_chr(
         if (!llama_grammar_is_end_of_sequence(match.second)) {
             new_stack.push_back(match.second);
         }
-        llama_grammar_advance_stack(grammar.rules, new_stack, new_stacks);
+        llama_grammar_advance_stack(*grammar.rules, new_stack, new_stacks);
     }
 }
 
@@ -1188,11 +1188,11 @@ struct llama_grammar * llama_grammar_init_impl(
     } while (true);
 
     // Important: vec_rules has to be moved here, not copied, because stacks contains
-    // pointers to elements of vec_rules. If vec_rules were copied into llama_grammar
-    // then the pointers would be invalidated when the local vec_rules goes out of scope.
+    // pointers to elements of vec_rules. Moving preserves the inner rule vectors' heap
+    // storage, so those pointers stay valid inside the shared_ptr the clones will share.
     return new llama_grammar {
         vocab,
-        std::move(vec_rules),
+        std::make_shared<const llama_grammar_rules>(std::move(vec_rules)),
         std::move(stacks),
         /* .partial_utf8 = */             {},
         /* .lazy = */                     false,
@@ -1294,11 +1294,11 @@ struct llama_grammar * llama_grammar_init_impl(
     }
 
     // Important: vec_rules has to be moved here, not copied, because stacks contains
-    // pointers to elements of vec_rules. If vec_rules were copied into llama_grammar
-    // then the pointers would be invalidated when the local vec_rules goes out of scope.
+    // pointers to elements of vec_rules. Moving preserves the inner rule vectors' heap
+    // storage, so those pointers stay valid inside the shared_ptr the clones will share.
     return new llama_grammar {
         vocab,
-        std::move(vec_rules),
+        std::make_shared<const llama_grammar_rules>(std::move(vec_rules)),
         std::move(stacks),
         /* .partial_utf8 = */             {},
         /* .lazy = */                     lazy,
@@ -1332,19 +1332,10 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.trigger_patterns,
     };
 
-    // redirect elements in stacks to point to new rules
-    for (size_t is = 0; is < result->stacks.size(); is++) {
-        for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
-            for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
-                for (size_t ir1 = 0; ir1 < grammar.rules[ir0].size(); ir1++) {
-                    if (grammar.stacks[is][ie] == &grammar.rules[ir0][ir1]) {
-                        result->stacks[is][ie] =  &result->rules[ir0][ir1];
-                    }
-                }
-            }
-        }
-    }
-
+    // rules are shared with the source grammar (they are immutable after init), so the
+    // copied stack elements still point into valid storage — no repointing pass needed.
+    // this keeps cloning cheap, which grammar-aware speculative drafting depends on
+    // (one clone per draft round).
     return result;
 }
 
@@ -1385,7 +1376,7 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
-    const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+    const auto rejects = llama_grammar_reject_candidates(*grammar.rules, grammar.stacks, candidates_grammar);
     for (const auto & reject : rejects) {
         cur_p->data[reject.index].logit = -INFINITY;
     }
@@ -1486,7 +1477,7 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
                 if (!llama_grammar_is_end_of_sequence(pos + 1)) {
                     new_stack.push_back(pos + 1);
                 }
-                llama_grammar_advance_stack(grammar.rules, new_stack, stacks_new);
+                llama_grammar_advance_stack(*grammar.rules, new_stack, stacks_new);
             }
         } else {
             llama_grammar_stacks current_stacks = {stack};
