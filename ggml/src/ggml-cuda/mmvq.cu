@@ -326,6 +326,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    // ATLAS: the Q1_0/Q2_0 dp4a vec-dots are unpack-ALU-bound at multi-column —
+    // per-call time grows ~linearly with ncols_dst (measured 15->37 us, ncols 1->5,
+    // RTX 5070) because the expensive low-bit unpack is redone per column, so wide
+    // spec-decode verify batches pay ~2 ms/row across a 27B's ~40 matmuls. MMQ
+    // amortizes the unpack into Q8 SRAM tiles once per block. Threshold tunable via
+    // ATLAS_LOWBIT_MMVQ_MAX for A/B; default keeps stock behavior.
+    if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0) {
+        static const int max_b = []() {
+            const char * e = getenv("ATLAS_LOWBIT_MMVQ_MAX");
+            return e ? atoi(e) : (int) MMVQ_MAX_BATCH_SIZE;
+        }();
+        return ne11 <= max_b;
+    }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 
