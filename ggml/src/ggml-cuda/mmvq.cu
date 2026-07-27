@@ -1044,7 +1044,7 @@ static __global__ void repack_q8_1_soa(
 }
 
 template <ggml_type type, int ncols_dst>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), (ncols_dst == 5 || ncols_dst == 6) ? 12 : 1)
 static __global__ void mul_mat_vec_q_lowbit_soa(
         const void * __restrict__ vx, const int8_t * __restrict__ y_qs, const float2 * __restrict__ y_ds,
         float * __restrict__ dst,
