@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -910,6 +911,26 @@ static bool grammar_drafting_enabled() {
     return !disabled;
 }
 
+// ATLAS_SPEC_TIMERS: env-gated per-section wall timers for the dspark/dflash round.
+// When enabled, GPU calls are followed by an explicit synchronize inside their
+// section so async execution bills to the section that launched it (observer
+// effect accepted — this mode is for attribution, not for benchmarking absolute
+// throughput; compare section SUMS against the unsync'd round wall to see overlap).
+static bool spec_timers_enabled() {
+    static const bool on = getenv("ATLAS_SPEC_TIMERS") != nullptr;
+    return on;
+}
+struct atlas_spec_tm {
+    std::chrono::steady_clock::time_point t0;
+    double * acc;
+    atlas_spec_tm(double * a) : acc(a) { if (spec_timers_enabled()) t0 = std::chrono::steady_clock::now(); }
+    ~atlas_spec_tm() {
+        if (spec_timers_enabled() && acc) {
+            *acc += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        }
+    }
+};
+
 // Apply `grmr` to the drafter's candidate array and return the highest-ranked token
 // that the grammar still permits, or LLAMA_TOKEN_NULL if the grammar rejects all of
 // them. cur_p is the drafter's own top-k, already sorted by probability, so the
@@ -950,6 +971,11 @@ static llama_token grammar_pick(llama_sampler * grmr, const llama_token_data_arr
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+    // ATLAS_SPEC_TIMERS accumulators (µs); printed + reset every 100 rounds in draft()
+    double tm_feat = 0, tm_enc = 0, tm_encread = 0, tm_inject = 0,
+           tm_crop = 0, tm_block = 0, tm_sample = 0, tm_chain = 0;
+    int    tm_rounds = 0;
+
     common_params_speculative_draft params;
 
     llama_batch batch;        // noise tokens
@@ -1111,6 +1137,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
+        // ATLAS_SPEC_TIMERS: whole-process() attribution happens per-section below.
+
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
@@ -1141,6 +1169,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather this chunk's target features, interleaved by extract layer
+                {
+                atlas_spec_tm _tm(&tm_feat);
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1152,6 +1182,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
+                }
                 }
 
                 // fuse extracted features through DFlash encoder
@@ -1165,19 +1196,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
+                int32_t rc;
+                {
+                atlas_spec_tm _tm(&tm_enc);
+                rc = llama_encode(ctx_dft, enc_batch);
+                if (spec_timers_enabled()) llama_synchronize(ctx_dft);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
 
+                {
+                atlas_spec_tm _tm(&tm_encread);
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
                 // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                }
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
@@ -1185,7 +1224,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                {
+                atlas_spec_tm _tm(&tm_inject);
                 rc = llama_decode(ctx_dft, batch_inject);
+                if (spec_timers_enabled()) llama_synchronize(ctx_dft);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1251,7 +1294,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_decode(ctx_dft, batch);
+        int ret;
+        {
+        atlas_spec_tm _tm(&tm_block);
+        ret = llama_decode(ctx_dft, batch);
+        if (spec_timers_enabled()) llama_synchronize(ctx_dft);
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1288,6 +1336,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         &llama_sampler_free);
                 llama_sampler * grmr = grmr_owner.get();
 
+                {
+                atlas_spec_tm _tm_s(&tm_sample);
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
@@ -1320,12 +1370,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                 }
+                }
                 // ATLAS: chained segments — a cleanly-drafted block seeds another
                 // [anchor + masks] segment (anchor = last drafted token) until
                 // n_want. Verify weight-read cost is ~flat in batch size, so
                 // extra segments are near-free tokens on clean rounds. A short
                 // or conf-truncated read stops chaining naturally.
                 static const bool atlas_no_chain = getenv("ATLAS_NO_CHAIN") != nullptr;
+                atlas_spec_tm _tm_c(&tm_chain);
                 while (!atlas_no_chain &&
                        (int32_t) result.size() > 0 &&
                        (int32_t) result.size() % block_size == 0 && // every segment so far drafted fully
@@ -1426,11 +1478,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // non-causal attention sees stale mask rows at accepted positions
         // forever. Deferred until AFTER chaining: chained segments require the
         // preceding block's rows to still be resident (consecutive positions).
+        {
+        atlas_spec_tm _tm(&tm_crop);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] >= 0) {
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
                         (llama_pos) dparams[seq_id].n_past, -1);
             }
+        }
+        }
+
+        // ATLAS_SPEC_TIMERS: per-round attribution report (ms/round over the window)
+        if (spec_timers_enabled() && ++tm_rounds % 100 == 0) {
+            const double r = 100.0 * 1000.0; // µs → ms, per-round mean over 100 rounds
+            LOG_INF("SPEC_TIMERS(dspark) rounds=%d  feat=%.2f enc=%.2f encread=%.2f inject=%.2f | "
+                    "block=%.2f sample=%.2f chain=%.2f crop=%.2f | draft-side sum=%.2f ms/round\n",
+                    tm_rounds,
+                    tm_feat / r, tm_enc / r, tm_encread / r, tm_inject / r,
+                    tm_block / r, tm_sample / r, tm_chain / r, tm_crop / r,
+                    (tm_feat + tm_enc + tm_encread + tm_inject + tm_block + tm_sample + tm_chain + tm_crop) / r);
+            tm_feat = tm_enc = tm_encread = tm_inject = tm_block = tm_sample = tm_chain = tm_crop = 0;
         }
     }
 

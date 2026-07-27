@@ -3592,6 +3592,34 @@ private:
 
         const int ret = llama_decode(ctx_tgt, batch_view);
 
+        // ATLAS_SPEC_TIMERS: force-sync the target here so the verify's GPU time is
+        // billed to THIS section instead of leaking into the drafter's feature-gather
+        // sync (process() runs before sampling and absorbs it otherwise). Attribution
+        // mode only — never enabled in production serving.
+        {
+            static const bool spec_timers = getenv("ATLAS_SPEC_TIMERS") != nullptr;
+            if (spec_timers && ret == 0) {
+                // bucket by batch size so the batch-1-vs-batch-k cliff is directly visible
+                static double tm_by_n[16] = {0}; static int cnt_by_n[16] = {0}; static int tm_n = 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                llama_synchronize(ctx_tgt);
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                const int b = std::min(15, (int) batch_view.n_tokens);
+                tm_by_n[b] += us; cnt_by_n[b]++;
+                if (++tm_n % 200 == 0) {
+                    std::string s;
+                    for (int i = 0; i < 16; ++i) {
+                        if (cnt_by_n[i] > 0) {
+                            char buf[64];
+                            snprintf(buf, sizeof(buf), " n%d=%.2fms(x%d)", i, tm_by_n[i] / cnt_by_n[i] / 1000.0, cnt_by_n[i]);
+                            s += buf;
+                        }
+                    }
+                    SRV_INF("SPEC_TIMERS(server) verify-sync by batch:%s\n", s.c_str());
+                }
+            }
+        }
+
         metrics.on_decoded(slots);
 
         if (ret != 0) {
