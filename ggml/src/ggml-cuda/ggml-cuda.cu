@@ -2759,7 +2759,17 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // The check walks every later node, so any other use of the output (or of a view of it) keeps the
 // plain transform, and use counts guard against consumers outside this graph. Returns the number of
 // nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
-static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+// atlas: an RMSNorm (+ weight MUL) folded into the fused transform-quantizer (see ggml_cuda_try_rms_fwht_q8)
+struct atlas_fwht_norm {
+    const ggml_tensor * src;       // RMS_NORM input rows
+    const ggml_tensor * w;         // norm weight, [ne00]
+    const ggml_tensor * out;       // the weight-MUL node (normalized activation)
+    bool                write_out; // the normalized activation has other consumers: write it too
+    float               eps;
+};
+
+static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+                                 const atlas_fwht_norm * norm = nullptr) {
     static const bool disabled = getenv("GGML_CUDA_FWHT_FUSION") != nullptr &&
                                  atoi(getenv("GGML_CUDA_FWHT_FUSION")) == 0;
     if (disabled) {
@@ -2806,6 +2816,10 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         i_mm     = node_idx;
     }
 
+    if (norm && (x != norm->out || norm->src->ne[0] != x->ne[0] || ggml_nrows(norm->src) != ggml_nrows(x))) {
+        return 0;
+    }
+
     const int n = (int) mm->src[0]->ne[0];
     if (mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
             (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || ggml_nelements(mm) != ggml_nelements(x)) {
@@ -2826,7 +2840,11 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         const char * b1 = b0 + ggml_nbytes(b);
         return a0 < b1 && b0 < a1;
     };
-    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
+    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm)) ||
+                                (norm && (overlaps(norm->src, mm) || overlaps(norm->w, mm)));
+    if (norm && norm->write_out && overlaps(norm->src, norm->out)) {
+        return 0;
+    }
 
     // every use of the transform output (directly or through a reshape view of the whole tensor)
     // must be src1 of a PTQ1_0 MUL_MAT that ggml_cuda_mul_mat routes to ggml_cuda_mul_mat_vec_q.
@@ -2920,8 +2938,14 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         return 0; // the quantized rows must fit in the F32 output allocation
     }
 
-    fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
-                                out, layout, K, ne0_padded, ncols, ctx.stream());
+    if (norm) {
+        fwht_quantize_row_q8_1_cuda(norm->src->data, norm->src->type, signs ? (const float *) signs->data : nullptr, n,
+                                    out, layout, K, ne0_padded, ncols, ctx.stream(),
+                                    (const float *) norm->w->data, norm->write_out ? (float *) norm->out->data : nullptr, norm->eps);
+    } else {
+        fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
+                                    out, layout, K, ne0_padded, ncols, ctx.stream());
+    }
 
     ggml_cuda_fwht_q8 e;
     e.layout = layout;
@@ -2932,6 +2956,38 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         ctx.fwht_q8().set(aliases[a], e);
     }
     return consumed;
+}
+
+// atlas: RMS_NORM -> MUL(weight) -> [signed Hadamard] -> PTQ1_0 mat-vecs as ONE launch: the fused
+// transform-quantizer computes the row RMS itself, so the separate rms_norm kernel disappears.
+// When the normalized activation has other readers (ssm_alpha/beta on GDN layers) it is written too.
+// ATLAS_FUSE_RMS_FWHT=1 enables it.
+static int ggml_cuda_try_rms_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("ATLAS_FUSE_RMS_FWHT") != nullptr && atoi(getenv("ATLAS_FUSE_RMS_FWHT")) != 0;
+    if (!enabled || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * rms  = cgraph->nodes[i];
+    const ggml_tensor * wmul = cgraph->nodes[i + 1];
+    if (rms->op != GGML_OP_RMS_NORM || wmul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * w = wmul->src[0] == rms ? wmul->src[1] : (wmul->src[1] == rms ? wmul->src[0] : nullptr);
+    const ggml_tensor * src = rms->src[0];
+    if (!w || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != rms->ne[0] ||
+            src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || !ggml_is_contiguous(wmul) ||
+            wmul->type != GGML_TYPE_F32 || !ggml_are_same_shape(wmul, rms) ||
+            ggml_node_get_use_count(cgraph, i) != 1 || (rms->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    atlas_fwht_norm norm;
+    norm.src       = src;
+    norm.w         = w;
+    norm.out       = wmul;
+    norm.write_out = ggml_node_get_use_count(cgraph, i + 1) > 1 || (wmul->flags & GGML_TENSOR_FLAG_OUTPUT);
+    memcpy(&norm.eps, rms->op_params, sizeof(float));
+    const int c = ggml_cuda_try_fwht_q8(ctx, cgraph, i + 2, &norm);
+    return c > 0 ? c + 2 : 0;
 }
 
 // GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
@@ -4733,10 +4789,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                {   // atlas: one-shot op dump of the first decode graph (ATLAS_DUMP_GRAPH=1)
+                    static int dumped = 0;
+                    static const bool dump = getenv("ATLAS_DUMP_GRAPH") != nullptr;
+                    if (dump && dumped < 2 && i < 160 && node->src[1] && node->src[1]->ne[1] == 1) {
+                        fprintf(stderr, "G %4d %-14s %-28s ne=[%lld,%lld] s0=%s(%s) s1=%s(%s) hint=%d\n", i, ggml_op_name(node->op), node->name,
+                            (long long) node->ne[0], (long long) node->ne[1],
+                            node->src[0] ? node->src[0]->name : "-", node->src[0] ? ggml_type_name(node->src[0]->type) : "-",
+                            node->src[1] ? node->src[1]->name : "-", node->src[1] ? ggml_type_name(node->src[1]->type) : "-",
+                            ggml_get_op_params_i32(node, 1));
+                        if (i == 159) dumped++;
+                    }
+                }
                 // recurrent-state gather folded into the GDN kernel (no temp, no kernel)
                 if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
                         ggml_cuda_try_gdn_gather_skip(*cuda_ctx, cgraph, i)) {
                     continue;
+                }
+
+                // atlas: RMSNorm folded into the Hadamard quantizer
+                if (node->op == GGML_OP_RMS_NORM && !is_concurrent_event_active) {
+                    const int consumed = ggml_cuda_try_rms_fwht_q8(*cuda_ctx, cgraph, i);
+                    if (consumed > 0) {
+                        i += consumed - 1;
+                        continue;
+                    }
                 }
 
                 // Hadamard rotation that quantizes its own output; its PTQ1_0 mat-vecs skip quantize

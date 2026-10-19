@@ -29,7 +29,8 @@ void quantize_row_q8_1_cuda(
 bool ggml_cuda_fwht_quantize_supported(int n, int64_t ne00);
 void fwht_quantize_row_q8_1_cuda(
         const void * x, ggml_type x_type, const float * signs, int n, void * vy,
-        ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t ne0, int64_t ncols, cudaStream_t stream);
+        ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t ne0, int64_t ncols, cudaStream_t stream,
+        const float * norm_w = nullptr, float * norm_out = nullptr, float norm_eps = 0.0f);
 
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,

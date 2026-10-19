@@ -3,6 +3,9 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "ggml-backend.h"
+#include <mutex>
+#include <unordered_map>
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -2319,6 +2322,61 @@ void common_prompt_checkpoint::update_pos(
     this->n_tokens = n_tokens;
     this->pos_min  = pos_min;
     this->pos_max  = pos_max;
+}
+
+namespace {
+struct pinned_registry {
+    std::mutex mtx;
+    std::unordered_map<void *, ggml_backend_buffer_t> bufs;
+};
+pinned_registry & pinned_reg() { static pinned_registry r; return r; }
+bool pinned_enabled() {
+    static const bool on = [] { const char * e = getenv("ATLAS_PINNED_CKPT"); return e && atoi(e) != 0; }();
+    return on;
+}
+ggml_backend_buffer_type_t pinned_buft() {
+    static ggml_backend_buffer_type_t buft = [] () -> ggml_backend_buffer_type_t {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        return dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    }();
+    return buft;
+}
+} // namespace
+
+void * common_pinned_alloc(size_t n) {
+    if (n == 0) {
+        n = 1;
+    }
+    if (pinned_enabled() && pinned_buft()) {
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(pinned_buft(), n);
+        if (buf) {
+            void * p = ggml_backend_buffer_get_base(buf);
+            std::lock_guard<std::mutex> lk(pinned_reg().mtx);
+            pinned_reg().bufs[p] = buf;
+            return p;
+        }
+    }
+    void * p = malloc(n);
+    if (!p) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+
+void common_pinned_free(void * p) {
+    if (!p) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(pinned_reg().mtx);
+        auto it = pinned_reg().bufs.find(p);
+        if (it != pinned_reg().bufs.end()) {
+            ggml_backend_buffer_free(it->second);
+            pinned_reg().bufs.erase(it);
+            return;
+        }
+    }
+    free(p);
 }
 
 void common_prompt_checkpoint::update_tgt(

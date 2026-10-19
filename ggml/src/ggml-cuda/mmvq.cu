@@ -301,7 +301,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
         // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
         // mat-vec 155 t/s vs MMQ 244 t/s at n=8).
-        return ne11 <= 4;
+        // atlas: ATLAS_PTQ1_MMVQ_MAX_COLS overrides the crossover (tuned on Ada; unmeasured on sm_120)
+        static const int atlas_max_cols = [] {
+            const char * s = getenv("ATLAS_PTQ1_MMVQ_MAX_COLS");
+            return s ? atoi(s) : 4;
+        }();
+        return ne11 <= atlas_max_cols;
     }
 #endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.

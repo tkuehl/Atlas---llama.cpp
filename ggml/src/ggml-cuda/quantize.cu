@@ -183,7 +183,8 @@ template <int N, int NT, ggml_cuda_q8_1_layout layout, typename T, bool has_sign
 __launch_bounds__(NT, 1)
 static __global__ void fwht_quantize_q8_1(
         const T * x_ptr, const float * signs, void * vy_ptr,
-        const int64_t ne00, const int64_t ne0, const uint32_t ne1, const uint3 ne2, const float scale) {
+        const int64_t ne00, const int64_t ne0, const uint32_t ne1, const uint3 ne2, const float scale,
+        const float * norm_w, float * norm_out, const float norm_eps) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0 && NT % QK8_1 == 0, "bad fused FWHT shape");
@@ -206,12 +207,44 @@ static __global__ void fwht_quantize_q8_1(
 
     float reg[NE];
     ggml_cuda_pdl_sync();
+
+    // atlas: optional RMSNorm folded in front of the transform. Every block needs the whole row's
+    // sum of squares, so each block reduces the full row (ne00 floats, L2-resident) itself.
+    float norm_inv = 1.0f;
+    if (norm_w) {
+        __shared__ float red[NT / warp_size];
+        const T * rowp = x_ptr + row * ne00;
+        float ss = 0.0f;
+        for (int64_t k = tid; k < ne00; k += NT) {
+            const float v = (float) rowp[k];
+            ss += v * v;
+        }
+        ss = warp_reduce_sum<warp_size>(ss);
+        if (lane == 0) {
+            red[tid / warp_size] = ss;
+        }
+        __syncthreads();
+        float tot = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NT / warp_size; ++w) {
+            tot += red[w];
+        }
+        norm_inv = rsqrtf(tot / (float) ne00 + norm_eps);
+    }
+
     if (base < ne00) {
         const T *     src       = x_ptr + row * ne00 + base;
         const float * signs_row = has_signs ? signs + base : nullptr; // (r % n_blk) * N with r = row*n_blk + blk
 #pragma unroll
         for (int i = 0; i < NE; ++i) {
-            reg[i] = (float) src[i * NT + tid] * scale;
+            float v = (float) src[i * NT + tid];
+            if (norm_w) {
+                v *= norm_inv * norm_w[base + i * NT + tid];
+                if (norm_out) {
+                    norm_out[row * ne00 + base + i * NT + tid] = v;
+                }
+            }
+            reg[i] = v * scale;
             if (has_signs) {
                 reg[i] *= signs_row[i * NT + tid];
             }
@@ -281,7 +314,7 @@ template <int N, typename T>
 static void fwht_quantize_launch_layout(
         const T * x, const float * signs, void * vy, const ggml_cuda_q8_1_layout layout,
         const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
-        const float scale, cudaStream_t stream) {
+        const float scale, const float * norm_w, float * norm_out, const float norm_eps, cudaStream_t stream) {
     constexpr int NT = N < 256 ? N : 256;
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
     const dim3 num_blocks((unsigned) (ne0 / N), (unsigned) ne1, (unsigned) (ne2*ne3));
@@ -289,9 +322,9 @@ static void fwht_quantize_launch_layout(
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
 #define FWHT_Q_LAUNCH(LAYOUT) \
     if (signs) { \
-        ggml_cuda_kernel_launch(fwht_quantize_q8_1<N, NT, LAYOUT, T, true>,  lp, x, signs, vy, ne00, ne0, (uint32_t) ne1, ne2_fastdiv, scale); \
+        ggml_cuda_kernel_launch(fwht_quantize_q8_1<N, NT, LAYOUT, T, true>,  lp, x, signs, vy, ne00, ne0, (uint32_t) ne1, ne2_fastdiv, scale, norm_w, norm_out, norm_eps); \
     } else { \
-        ggml_cuda_kernel_launch(fwht_quantize_q8_1<N, NT, LAYOUT, T, false>, lp, x, signs, vy, ne00, ne0, (uint32_t) ne1, ne2_fastdiv, scale); \
+        ggml_cuda_kernel_launch(fwht_quantize_q8_1<N, NT, LAYOUT, T, false>, lp, x, signs, vy, ne00, ne0, (uint32_t) ne1, ne2_fastdiv, scale, norm_w, norm_out, norm_eps); \
     }
     switch (layout) {
         case GGML_CUDA_Q8_1_PT:       FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_PT);       break;
@@ -305,14 +338,14 @@ template <typename T>
 static void fwht_quantize_launch(
         const T * x, const float * signs, void * vy, const ggml_cuda_q8_1_layout layout, const int n,
         const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
-        const float scale, cudaStream_t stream) {
+        const float scale, const float * norm_w, float * norm_out, const float norm_eps, cudaStream_t stream) {
     switch (n) {
-        case   64: fwht_quantize_launch_layout<  64, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
-        case  128: fwht_quantize_launch_layout< 128, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
-        case  256: fwht_quantize_launch_layout< 256, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
-        case  512: fwht_quantize_launch_layout< 512, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
-        case 1024: fwht_quantize_launch_layout<1024, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
-        case 2048: fwht_quantize_launch_layout<2048, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
+        case   64: fwht_quantize_launch_layout<  64, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, norm_w, norm_out, norm_eps, stream); break;
+        case  128: fwht_quantize_launch_layout< 128, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, norm_w, norm_out, norm_eps, stream); break;
+        case  256: fwht_quantize_launch_layout< 256, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, norm_w, norm_out, norm_eps, stream); break;
+        case  512: fwht_quantize_launch_layout< 512, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, norm_w, norm_out, norm_eps, stream); break;
+        case 1024: fwht_quantize_launch_layout<1024, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, norm_w, norm_out, norm_eps, stream); break;
+        case 2048: fwht_quantize_launch_layout<2048, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, norm_w, norm_out, norm_eps, stream); break;
         default: GGML_ABORT("fused FWHT quantizer: unsupported transform width %d", n);
     }
 }
@@ -329,7 +362,8 @@ bool ggml_cuda_fwht_quantize_supported(const int n, const int64_t ne00) {
 
 void fwht_quantize_row_q8_1_cuda(
         const void * x, const ggml_type x_type, const float * signs, const int n, void * vy,
-        const ggml_cuda_q8_1_layout layout, const int64_t ne00, const int64_t ne0, const int64_t ncols, cudaStream_t stream) {
+        const ggml_cuda_q8_1_layout layout, const int64_t ne00, const int64_t ne0, const int64_t ncols, cudaStream_t stream,
+        const float * norm_w, float * norm_out, const float norm_eps) {
     GGML_ASSERT(ggml_cuda_fwht_quantize_supported(n, ne00));
     GGML_ASSERT(ne0 % n == 0 && ne0 >= ne00);
     if (layout == GGML_CUDA_Q8_1_PT) {
@@ -337,10 +371,10 @@ void fwht_quantize_row_q8_1_cuda(
     }
     const float scale = 1.0f / sqrtf((float) n);
     if (x_type == GGML_TYPE_F16) {
-        fwht_quantize_launch<half>((const half *) x, signs, vy, layout, n, ne00, ne0, ncols, 1, 1, scale, stream);
+        fwht_quantize_launch<half>((const half *) x, signs, vy, layout, n, ne00, ne0, ncols, 1, 1, scale, norm_w, norm_out, norm_eps, stream);
     } else {
         GGML_ASSERT(x_type == GGML_TYPE_F32);
-        fwht_quantize_launch<float>((const float *) x, signs, vy, layout, n, ne00, ne0, ncols, 1, 1, scale, stream);
+        fwht_quantize_launch<float>((const float *) x, signs, vy, layout, n, ne00, ne0, ncols, 1, 1, scale, norm_w, norm_out, norm_eps, stream);
     }
 }
 

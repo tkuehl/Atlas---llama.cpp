@@ -1149,6 +1149,26 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// atlas: page-locked host memory for context checkpoints. A checkpoint of a hybrid model is a
+// full recurrent-state copy (~160 MiB for Bonsai 2 27B) made synchronously up to three times per
+// request; into pageable memory that runs at ~7 GB/s (~23 ms each). Allocation goes through the
+// first GPU device's host buffer type and falls back to the heap. Enabled by ATLAS_PINNED_CKPT=1.
+void * common_pinned_alloc(size_t n);
+void   common_pinned_free(void * p);
+
+template <typename T>
+struct common_pinned_allocator {
+    using value_type = T;
+    common_pinned_allocator() noexcept = default;
+    template <typename U> common_pinned_allocator(const common_pinned_allocator<U> &) noexcept {}
+    T *  allocate(size_t n) { return static_cast<T *>(common_pinned_alloc(n * sizeof(T))); }
+    void deallocate(T * p, size_t) noexcept { common_pinned_free(p); }
+    template <typename U> bool operator==(const common_pinned_allocator<U> &) const noexcept { return true; }
+    template <typename U> bool operator!=(const common_pinned_allocator<U> &) const noexcept { return false; }
+};
+
+using common_ckpt_buffer = std::vector<uint8_t, common_pinned_allocator<uint8_t>>;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1158,8 +1178,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_ckpt_buffer data_tgt;
+    common_ckpt_buffer data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
