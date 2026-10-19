@@ -4672,6 +4672,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    static const int atlas_graph_chunk = [] {
+        const char * e = getenv("ATLAS_GRAPH_CHUNK");
+        return e ? atoi(e) : 0;
+    }();
+    int atlas_nodes_in_chunk = 0;
+#ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph && cuda_graph_update_required) {
+        cuda_ctx->cuda_graph(graph_key)->clear_chunks();   // fresh capture: drop the previous pieces
+    }
+#endif
+
     while (!graph_evaluated_or_captured) {
         for (auto & entry : gb10_shared_q8) {
             entry.quantized = false;
@@ -4789,16 +4800,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                {   // atlas: one-shot op dump of the first decode graph (ATLAS_DUMP_GRAPH=1)
+#ifdef USE_CUDA_GRAPH
+                // atlas: end the capture every ATLAS_GRAPH_CHUNK executed nodes (see ggml_cuda_graph::chunk_graphs)
+                if (use_cuda_graph && cuda_graph_update_required && atlas_graph_chunk > 0 && !is_concurrent_event_active) {
+                    if (atlas_nodes_in_chunk >= atlas_graph_chunk && cgraph->n_nodes - i > atlas_graph_chunk / 2) {
+                        cudaGraph_t piece = nullptr;
+                        CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &piece));
+                        cuda_ctx->cuda_graph(graph_key)->chunk_graphs.push_back(piece);
+                        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                        atlas_nodes_in_chunk = 0;
+                    }
+                    atlas_nodes_in_chunk++;
+                }
+#endif
+
+                {   // atlas: one-shot op dump of the first decode graph (ATLAS_DUMP_GRAPH=1): every node of the
+                    // first 4 layers and the last 30 nodes, with type, shape and whether it is a view/no-op
                     static int dumped = 0;
                     static const bool dump = getenv("ATLAS_DUMP_GRAPH") != nullptr;
-                    if (dump && dumped < 2 && i < 160 && node->src[1] && node->src[1]->ne[1] == 1) {
-                        fprintf(stderr, "G %4d %-14s %-28s ne=[%lld,%lld] s0=%s(%s) s1=%s(%s) hint=%d\n", i, ggml_op_name(node->op), node->name,
-                            (long long) node->ne[0], (long long) node->ne[1],
+                    const bool decode = cgraph->n_nodes > 0 && cgraph->nodes[cgraph->n_nodes - 1]->ne[1] == 1;
+                    if (dump && dumped == 0 && decode && (i < 340 || i >= cgraph->n_nodes - 30)) {
+                        fprintf(stderr, "G %4d/%d %-12s %-36.36s %-6s [%lld,%lld,%lld] %s s0=%.24s(%s) s1=%.24s(%s)\n", i, cgraph->n_nodes,
+                            ggml_op_name(node->op), node->name, ggml_type_name(node->type),
+                            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                            ggml_cuda_is_view_or_noop(node) ? "VIEW" : "KERN",
                             node->src[0] ? node->src[0]->name : "-", node->src[0] ? ggml_type_name(node->src[0]->type) : "-",
-                            node->src[1] ? node->src[1]->name : "-", node->src[1] ? ggml_type_name(node->src[1]->type) : "-",
-                            ggml_get_op_params_i32(node, 1));
-                        if (i == 159) dumped++;
+                            node->src[1] ? node->src[1]->name : "-", node->src[1] ? ggml_type_name(node->src[1]->type) : "-");
+                        if (i == cgraph->n_nodes - 1) dumped = 1;
                     }
                 }
                 // recurrent-state gather folded into the GDN kernel (no temp, no kernel)
@@ -4996,6 +5024,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        // atlas: chunked launch - pieces first, in capture order (re-instantiated on every recapture)
+        if (graph->chunk_instances.size() != graph->chunk_graphs.size()) {
+            for (auto inst : graph->chunk_instances) { if (inst) { CUDA_CHECK(cudaGraphExecDestroy(inst)); } }
+            graph->chunk_instances.assign(graph->chunk_graphs.size(), nullptr);
+            for (size_t c = 0; c < graph->chunk_graphs.size(); ++c) {
+                CUDA_CHECK(cudaGraphInstantiate(&graph->chunk_instances[c], graph->chunk_graphs[c], NULL, NULL, 0));
+            }
+        }
+        for (auto inst : graph->chunk_instances) {
+            CUDA_CHECK(cudaGraphLaunch(inst, cuda_ctx->stream()));
+            // WDDM batches submissions; querying the stream flushes the batch so the GPU starts on this piece
+            (void) cudaStreamQuery(cuda_ctx->stream());
+        }
+        {
+            static const bool atlas_dbg = getenv("ATLAS_GRAPH_CHUNK_DEBUG") != nullptr;
+            static int atlas_dbg_n = 0;
+            if (atlas_dbg && atlas_dbg_n++ < 3) {
+                GGML_LOG_INFO("atlas: graph launch with %zu pieces + final\n", graph->chunk_instances.size());
+            }
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));

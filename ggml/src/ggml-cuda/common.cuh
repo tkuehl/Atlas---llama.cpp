@@ -1389,6 +1389,19 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        clear_chunks();
+    }
+    // atlas: chunked launch (ATLAS_GRAPH_CHUNK=N). Under WDDM a ~1500-node graph takes ~1 ms of host
+    // submission before its first kernel runs; captured as pieces of N nodes, the GPU starts on piece 0
+    // while the host is still submitting the rest. The pieces captured before the final one live here
+    // (in order); the final piece is graph/instance as before.
+    std::vector<cudaGraph_t>     chunk_graphs;
+    std::vector<cudaGraphExec_t> chunk_instances;
+    void clear_chunks() {
+        for (auto inst : chunk_instances) { if (inst) { CUDA_CHECK(cudaGraphExecDestroy(inst)); } }
+        for (auto g : chunk_graphs)       { if (g)    { CUDA_CHECK(cudaGraphDestroy(g)); } }
+        chunk_instances.clear();
+        chunk_graphs.clear();
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
