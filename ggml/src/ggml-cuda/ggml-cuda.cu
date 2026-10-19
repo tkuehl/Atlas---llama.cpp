@@ -2840,6 +2840,9 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     int64_t ncols         = 0;
     int64_t ne0_padded    = 0;
     ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
+    // atlas: ATLAS_FWHT_FUSION_PQ2=1 also accepts PQ2_0 consumers (all consumers must share one type)
+    static const bool atlas_pq2 = getenv("ATLAS_FWHT_FUSION_PQ2") != nullptr && atoi(getenv("ATLAS_FWHT_FUSION_PQ2")) != 0;
+    ggml_type wtype = GGML_TYPE_COUNT;
     for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
         ggml_tensor * t = cgraph->nodes[j];
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -2867,14 +2870,17 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
                 uses_expected += ggml_node_get_use_count(cgraph, j);
                 continue;
             }
-            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] || t->src[0]->type != GGML_TYPE_PTQ1_0 ||
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] ||
+                    !(t->src[0]->type == GGML_TYPE_PTQ1_0 || (atlas_pq2 && t->src[0]->type == GGML_TYPE_PQ2_0)) ||
+                    (wtype != GGML_TYPE_COUNT && t->src[0]->type != wtype) ||
                     ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
                     t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
                     src->ne[2] != 1 || src->ne[3] != 1 ||
                     (K != 0 && (src->ne[0] != K || src->ne[1] != ncols)) ||
-                    !ggml_cuda_should_use_mmvq(GGML_TYPE_PTQ1_0, cc, src->ne[1])) {
+                    !ggml_cuda_should_use_mmvq(t->src[0]->type, cc, src->ne[1])) {
                 return 0;
             }
+            wtype = t->src[0]->type;
             K     = src->ne[0];
             ncols = src->ne[1];
             // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
@@ -2893,7 +2899,10 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     }
 
     // same (type, ncols, ids) -> layout and padding as ggml_cuda_mul_mat_vec_q
-    layout     = ggml_cuda_q8_1_layout_host(GGML_TYPE_PTQ1_0, (int) ncols, false);
+    layout     = ggml_cuda_q8_1_layout_host(wtype, (int) ncols, false);
+    if (layout == GGML_CUDA_Q8_1_PQ2) {
+        return 0; // the fused quantizer has no PQ2 multi-column layout
+    }
     ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
     if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
         ne0_padded = GGML_PAD(ne0_padded, GGML_CUDA_PTQ1_K_PAD);

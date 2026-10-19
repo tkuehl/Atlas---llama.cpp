@@ -496,6 +496,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                // atlas: ATLAS_FA_MMA_DECODE_MIN_KV=N routes quantized-KV decode with GQA>4 to the MMA kernel
+                // once the cache holds >= N cells (vec runs one block per Q head, re-reading the KV
+                // gqa_ratio times; MMA packs the GQA group). Unset = upstream behaviour.
+                static const int64_t atlas_mma_min_kv = [] {
+                    const char * s = getenv("ATLAS_FA_MMA_DECODE_MIN_KV");
+                    return s ? (int64_t) atoll(s) : (int64_t) -1;
+                }();
+                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && atlas_mma_min_kv >= 0 && gqa_opt_applies &&
+                        gqa_ratio > 4 && K->ne[1] >= atlas_mma_min_kv && Q->ne[3] == 1) {
+                    return BEST_FATTN_KERNEL_MMA_F16;
+                }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
