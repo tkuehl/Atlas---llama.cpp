@@ -192,6 +192,22 @@ struct server_batch {
     }
 };
 
+// atlas: per-phase host timers for speculative steps (ATLAS_SPEC_TIMERS=1), printed every 200 verify steps
+#include <chrono>
+struct atlas_spec_timers {
+    double draft = 0, decode = 0, accept = 0, post = 0, step = 0; long n = 0, nd = 0, ndec = 0;
+    std::chrono::steady_clock::time_point last_step{};
+    static bool on() { static const bool v = getenv("ATLAS_SPEC_TIMERS") != nullptr; return v; }
+    static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    void report() {
+        if (n > 0 && n % 200 == 0) {
+            fprintf(stderr, "atlas-spec: %ld steps | per step ms: total %.3f draft %.3f (n=%ld) verify-decode %.3f (n=%ld) sample+accept %.3f post %.3f\n",
+                    n, step / n, draft / n, nd, decode / n, ndec, accept / n, post / n);
+        }
+    }
+};
+static atlas_spec_timers g_atlas_st;
+
 struct server_slot {
     int id;
 
@@ -2977,9 +2993,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const double t0 = atlas_spec_timers::on() ? atlas_spec_timers::now_ms() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (atlas_spec_timers::on()) { g_atlas_st.draft += atlas_spec_timers::now_ms() - t0; g_atlas_st.nd++; }
         }
 
         // make checkpoints if needed
@@ -3613,12 +3631,14 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const double atlas_t_dec = atlas_spec_timers::on() ? atlas_spec_timers::now_ms() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (atlas_spec_timers::on()) { g_atlas_st.decode += atlas_spec_timers::now_ms() - atlas_t_dec; g_atlas_st.ndec++; }
 
         if (ret != 0) {
             {
@@ -3854,6 +3874,7 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            const double atlas_t_acc = atlas_spec_timers::on() ? atlas_spec_timers::now_ms() : 0;
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
@@ -3909,6 +3930,18 @@ private:
             }
 
             const auto ids = std::move(slot.spec_draft);
+            const double atlas_t_post = atlas_spec_timers::on() ? atlas_spec_timers::now_ms() : 0;
+            if (atlas_spec_timers::on()) {
+                g_atlas_st.accept += atlas_t_post - atlas_t_acc;
+                g_atlas_st.n++;
+                const auto tnow = std::chrono::steady_clock::now();
+                if (g_atlas_st.last_step.time_since_epoch().count() != 0) {
+                    const double dt = std::chrono::duration<double, std::milli>(tnow - g_atlas_st.last_step).count();
+                    if (dt < 200) { g_atlas_st.step += dt; } else { g_atlas_st.n--; g_atlas_st.accept -= atlas_t_post - atlas_t_acc; }
+                }
+                g_atlas_st.last_step = tnow;
+                g_atlas_st.report();
+            }
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
