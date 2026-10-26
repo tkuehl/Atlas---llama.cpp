@@ -1879,7 +1879,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // ATLAS: honor the per-request cap too, so a short-cap request stops drafting
+                // instead of drafting to params.n_max and being truncated afterwards.
+                if ((params.n_max <= (int) result.size()) ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

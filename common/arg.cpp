@@ -3941,6 +3941,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    // ATLAS: grammar-dependent draft length
+    add_opt(common_arg(
+        {"--spec-draft-n-max-free"}, "N",
+        string_format("draft cap for requests WITHOUT an active (non-lazy) grammar; --spec-draft-n-max then "
+                      "applies only to grammar-constrained requests (default: %d = same as --spec-draft-n-max)",
+                      params.speculative.draft.n_max_free),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_max_free = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_FREE"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

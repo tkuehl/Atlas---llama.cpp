@@ -2939,7 +2939,16 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+
+                // ATLAS: shorter draft cap when no grammar constrains the output
+                if (params_base.speculative.draft.n_max_free >= 0) {
+                    const auto & sp = slot.task->params.sampling;
+                    const bool constrained = sp.grammar.type != COMMON_GRAMMAR_TYPE_NONE && !sp.grammar_lazy;
+                    if (!constrained) {
+                        n_draft_max = std::min(n_draft_max, params_base.speculative.draft.n_max_free);
+                    }
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
