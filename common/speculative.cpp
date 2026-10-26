@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <iomanip>

@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include <cmath>
+#include <cstdlib>
+
 void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_embd_inp_impl = hparams.n_embd_out();
 
