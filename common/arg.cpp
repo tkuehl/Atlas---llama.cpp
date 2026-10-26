@@ -1586,6 +1586,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.checkpoint_min_step = value;
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    // ATLAS: where the near-end checkpoint lands
+    add_opt(common_arg(
+        {"--checkpoint-tail"}, "N",
+        string_format("create the near-end context checkpoint N tokens before the prompt end (default: %d). "
+                      "Raise it when callers reuse a prefix that ends a few tokens before their prompts do "
+                      "(e.g. a cache warm-up whose chat-template tail runs past the shared prefix)", params.checkpoint_tail),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("checkpoint-tail must be >= 1");
+            }
+            params.checkpoint_tail = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_TAIL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"

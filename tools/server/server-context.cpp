@@ -3498,11 +3498,12 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
+                        //  - tail + n_ubatch
+                        //  - tail (ATLAS: --checkpoint-tail, upstream hard-codes 4)
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int tail = params_base.checkpoint_tail;
+                            const int checkpoint_offsets[] = {tail + n_ubatch, tail};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
