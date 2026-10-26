@@ -2500,6 +2500,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        torch.int32: np.int32,
         torch.int64: np.int64,
     }
 

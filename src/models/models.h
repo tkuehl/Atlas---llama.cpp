@@ -827,6 +827,11 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // ATLAS: centroid-masked output head (absent in upstream conversions → full-vocab head)
+    ggml_tensor * masked_centroids = nullptr; // [n_embd, n_centroids]
+    ggml_tensor * masked_ordering  = nullptr; // I32 [n_vocab], cluster-major token ids
+    int32_t       centroid_top_k   = 32;
+
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     };

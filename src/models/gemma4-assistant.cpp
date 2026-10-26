@@ -21,7 +21,7 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,   hparams.n_embd_head_v_swa);
 }
 
-void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
+void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     if (n_embd_head_k != n_embd_head_v) {
@@ -39,8 +39,31 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
 
-    create_tensor(tn(LLM_TENSOR_MASKED_EMBD_CENTROIDS, "weight"), {}, TENSOR_NOT_REQUIRED);
-    create_tensor(tn(LLM_TENSOR_MASKED_EMBD_ORDERING),  {}, TENSOR_NOT_REQUIRED);
+    // ATLAS: centroid-masked output head. Google trained the E2B/E4B assistants to score
+    // n_centroids clusters, keep the top-k, and compute logits only for those clusters'
+    // tokens (top_k * n_vocab/n_centroids, 4096 of 262144 at the shipped 32/2048). Upstream
+    // conversions strip these tensors; when present the graph below uses them.
+    // ATLAS_NO_CENTROID_HEAD=1 forces the full-vocab head on the same GGUF (A/B).
+    if (const auto * meta = ml.get_tensor_meta(tn(LLM_TENSOR_MASKED_EMBD_CENTROIDS, "weight").str().c_str());
+            meta && !getenv("ATLAS_NO_CENTROID_HEAD")) {
+        const int64_t n_centroids = meta->ne[1];
+        masked_centroids = create_tensor(tn(LLM_TENSOR_MASKED_EMBD_CENTROIDS, "weight"), { n_embd, n_centroids }, 0);
+        masked_ordering  = create_tensor(tn(LLM_TENSOR_MASKED_EMBD_ORDERING), { n_vocab }, 0);
+        // create_tensor binds data later (null in this pass), so validate from the metadata
+        const auto * ord_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MASKED_EMBD_ORDERING).str().c_str());
+        if (n_vocab % n_centroids != 0 || !ord_meta || ord_meta->type != GGML_TYPE_I32) {
+            throw std::runtime_error("Gemma 4 assistant: centroid head needs n_vocab % n_centroids == 0 and I32 ordering");
+        }
+        if (const char * k = getenv("ATLAS_CENTROID_TOP_K")) {
+            centroid_top_k = atoi(k);
+        }
+        LLAMA_LOG_INFO("%s: centroid draft head: %lld centroids, top-%d -> %lld of %lld tokens scored\n", __func__,
+                (long long) n_centroids, centroid_top_k,
+                (long long) (centroid_top_k * (n_vocab / n_centroids)), (long long) n_vocab);
+    } else {
+        create_tensor(tn(LLM_TENSOR_MASKED_EMBD_CENTROIDS, "weight"), {}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+        create_tensor(tn(LLM_TENSOR_MASKED_EMBD_ORDERING),  {}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    }
 
     const int64_t n_embd_backbone = hparams.n_embd_inp();
     nextn_proj_post = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_POST, "weight"), { n_embd, n_embd_backbone }, 0);
@@ -190,7 +213,44 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    ggml_tensor * logits = build_lora_mm(model.output, cur);
+    const auto & asst = static_cast<const llama_model_gemma4_assistant &>(model);
+
+    // the sparse head pays off for the few-row draft steps; wide batches (prompt-side calls,
+    // graph reservation) keep the dense head so worst-case compute buffers don't grow.
+    constexpr int64_t CENTROID_HEAD_MAX_ROWS = 8;
+
+    ggml_tensor * logits;
+    if (asst.masked_centroids && cur->ne[1] <= CENTROID_HEAD_MAX_ROWS) {
+        // centroid-masked head: score clusters, keep top-k, score only their tokens, and
+        // scatter into a -inf full-vocab row so the sampler sees the usual logits shape.
+        const int64_t n_vocab_l   = asst.masked_ordering->ne[0];
+        const int64_t n_centroids = asst.masked_centroids->ne[1];
+        const int64_t per_cluster = n_vocab_l / n_centroids;
+        const int64_t n_sel       = asst.centroid_top_k * per_cluster;
+        const int64_t n_out       = cur->ne[1];
+
+        ggml_tensor * cs = ggml_mul_mat(ctx0, asst.masked_centroids, cur);           // [n_centroids, n_out]
+        cb(cs, "centroid_scores", -1);
+        ggml_tensor * top = ggml_top_k(ctx0, cs, asst.centroid_top_k);              // I32 [k, n_out]
+        cb(top, "centroid_top", -1);
+
+        // get_rows indexes slice-wise, so flatten the batch dimension into the index list
+        ggml_tensor * clusters = ggml_reshape_2d(ctx0, asst.masked_ordering, per_cluster, n_centroids);
+        ggml_tensor * ids = ggml_get_rows(ctx0, clusters, ggml_reshape_1d(ctx0, top, asst.centroid_top_k * n_out));
+        ids = ggml_reshape_2d(ctx0, ids, n_sel, n_out);                               // I32 [n_sel, n_out]
+        cb(ids, "centroid_ids", -1);
+
+        ggml_tensor * emb = ggml_get_rows(ctx0, model.output, ggml_reshape_1d(ctx0, ids, n_sel * n_out));
+        emb = ggml_reshape_3d(ctx0, emb, cur->ne[0], n_sel, n_out);                   // [n_embd, n_sel, n_out]
+        ggml_tensor * ls  = ggml_mul_mat(ctx0, emb, ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_out)); // [n_sel, 1, n_out]
+        cb(ls, "centroid_logits", -1);
+
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_l, n_out), -INFINITY);
+        full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, ls, 1, n_sel, n_out), ids);
+        logits = ggml_reshape_2d(ctx0, full, n_vocab_l, n_out);
+    } else {
+        logits = build_lora_mm(model.output, cur);
+    }
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 

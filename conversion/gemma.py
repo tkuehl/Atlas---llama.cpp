@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 
 from typing import Callable, Iterable, TYPE_CHECKING, Sequence
@@ -793,8 +794,11 @@ class Gemma4AssistantModel(Gemma4Model):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
-        if "masked_embedding" in name:
-            logger.debug(f"Skipping get tensor {name!r} in safetensors so that convert can end normally.")
+        # ATLAS: keep the centroid-masked output head (masked_embedding.centroids +
+        # token_ordering); the assistant graph uses it for a sparse draft head.
+        # Set ATLAS_STRIP_CENTROIDS=1 to reproduce the upstream (full-vocab) conversion.
+        if "masked_embedding" in name and os.environ.get("ATLAS_STRIP_CENTROIDS"):
+            logger.debug(f"Skipping get tensor {name!r} (ATLAS_STRIP_CENTROIDS)")
             return None
 
         return super().filter_tensors(item)
@@ -803,6 +807,27 @@ class Gemma4AssistantModel(Gemma4Model):
         super().set_gguf_parameters()
         self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
         self.gguf_writer.add_nextn_predict_layers(self.block_count)
+        if self.hparams.get("use_ordered_embeddings") and not os.environ.get("ATLAS_STRIP_CENTROIDS"):
+            self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.centroid_top_k",
+                                        int(self.hparams["centroid_intermediate_top_k"]))
+            # token_ordering is written raw as I32 (ggml_get_rows indices): the generic tensor
+            # path converts every non-float tensor to F32. Read it straight from safetensors.
+            from safetensors import safe_open
+            with safe_open(str(self.dir_model / "model.safetensors"), framework="pt") as f:
+                ordering = f.get_tensor("masked_embedding.token_ordering").to(torch.int32).numpy()
+            self.gguf_writer.add_tensor("masked_embd_ordering", ordering,
+                                        raw_dtype=gguf.GGMLQuantizationType.I32)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == "masked_embedding.token_ordering":
+            return  # written raw as I32 in set_gguf_parameters
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # centroid scores pick which 4096 tokens get scored at all — keep them precise
+        if "masked_embd" in new_name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 @ModelBase.register("Gemma4ForConditionalGeneration")
